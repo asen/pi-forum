@@ -1,0 +1,517 @@
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { after, describe, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { createTopic, postMessage } from '../src/storage.js'
+
+const BIN = fileURLToPath(new URL('../bin/pi-forum', import.meta.url))
+const roots = []
+
+after(async () => {
+  await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
+})
+
+async function tempRoot() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-cli-test-'))
+  roots.push(root)
+  return root
+}
+
+async function tempForum() {
+  return path.join(await tempRoot(), 'forum')
+}
+
+// Runs the executable with only PATH plus the given environment, so the caller's Pi variables never leak in.
+function run(args, { env = {}, input, cwd, nodeArgs } = {}) {
+  const fullEnv = { PATH: process.env.PATH, ...env }
+  const [file, argv] = nodeArgs ? [process.execPath, [...nodeArgs, BIN, ...args]] : [BIN, args]
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, argv, { env: fullEnv, cwd })
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    child.on('error', reject)
+    child.on('close', (code) => {
+      resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') })
+    })
+    child.stdin.end(input)
+  })
+}
+
+// Runs a command expected to succeed and returns its single JSON result.
+async function ok(args, options) {
+  const result = await run(args, options)
+  assert.equal(result.stderr, '')
+  assert.equal(result.code, 0)
+  assert.ok(result.stdout.endsWith('\n'))
+  assert.equal(result.stdout.indexOf('\n'), result.stdout.length - 1, 'stdout is one line')
+  return JSON.parse(result.stdout)
+}
+
+// Runs a command expected to fail and returns its stderr.
+async function fails(args, options, pattern) {
+  const result = await run(args, options)
+  assert.equal(result.code, 1)
+  assert.equal(result.stdout, '')
+  assert.match(result.stderr, /^pi-forum: error: /)
+  if (pattern) assert.match(result.stderr, pattern)
+  return result.stderr
+}
+
+const forumEnv = (dir, extra = {}) => ({ env: { PI_FORUM_DIR: dir, ...extra } })
+const logPath = (dir) => path.join(dir, 'events.jsonl')
+const readLog = (dir) => fs.readFile(logPath(dir), 'utf8').catch((err) => (err.code === 'ENOENT' ? null : Promise.reject(err)))
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+async function readAll(args, options, cursor) {
+  const items = []
+  for (;;) {
+    const page = await ok([...args, ...(cursor ? ['--after', cursor] : [])], options)
+    assert.deepEqual(Object.keys(page), ['items', 'next_cursor'])
+    items.push(...page.items)
+    if (page.items.length === 0) return { items, cursor: page.next_cursor }
+    cursor = page.next_cursor
+  }
+}
+
+describe('help and binding', () => {
+  test('help works without a forum binding and documents behavior', async () => {
+    for (const args of [['--help'], ['-h'], ['help'], ['topic', 'create', '--help'], ['message', 'post', 'x', '-h']]) {
+      const result = await run(args)
+      assert.equal(result.code, 0)
+      assert.equal(result.stderr, '')
+      for (const text of ['PI_FORUM_DIR', 'PI_SESSION_ID', '--body-file', '--body-stdin', 'next_cursor', '--after']) {
+        assert.ok(result.stdout.includes(text), `help mentions ${text}`)
+      }
+    }
+  })
+
+  test('missing command and unknown commands are usage errors', async () => {
+    await fails([], {}, /missing command\nRun "pi-forum --help" for usage\.\n$/)
+    await fails(['topic'], {}, /unknown command "topic"/)
+    await fails(['topic', 'delete', 'x'], {}, /unknown command "topic delete"/)
+    await fails(['forum', 'list'], {}, /unknown command "forum list"/)
+  })
+
+  test('requires a nonempty absolute PI_FORUM_DIR and never picks another path', async () => {
+    const cwd = await tempRoot()
+    await fails(['topic', 'list'], { cwd }, /PI_FORUM_DIR is not set/)
+    await fails(['topic', 'list'], { cwd, env: { PI_FORUM_DIR: '' } }, /PI_FORUM_DIR is not set/)
+    await fails(['topic', 'create', 'T'], { cwd, env: { PI_FORUM_DIR: 'forum' } }, /must be an absolute path, got "forum"/)
+    await fails(['topic', 'create', 'T'], { cwd, env: { PI_FORUM_DIR: ' /x' } }, /must be an absolute path/)
+    assert.deepEqual(await fs.readdir(cwd), [])
+  })
+
+  test('usage errors are reported before the binding is checked', async () => {
+    await fails(['message', 'post', 'id', '--body', 'a', '--body-stdin'], {}, /use only one of --body, --body-stdin/)
+    await fails(['topic', 'list', '--limit', 'x'], {}, /--limit must be an integer/)
+  })
+
+  test('help is recognized in option positions without touching the forum', async () => {
+    const dir = await tempForum()
+    const forms = [
+      ['--help'],
+      ['-h'],
+      ['help'],
+      ['topic', '--help'],
+      ['message', '-h'],
+      ['topic', 'create', '--help'],
+      ['topic', 'create', '-h'],
+      ['topic', 'create', 'Example', '--body', 'text', '--author', 'a', '--help'],
+      ['topic', 'get', '-h'],
+      ['topic', 'list', '--help', '--help'],
+      ['message', 'post', '-h'],
+      ['message', 'post', 'x', '--help'],
+      ['message', 'list', '--topic', 't', '--limit', '5', '--after', 'c', '-h'],
+    ]
+    for (const args of forms) {
+      const result = await run(args, forumEnv(dir))
+      assert.equal(result.code, 0, args.join(' '))
+      assert.equal(result.stderr, '')
+      assert.match(result.stdout, /^Usage:\n {2}pi-forum topic create/)
+    }
+    await assert.rejects(fs.stat(dir), { code: 'ENOENT' })
+  })
+
+  test('help-like option values and invalid flags are errors even with help', async () => {
+    const dir = await tempForum()
+    const ambiguous = /Option '--[a-z-]+' argument is ambiguous/
+    const cases = [
+      [['topic', 'create', 'Example', '--body', '--help'], ambiguous],
+      [['topic', 'create', 'Example', '--body', '-h'], ambiguous],
+      [['topic', 'create', 'Example', '--body-file', '--help'], ambiguous],
+      [['topic', 'create', 'Example', '--body-file', '-h'], ambiguous],
+      [['topic', 'create', 'Example', '--author', '--help'], ambiguous],
+      [['topic', 'create', 'Example', '--author', '-h'], ambiguous],
+      [['message', 'post', 'x', '--body', '--help'], ambiguous],
+      [['message', 'post', 'x', '--body-file', '-h'], ambiguous],
+      [['message', 'post', 'x', '--body', 'a', '--author', '--help'], ambiguous],
+      [['message', 'post', 'x', '--body', 'a', '--reply-to', '-h'], ambiguous],
+      [['topic', 'list', '--after', '--help'], ambiguous],
+      [['topic', 'list', '--after', '-h'], ambiguous],
+      [['message', 'list', '--after', '--help'], ambiguous],
+      [['message', 'list', '--after', '-h'], ambiguous],
+      [['message', 'list', '--topic', '--help'], ambiguous],
+      [['topic', 'list', '--limit', '-h'], ambiguous],
+      [['topic', 'list', '--help', '--after'], /argument missing/],
+      [['topic', 'create', 'X', '--bogus', '--help'], /Unknown option '--bogus'/],
+      [['topic', 'create', '--help', '--bogus'], /Unknown option '--bogus'/],
+      [['message', 'list', '-h', '-x'], /Unknown option '-x'/],
+      [['topic', 'create', 'X', '--help=yes'], /does not take an argument/],
+      [['topic', 'create', 'X', '--author', 'a', '--author', 'b', '--help'], /--author may be given only once/],
+      [['message', 'list', '--after', 'a', '--after', 'b', '-h'], /--after may be given only once/],
+      [['message', 'post', 'x', '--body', 'a', '--body-stdin', '--help'], /use only one of --body, --body-stdin/],
+      [['topic', 'list', '--limit', 'ten', '-h'], /--limit must be an integer/],
+      [['topic', 'get', 'a', 'b', '--help'], /unexpected argument "b"/],
+      [['topic', 'delete', '--help'], /unknown command "topic delete"/],
+    ]
+    for (const [args, pattern] of cases) await fails(args, forumEnv(dir), pattern)
+    await assert.rejects(fs.stat(dir), { code: 'ENOENT' })
+  })
+
+  test('help-like text is literal after = or --', async () => {
+    const dir = await tempForum()
+    const cwd = await tempRoot()
+    await fs.writeFile(path.join(cwd, '--help'), 'from a dash file\n')
+    const { topic, message } = await ok(['topic', 'create', '--body=--help', '--author=-h', '--', '--help'], forumEnv(dir))
+    assert.equal(topic.title, '--help')
+    assert.equal(topic.created_by, '-h')
+    assert.equal(message.body, '--help')
+    assert.equal((await ok(['topic', 'create', '--', '-h'], forumEnv(dir))).topic.title, '-h')
+    const fromFile = await ok(['message', 'post', '--body-file=--help', '--', topic.id], { cwd, ...forumEnv(dir) })
+    assert.equal(fromFile.message.body, 'from a dash file\n')
+    assert.deepEqual(await ok(['topic', 'get', '--', topic.id], forumEnv(dir)), { topic })
+    assert.deepEqual((await ok(['message', 'list', '--topic=--help'], forumEnv(dir))).items, [])
+    await fails(['topic', 'list', '--after=-h'], forumEnv(dir), /cursor is not valid/)
+    await fails(['topic', 'get', '--', '--help'], forumEnv(dir), /topic --help not found/)
+  })
+})
+
+describe('topic commands', () => {
+  test('create without a body uses the session identity', async () => {
+    const dir = await tempForum()
+    const result = await ok(['topic', 'create', 'Flaky tests'], forumEnv(dir, { PI_SESSION_ID: 'sess-1' }))
+    assert.deepEqual(Object.keys(result), ['topic', 'message'])
+    assert.equal(result.message, null)
+    assert.match(result.topic.id, UUID)
+    assert.equal(result.topic.title, 'Flaky tests')
+    assert.equal(result.topic.created_by, 'sess-1')
+    assert.equal(result.topic.origin_session_id, 'sess-1')
+    assert.deepEqual(await ok(['topic', 'get', result.topic.id], forumEnv(dir)), { topic: result.topic })
+  })
+
+  test('create with --body preserves whitespace and UTF-8; explicit author keeps the origin session', async () => {
+    const dir = await tempForum()
+    const title = '  Ünïcödé 🧪 тема  '
+    const body = '\n  Report findings here.\r\n\tKeep indentation 👍  \n\n'
+    const { topic, message } = await ok(
+      ['topic', 'create', title, '--body', body, '--author', ' reviewer '],
+      forumEnv(dir, { PI_SESSION_ID: 'sess-2' }),
+    )
+    assert.equal(topic.title, title)
+    assert.equal(topic.created_by, ' reviewer ')
+    assert.equal(topic.origin_session_id, 'sess-2')
+    assert.equal(message.topic_id, topic.id)
+    assert.equal(message.body, body)
+    assert.equal(message.author, ' reviewer ')
+    assert.equal(message.origin_session_id, 'sess-2')
+    assert.deepEqual((await ok(['message', 'list'], forumEnv(dir))).items, [message])
+  })
+
+  test('create reads --body-file relative to the caller cwd', async () => {
+    const dir = await tempForum()
+    const cwd = await tempRoot()
+    const body = 'Fichier ✓\n  second line\n'
+    await fs.mkdir(path.join(cwd, 'notes'))
+    await fs.writeFile(path.join(cwd, 'notes', 'body.md'), body)
+    const { message } = await ok(['topic', 'create', 'From file', '--body-file', 'notes/body.md'], { cwd, ...forumEnv(dir) })
+    assert.equal(message.body, body)
+  })
+
+  test('create reads --body-stdin exactly', async () => {
+    const dir = await tempForum()
+    const body = '﻿  stdin 本文\n\n'
+    const { message } = await ok(['topic', 'create', 'From stdin', '--body-stdin'], { input: body, ...forumEnv(dir) })
+    assert.equal(message.body, body)
+  })
+
+  test('callers without session metadata are external with no origin', async () => {
+    const dir = await tempForum()
+    for (const env of [{}, { PI_SESSION_ID: '' }, { PI_SESSION_ID: '  \t' }]) {
+      const { topic, message } = await ok(['topic', 'create', 'Manual', '--body', 'hi'], forumEnv(dir, env))
+      assert.equal(topic.created_by, 'external')
+      assert.equal(message.author, 'external')
+      assert.equal('origin_session_id' in topic, false)
+      assert.equal('origin_session_id' in message, false)
+    }
+    const { topic } = await ok(['topic', 'create', 'Labelled', '--author', 'human'], forumEnv(dir))
+    assert.deepEqual(Object.keys(topic), ['id', 'title', 'created_by', 'created_at'])
+    assert.equal(topic.created_by, 'human')
+  })
+
+  test('titles and IDs starting with a dash can follow --', async () => {
+    const dir = await tempForum()
+    const { topic } = await ok(['topic', 'create', '--body=-starts with dash', '--', '-dash title'], forumEnv(dir))
+    assert.equal(topic.title, '-dash title')
+    await fails(['topic', 'get', '--', '-missing'], forumEnv(dir), /topic -missing not found/)
+  })
+
+  test('get reports unknown topics', async () => {
+    const dir = await tempForum()
+    await fails(['topic', 'get', 'nope'], forumEnv(dir), /topic nope not found/)
+    await fails(['topic', 'get', '  '], forumEnv(dir), /topicId must be a non-blank string/)
+  })
+
+  test('list paginates in creation order and resumes from EOF after later appends', async () => {
+    const dir = await tempForum()
+    const titles = ['one', 'two ✨', 'three']
+    for (const title of titles) await ok(['topic', 'create', title], forumEnv(dir))
+    const first = await ok(['topic', 'list', '--limit', '2'], forumEnv(dir))
+    assert.deepEqual(first.items.map((t) => t.title), titles.slice(0, 2))
+    const second = await ok(['topic', 'list', '--limit', '2', '--after', first.next_cursor], forumEnv(dir))
+    assert.deepEqual(second.items.map((t) => t.title), ['three'])
+    const end = await ok(['topic', 'list', '--after', second.next_cursor], forumEnv(dir))
+    assert.deepEqual(end.items, [])
+    const again = await ok(['topic', 'list', '--after', end.next_cursor], forumEnv(dir))
+    assert.deepEqual(again, end)
+    await ok(['topic', 'create', 'four'], forumEnv(dir))
+    const later = await ok(['topic', 'list', '--after', end.next_cursor], forumEnv(dir))
+    assert.deepEqual(later.items.map((t) => t.title), ['four'])
+    assert.deepEqual((await readAll(['topic', 'list', '--limit', '1'], forumEnv(dir))).items.map((t) => t.title), [
+      ...titles,
+      'four',
+    ])
+  })
+
+  test('list defaults to 20 topics and accepts limits 1 and 100', async () => {
+    const dir = await tempForum()
+    for (let i = 0; i < 21; i++) await createTopic(dir, { title: `t${i}`, author: 'seed' })
+    assert.equal((await ok(['topic', 'list'], forumEnv(dir))).items.length, 20)
+    assert.equal((await ok(['topic', 'list', '--limit', '1'], forumEnv(dir))).items.length, 1)
+    assert.equal((await ok(['topic', 'list', '--limit=100'], forumEnv(dir))).items.length, 21)
+  })
+})
+
+describe('message commands', () => {
+  async function seededTopic(dir) {
+    return (await createTopic(dir, { title: 'Topic', author: 'seed' })).topic
+  }
+
+  test('post from each body source with attribution and replies', async () => {
+    const dir = await tempForum()
+    const cwd = await tempRoot()
+    const topic = await seededTopic(dir)
+    const session = { PI_SESSION_ID: 'sess-3' }
+
+    const inline = await ok(['message', 'post', topic.id, '--body', '  inline ✓  '], forumEnv(dir, session))
+    assert.deepEqual(Object.keys(inline), ['message'])
+    assert.equal(inline.message.body, '  inline ✓  ')
+    assert.equal(inline.message.author, 'sess-3')
+    assert.equal(inline.message.origin_session_id, 'sess-3')
+    assert.equal(inline.message.topic_id, topic.id)
+    assert.equal('reply_to' in inline.message, false)
+
+    await fs.writeFile(path.join(cwd, 'reply.txt'), 'file body\n')
+    const reply = await ok(
+      ['message', 'post', topic.id, '--body-file', 'reply.txt', '--reply-to', inline.message.id, '--author', 'bot'],
+      { cwd, ...forumEnv(dir, session) },
+    )
+    assert.equal(reply.message.body, 'file body\n')
+    assert.equal(reply.message.reply_to, inline.message.id)
+    assert.equal(reply.message.author, 'bot')
+    assert.equal(reply.message.origin_session_id, 'sess-3')
+
+    const piped = await ok(['message', 'post', topic.id, '--body-stdin'], { input: 'piped\r\n', ...forumEnv(dir) })
+    assert.equal(piped.message.body, 'piped\r\n')
+    assert.equal(piped.message.author, 'external')
+    assert.equal('origin_session_id' in piped.message, false)
+
+    const { items } = await ok(['message', 'list', '--topic', topic.id], forumEnv(dir))
+    assert.deepEqual(items, [inline.message, reply.message, piped.message])
+  })
+
+  test('post reports missing topics and replies', async () => {
+    const dir = await tempForum()
+    const topic = await seededTopic(dir)
+    const other = await seededTopic(dir)
+    const elsewhere = await postMessage(dir, { topicId: other.id, author: 'a', body: 'x' })
+    const before = await readLog(dir)
+    await fails(['message', 'post', 'nope', '--body', 'x'], forumEnv(dir), /topic nope not found/)
+    await fails(['message', 'post', topic.id, '--body', 'x', '--reply-to', 'm'], forumEnv(dir), /message m not found/)
+    await fails(
+      ['message', 'post', topic.id, '--body', 'x', '--reply-to', elsewhere.id],
+      forumEnv(dir),
+      /belongs to a different topic/,
+    )
+    assert.equal(await readLog(dir), before)
+  })
+
+  test('list reads the whole forum or one topic, paginating and resuming from EOF', async () => {
+    const dir = await tempForum()
+    const a = await seededTopic(dir)
+    const b = await seededTopic(dir)
+    for (const [topic, body] of [[a, 'a1'], [b, 'b1'], [a, 'a2 🚀'], [b, 'b2'], [a, 'a3']]) {
+      await ok(['message', 'post', topic.id, '--body', body], forumEnv(dir))
+    }
+    const all = await readAll(['message', 'list', '--limit', '2'], forumEnv(dir))
+    assert.deepEqual(all.items.map((m) => m.body), ['a1', 'b1', 'a2 🚀', 'b2', 'a3'])
+
+    const first = await ok(['message', 'list', '--topic', a.id, '--limit', '2'], forumEnv(dir))
+    assert.deepEqual(first.items.map((m) => m.body), ['a1', 'a2 🚀'])
+    const rest = await readAll(['message', 'list', '--topic', a.id], forumEnv(dir), first.next_cursor)
+    assert.deepEqual(rest.items.map((m) => m.body), ['a3'])
+
+    await ok(['message', 'post', b.id, '--body', 'b3'], forumEnv(dir))
+    await ok(['message', 'post', a.id, '--body', 'a4'], forumEnv(dir))
+    const newer = await ok(['message', 'list', '--topic', a.id, '--after', rest.cursor], forumEnv(dir))
+    assert.deepEqual(newer.items.map((m) => m.body), ['a4'])
+    const newerAll = await ok(['message', 'list', '--after', all.cursor], forumEnv(dir))
+    assert.deepEqual(newerAll.items.map((m) => m.body), ['b3', 'a4'])
+  })
+
+  test('list for an unknown topic is an empty page', async () => {
+    const dir = await tempForum()
+    await postMessage(dir, { topicId: (await seededTopic(dir)).id, author: 'a', body: 'x' })
+    const page = await ok(['message', 'list', '--topic', 'unknown'], forumEnv(dir))
+    assert.deepEqual(page.items, [])
+    assert.equal(typeof page.next_cursor, 'string')
+  })
+
+  test('list defaults to 50 messages', async () => {
+    const dir = await tempForum()
+    const topic = await seededTopic(dir)
+    for (let i = 0; i < 51; i++) await postMessage(dir, { topicId: topic.id, author: 'seed', body: `m${i}` })
+    assert.equal((await ok(['message', 'list'], forumEnv(dir))).items.length, 50)
+    assert.equal((await ok(['message', 'list', '--limit', '100'], forumEnv(dir))).items.length, 51)
+  })
+})
+
+describe('input errors', () => {
+  test('argument and body-source errors write nothing', async () => {
+    const dir = await tempForum()
+    const cwd = await tempRoot()
+    const topic = (await createTopic(dir, { title: 'T', author: 'a' })).topic
+    await fs.writeFile(path.join(cwd, 'blank.txt'), ' \n\t\n')
+    await fs.writeFile(path.join(cwd, 'bad.txt'), Buffer.from([0x68, 0xff, 0x69]))
+    const before = await readLog(dir)
+    const env = { cwd, ...forumEnv(dir, { PI_SESSION_ID: 's' }) }
+    const cases = [
+      [['topic', 'create'], /missing TITLE for topic create/],
+      [['topic', 'create', 'A', 'B'], /unexpected argument "B" for topic create/],
+      [['topic', 'create', '   '], /title must be a non-blank string/],
+      [['topic', 'create', ''], /title must be a non-blank string/],
+      [['topic', 'create', 'A', '--author', ' '], /author must be a non-blank string/],
+      [['topic', 'create', 'A', '--author', 'x', '--author', 'y'], /--author may be given only once/],
+      [['topic', 'create', 'A', '--body', ''], /body must be a non-blank string/],
+      [['topic', 'create', 'A', '--body', ' \n '], /body must be a non-blank string/],
+      [['topic', 'create', 'A', '--body-file', 'blank.txt'], /body must be a non-blank string/],
+      [['topic', 'create', 'A', '--body-file', 'bad.txt'], /body from .*bad\.txt is not valid UTF-8/],
+      [['topic', 'create', 'A', '--body-file', 'missing.txt'], /cannot read body file .*missing\.txt: ENOENT/],
+      [['topic', 'create', 'A', '--body', 'x', '--body-file', 'blank.txt'], /use only one of --body, --body-file/],
+      [['topic', 'create', 'A', '--body', 'x', '--body', 'y'], /--body may be given only once/],
+      [['topic', 'create', 'A', '--body'], /argument missing/],
+      [['topic', 'create', 'A', '--body', '-x'], /argument is ambiguous/],
+      [['topic', 'create', 'A', '--body-stdin=yes'], /does not take an argument/],
+      [['topic', 'create', 'A', '--reply-to', 'm'], /Unknown option '--reply-to'/],
+      [['topic', 'create', 'A', '--limit', '5'], /Unknown option '--limit'/],
+      [['topic', 'create', '-x'], /Unknown option '-x'/],
+      [['topic', 'get'], /missing TOPIC_ID for topic get/],
+      [['topic', 'get', topic.id, 'extra'], /unexpected argument "extra"/],
+      [['topic', 'list', 'extra'], /unexpected argument "extra" for topic list/],
+      [['topic', 'list', '--topic', topic.id], /Unknown option '--topic'/],
+      [['message', 'post', topic.id], /a body is required/],
+      [['message', 'post', '--body', 'x'], /missing TOPIC_ID for message post/],
+      [['message', 'post', topic.id, '--body', '\t'], /body must be a non-blank string/],
+      [['message', 'post', topic.id, '--body-stdin', '--body-file', 'blank.txt'], /use only one of --body-file, --body-stdin/],
+      [['message', 'post', topic.id, 'extra', '--body', 'x'], /unexpected argument "extra"/],
+      [['message', 'post', topic.id, '--body', 'x', '--reply-to', ' '], /replyTo must be a non-blank string/],
+      [['message', 'list', '--topic', ''], /topicId must be a non-blank string/],
+      [['message', 'list', '--verbose'], /Unknown option '--verbose'/],
+    ]
+    for (const [args, pattern] of cases) {
+      const stderr = await fails(args, { ...env, input: ' ' }, pattern)
+      assert.doesNotMatch(stderr, /warning/, args.join(' '))
+    }
+    assert.equal(await readLog(dir), before)
+  })
+
+  test('storage caps apply to titles, authors and bodies', async () => {
+    const dir = await tempForum()
+    await ok(['topic', 'create', '🧪'.repeat(256), '--author', 'é'.repeat(256)], forumEnv(dir))
+    await fails(['topic', 'create', 'x'.repeat(257)], forumEnv(dir), /title must be at most 256 characters/)
+    await fails(['topic', 'create', 'x', '--author', 'x'.repeat(257)], forumEnv(dir), /author must be at most 256/)
+    const big = 'é'.repeat(32 * 1024)
+    await ok(['topic', 'create', 'Big', '--body-stdin'], { input: big, ...forumEnv(dir) })
+    await fails(['topic', 'create', 'Too big', '--body-stdin'], { input: `${big}x`, ...forumEnv(dir) }, /at most 65536 bytes/)
+  })
+
+  test('limits and cursors are validated', async () => {
+    const dir = await tempForum()
+    for (const limit of ['0', '101', '-1', '1.5', 'ten', '', ' 5', '1e2']) {
+      for (const command of [['topic', 'list'], ['message', 'list']]) {
+        await fails([...command, `--limit=${limit}`], forumEnv(dir), /limit must be an integer from 1 to 100/)
+      }
+    }
+    await fails(['topic', 'list', '--after', 'not a cursor'], forumEnv(dir), /cursor is not valid/)
+    await fails(['message', 'list', '--after', ''], forumEnv(dir), /cursor is not valid/)
+    const other = await tempForum()
+    const { next_cursor } = await ok(['topic', 'list'], forumEnv(other))
+    await fails(['topic', 'list', '--after', next_cursor], forumEnv(dir), /cursor belongs to a different forum/)
+  })
+})
+
+describe('storage conditions', () => {
+  test('warnings go to stderr while the result stays on stdout', async () => {
+    const dir = await tempForum()
+    await fs.mkdir(dir)
+    await fs.writeFile(logPath(dir), 'not json\n')
+    const { topic } = await createTopic(dir, { title: 'T', author: 'a' })
+    for (const args of [['topic', 'list'], ['topic', 'get', topic.id], ['message', 'list']]) {
+      const result = await run(args, forumEnv(dir))
+      assert.equal(result.code, 0)
+      assert.match(result.stderr, /^pi-forum: warning: skipping malformed record at byte offset \d+/)
+      JSON.parse(result.stdout)
+    }
+    await fs.appendFile(logPath(dir), '{"partial')
+    const result = await run(['message', 'post', topic.id, '--body', 'x'], forumEnv(dir))
+    assert.equal(result.code, 1)
+    assert.equal(result.stdout, '')
+    assert.match(result.stderr, /pi-forum: error: .*incomplete record .*repair it manually/)
+  })
+
+  test('a held lock fails with a bounded error', async () => {
+    const dir = await tempForum()
+    await fs.mkdir(path.join(dir, '.write-lock'), { recursive: true })
+    await fails(['topic', 'create', 'T'], forumEnv(dir), /timed out waiting for .*\.write-lock; .*remove it manually/)
+    assert.equal(await readLog(dir), null)
+  })
+
+  test('a partial topic creation names the created topic and prints no result', async () => {
+    const dir = await tempForum()
+    const preload = path.join(await tempRoot(), 'fail-message-append.mjs')
+    await fs.writeFile(
+      preload,
+      `import fs from 'node:fs/promises'
+const appendFile = fs.appendFile
+fs.appendFile = async (file, data, ...rest) => {
+  if (String(data).includes('"message_posted"')) throw new Error('EIO: simulated failure')
+  return appendFile(file, data, ...rest)
+}
+`,
+    )
+    const stderr = await fails(
+      ['topic', 'create', 'Partial', '--body', 'lost'],
+      { nodeArgs: ['--import', preload], ...forumEnv(dir) },
+      /simulated failure/,
+    )
+    const [event] = (await readLog(dir)).trim().split('\n').map((line) => JSON.parse(line))
+    assert.equal(event.type, 'topic_created')
+    assert.match(stderr, new RegExp(`topic ${event.id} was created, but its initial message may be missing`))
+    assert.match(stderr, new RegExp(`pi-forum message list --topic ${event.id}`))
+    await ok(['topic', 'get', event.id], forumEnv(dir))
+  })
+})

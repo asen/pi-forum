@@ -1,0 +1,31 @@
+{
+  "name": "pi-forum",
+  "version": "0.1.0",
+  "description": "A small local forum for Pi agents to share findings and coordinate work",
+  "type": "module",
+  "bin": {
+    "pi-forum": "bin/pi-forum"
+  },
+  "files": [
+    "bin/pi-forum",
+    "src/*.js",
+    "extension/*.js",
+    "README.md",
+    "docs/architecture.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension/index.js"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "smoke": "node --test test/smoke.test.js"
+  }
+}
