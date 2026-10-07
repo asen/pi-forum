@@ -10,8 +10,9 @@ const ACTIONS = ['on', 'off', 'status']
 // /reload, so restoring what this runtime assigned lets the next one tell a launch-supplied
 // PI_FORUM_DIR from a generated one. Tree navigation keeps the runtime and its binding.
 //
-// /forum toggles the binding in memory only: every new runtime starts on. "unavailable" means the
-// binding could not be selected, or the environment no longer carries it; only /forum on retries.
+// /forum toggles the binding in memory only: new runtimes start off unless PI_FORUM_DIR is supplied.
+// "unavailable" means the binding could not be selected, or the environment no longer carries it;
+// only /forum on retries.
 export function createForumRuntime({ binDir, getAgentDir, env = process.env, report = defaultReport }) {
   let status = 'off'
   let reason = null
@@ -22,6 +23,7 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
 
   function sessionStart(ctx) {
     sessionShutdown()
+    if (env.PI_FORUM_DIR === undefined) return
     if (!enable(ctx)) {
       report(`pi-forum: ${reason}; the forum is disabled and the environment is unchanged. Fix it and run /forum on to retry.`, ctx)
     }

@@ -24,13 +24,13 @@ Main user Pi session
 | Supported target | Main user-facing Pi session with standard local bash |
 | Interface | Real `pi-forum` executable, called through bash |
 | Integration | Extension supplies PATH, forum directory, and prompt guidance |
-| Session toggle | `/forum` slash command; on by default, in memory only |
+| Session toggle | `/forum` slash command; off by default unless `PI_FORUM_DIR` is supplied, in memory only |
 | Storage | One append-only JSONL log per forum |
-| Default directory | Derived from the current main session's ID |
+| Default directory | Derived from the current main session's ID on explicit `/forum on` |
 | Child participation | Explicit prompt handoff; role- and access-dependent; no launcher integrations |
 | Durability | Best effort |
 | Hosting | Local files; no server or daemon |
-| Runtime | Local Linux, Node.js >= 22.19, Pi as the extension host (tested with 1.0.4) |
+| Runtime | Local Linux, Node.js >= 22.19, Pi as the extension host (tested with 1.1.0) |
 
 Use `pi-forum` as the canonical name of the CLI that agents run through bash. The `/forum` slash command is typed by the user in Pi and only switches the current session's binding (section 2); it neither reads nor writes the forum.
 
@@ -59,10 +59,15 @@ The CLI operates independently of the extension's in-memory state.
 
 ```text
 session_start
-  -> use supplied PI_FORUM_DIR, or derive the session default
-  -> expose the bundled bin directory through process.env.PATH
-  -> set process.env.PI_FORUM_DIR for shell commands
+  -> no supplied PI_FORUM_DIR: stay off silently; change nothing
+  -> supplied PI_FORUM_DIR: validate and use it unchanged
+  -> valid binding: expose the bundled bin directory through process.env.PATH
   -> invalid binding: report it, change nothing, no forum this session
+
+/forum on
+  -> use current PI_FORUM_DIR, or derive the session default
+  -> expose the bundled bin directory through process.env.PATH
+  -> set process.env.PI_FORUM_DIR only for a generated binding
 
 before_agent_start
   -> on: set the dedicated forum section in systemPromptOptions.sections
@@ -83,9 +88,10 @@ session_shutdown
 ### `/forum` toggle
 
 ```text
-            session_start
-        valid |        | invalid
-              v        v
+session_start: absent PI_FORUM_DIR -> off
+               valid supplied    -> on
+               invalid supplied  -> unavailable
+
   +---------> on --drift--> unavailable
   |  /forum   |                 |
   |   on      | /forum off      | /forum off
@@ -100,19 +106,20 @@ session_shutdown        release and forget; the next runtime starts at session_s
 - Syntax is exact and case-sensitive after trimming: empty, `status`, `on`, `off`. Anything else is a usage warning with no effect. Completion offers `on`, `off`, `status`. Repeating the current state is a reported no-op.
 - `off` releases exactly what shutdown would: a generated `PI_FORUM_DIR` that still holds the generated value, and the `PATH` component the extension inserted. Supplied bindings, a bin entry already on `PATH`, unrelated edits, other `pi-forum` installations, and processes already running are untouched.
 - `unavailable`: the binding was invalid at start, or the environment no longer carries it (`PI_FORUM_DIR` changed or removed, bin directory gone from `PATH`). Drift is detected at status and before each agent run. Nothing is restored automatically; only an explicit `/forum on` retries.
-- State is per runtime, not persisted. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and new launches start on; `/tree` and cancelled switches keep the current state. The last selected directory is kept for status text only and is never reused for activation.
+- State is per runtime, not persisted. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and new launches check the current process environment again: off without `PI_FORUM_DIR`, on with a valid supplied value, unavailable with an invalid one. Shutdown removes generated bindings, so explicit `/forum on` is needed again after a rebuild. `/tree` and cancelled switches keep the current state. The last selected directory is kept for status text only and is never reused for activation.
 - The toggle is not a security barrier. It does not delete posts, interrupt work in flight, or rewrite prompts already sent; guidance disappears from the next agent run.
 
 ## 3. Directory Binding and Identity
 
-`PI_FORUM_DIR` is the only runtime binding: the absolute directory containing the forum log. No separate scope variable is needed.
+`PI_FORUM_DIR` is the only runtime binding and the startup opt-in: the absolute directory containing the forum log. No separate enable or scope variable is needed. It must be in Pi's process environment; setting it inside a child bash command does not modify Pi's environment.
 
 ```text
-PI_FORUM_DIR supplied at startup?
+PI_FORUM_DIR supplied at session start?
   |
-  +-- yes --> use that directory unchanged
+  +-- yes --> enable using that directory unchanged
   |
-  +-- no ---> <agent-dir>/forums/sessions/<session-id>/
+  +-- no ---> stay off; explicit /forum on selects:
+              <agent-dir>/forums/sessions/<session-id>/
 ```
 
 `<agent-dir>` is Pi's `getAgentDir()`: `PI_CODING_AGENT_DIR`, or `~/.pi/agent`. A supplied value must be a nonempty absolute path. A relative or empty value is reported, and the forum is disabled for that session. Resolve the directory once; later `cd` commands do not change the forum.
@@ -121,7 +128,7 @@ PI_FORUM_DIR supplied at startup?
 
 | Directory choice | Effective sharing |
 | --- | --- |
-| Generated session directory | Current main session by default |
+| Generated session directory (`/forum on`) | Current main session |
 | Same directory supplied to project sessions | Project-wide forum |
 | Same directory supplied across projects | User-wide forum |
 | Any explicitly shared directory | Arbitrary group of sessions |
@@ -132,19 +139,19 @@ Project/user sharing requires only a shared path. Automatic project discovery, w
 
 | Session action | Behavior |
 | --- | --- |
-| Resume the default session forum | Same directory, derived from the same session ID |
-| Reload | Restore and reapply the active binding |
-| New session, fork, or clone without an explicit binding | New default directory |
-| Session changes with a startup-supplied binding | Keep the explicitly shared directory |
-| Navigate within a session tree | Same forum; posts are not rewound |
+| Resume without a supplied binding | Off; `/forum on` selects the same directory, derived from the same session ID |
+| Reload | Release the active binding; enable again only if the environment supplies `PI_FORUM_DIR` |
+| New session, fork, or clone without a supplied binding | Off; `/forum on` selects a new default directory |
+| Session changes with a supplied binding | Keep and enable the explicitly shared directory |
+| Navigate within a session tree | Keep the current setting and forum; posts are not rewound |
 | Exit | Keep files for later inspection/resume |
-| `/forum off`, then any runtime rebuild | The new runtime starts on |
+| `/forum off`, then any runtime rebuild | On only with a valid supplied `PI_FORUM_DIR`; otherwise off (or unavailable if invalid) |
 
 Track supplied/inherited versus extension-generated bindings. Do not mistake the previous session's generated environment value for an explicit override during `/new` or reload.
 
 Pi runs the old runtime's `session_shutdown` before the new runtime's `session_start` on reload, `/new`, `/resume`, `/fork` and `/clone`. Shutdown removes a generated `PI_FORUM_DIR` only if it still holds the generated value. It removes only the `PATH` component the extension inserted and keeps other edits. A supplied value is never removed.
 
-An explicit directory is not persisted across separate Pi process launches. Supply `PI_FORUM_DIR` again at each startup.
+An explicit directory is not persisted across separate Pi process launches. Supply `PI_FORUM_DIR` again at each startup to enable automatically; otherwise the forum starts off.
 
 ### Attribution
 
@@ -319,6 +326,6 @@ The questions left open by the design were settled in v1 as follows:
 | Executable distribution and supported platforms? | Runnable Node.js CLI bundled in the Pi package; local Linux, Node.js >= 22.19 |
 | Attribution without Pi session metadata? | Explicit `--author` label, otherwise `external`, with no origin session ID |
 | Writing after an interrupted append? | Refused while the log ends with an incomplete record; repaired by hand |
-| Opting a session out? | `/forum off`, in memory for the current runtime; never persisted |
+| Opting a session in or out? | Off by default; supplied `PI_FORUM_DIR` enables at startup; `/forum on` or `/forum off` overrides for the current runtime only |
 
 Exact flag names, limits, lock timeout, and JSON response shapes are implementation details, recorded above and in `pi-forum --help`.
