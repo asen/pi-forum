@@ -1,29 +1,39 @@
 import path from 'node:path'
 
 export const SECTION_NAME = 'forum'
+export const COMMAND_NAME = 'forum'
+export const USAGE = 'Usage: /forum [on|off|status]'
+const ACTIONS = ['on', 'off', 'status']
 
 // Session-scoped forum binding for one Pi extension runtime. Pi tears down the old runtime
 // (session_shutdown) before the next one starts (session_start) on /new, resume, fork, clone and
 // /reload, so restoring what this runtime assigned lets the next one tell a launch-supplied
 // PI_FORUM_DIR from a generated one. Tree navigation keeps the runtime and its binding.
+//
+// /forum toggles the binding in memory only: every new runtime starts on. "unavailable" means the
+// binding could not be selected, or the environment no longer carries it; only /forum on retries.
 export function createForumRuntime({ binDir, getAgentDir, env = process.env, report = defaultReport }) {
+  let status = 'off'
+  let reason = null
+  // What this runtime exposed and owns; kept while unavailable so off, on and shutdown can undo it.
   let active = null
+  // The last successfully selected directory, for status only; never reused for activation.
+  let selected = null
 
   function sessionStart(ctx) {
     sessionShutdown()
-    const binding = selectBinding(env.PI_FORUM_DIR, ctx, getAgentDir)
-    if (binding.error) {
-      report(`pi-forum: ${binding.error}; the forum is disabled for this session and the environment is unchanged.`, ctx)
-      return
+    if (!enable(ctx)) {
+      report(`pi-forum: ${reason}; the forum is disabled and the environment is unchanged. Fix it and run /forum on to retry.`, ctx)
     }
-    const pathChange = prependPath(env, binDir)
-    if (binding.generated) env.PI_FORUM_DIR = binding.forumDir
-    active = { ...binding, pathChange }
   }
 
   function beforeAgentStart(event, ctx) {
-    if (!active) return
-    event.systemPromptOptions.sections[SECTION_NAME] = forumSection({
+    const { sections } = event.systemPromptOptions
+    if (!checkHealth()) {
+      delete sections[SECTION_NAME]
+      return
+    }
+    sections[SECTION_NAME] = forumSection({
       forumDir: active.forumDir,
       generated: active.generated,
       sessionId: ctx.sessionManager.getSessionId(),
@@ -32,6 +42,61 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
 
   // Idempotent: undoes only what this runtime assigned and still finds in place.
   function sessionShutdown() {
+    release()
+    status = 'off'
+    reason = null
+    selected = null
+  }
+
+  function command(args, ctx) {
+    const action = args.trim() || 'status'
+    if (!ACTIONS.includes(action)) {
+      report(USAGE, ctx, 'warning')
+      return
+    }
+    if (action === 'on') {
+      if (checkHealth()) {
+        report(`Forum is already on: ${describe(active)}`, ctx, 'info')
+      } else if (enable(ctx)) {
+        report(`Forum is on: ${describe(active)}`, ctx, 'info')
+      } else {
+        report(statusText(), ctx, 'warning')
+      }
+    } else if (action === 'off') {
+      const wasOff = status === 'off'
+      disable()
+      report(wasOff ? `Forum is already off.${lastSelected()}` : statusText(), ctx, 'info')
+    } else {
+      checkHealth()
+      report(statusText(), ctx, status === 'unavailable' ? 'warning' : 'info')
+    }
+  }
+
+  // Selects from the current environment and session after releasing any previous exposure.
+  function enable(ctx) {
+    release()
+    const binding = selectBinding(env.PI_FORUM_DIR, ctx, getAgentDir)
+    if (binding.error) {
+      status = 'unavailable'
+      reason = binding.error
+      return false
+    }
+    const pathChange = prependPath(env, binDir)
+    if (binding.generated) env.PI_FORUM_DIR = binding.forumDir
+    active = { ...binding, pathChange }
+    selected = { forumDir: binding.forumDir, generated: binding.generated }
+    status = 'on'
+    reason = null
+    return true
+  }
+
+  function disable() {
+    release()
+    status = 'off'
+    reason = null
+  }
+
+  function release() {
     if (!active) return
     const { forumDir, generated, pathChange } = active
     active = null
@@ -39,14 +104,59 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
     if (pathChange) restorePath(env, binDir, pathChange)
   }
 
+  // An "on" binding the environment no longer carries becomes unavailable; nothing is restored.
+  function checkHealth() {
+    if (status !== 'on') return false
+    const drift = bindingDrift(env, binDir, active.forumDir)
+    if (!drift) return true
+    status = 'unavailable'
+    reason = drift
+    return false
+  }
+
+  function statusText() {
+    if (status === 'on') return `Forum is on: ${describe(active)}`
+    if (status === 'off') return `Forum is off.${lastSelected()}`
+    return `Forum is unavailable: ${reason}.${lastSelected()} Run /forum on to retry.`
+  }
+
+  function lastSelected() {
+    return selected ? ` Last selected directory (inactive): ${describe(selected)}` : ''
+  }
+
   return {
     get binding() {
-      return active && { forumDir: active.forumDir, generated: active.generated }
+      return status === 'on' ? { forumDir: active.forumDir, generated: active.generated } : null
+    },
+    get state() {
+      return { status, reason, selected: selected && { ...selected } }
     },
     sessionStart,
     beforeAgentStart,
     sessionShutdown,
+    command,
   }
+}
+
+// Argument completions for /forum: the actions starting with the typed prefix.
+export function forumCompletions(prefix) {
+  return ACTIONS.filter((action) => action.startsWith(prefix)).map((action) => ({ value: action, label: action }))
+}
+
+function describe({ forumDir, generated }) {
+  return `${forumDir} (${generated ? 'session default' : 'supplied PI_FORUM_DIR'})`
+}
+
+function bindingDrift(env, binDir, forumDir) {
+  const current = env.PI_FORUM_DIR
+  if (current === undefined) return `PI_FORUM_DIR was removed (was ${JSON.stringify(forumDir)})`
+  if (current !== forumDir) {
+    return `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to ${JSON.stringify(current)}`
+  }
+  if (!(env.PATH ?? '').split(path.delimiter).includes(binDir)) {
+    return `the bundled pi-forum directory ${binDir} is no longer on PATH`
+  }
+  return null
 }
 
 // A supplied PI_FORUM_DIR is used unchanged; otherwise the session ID selects a default directory.
@@ -88,8 +198,9 @@ function restorePath(env, binDir, { baseline, assigned }) {
   env.PATH = parts.join(path.delimiter)
 }
 
-function defaultReport(message, ctx) {
-  if (ctx?.hasUI) ctx.ui.notify(message, 'error')
+// Pi's notifications when the mode has a UI (TUI and RPC); stderr otherwise.
+function defaultReport(message, ctx, type = 'error') {
+  if (ctx?.hasUI) ctx.ui.notify(message, type)
   else console.error(message)
 }
 

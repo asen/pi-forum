@@ -6,7 +6,8 @@
 //
 // With the variable set, a root that cannot be loaded fails the suite. Every run uses its own agent
 // directory, sessions, working directory, HOME, TMPDIR and npm cache under one temp directory, and
-// makes no model requests: the session lifecycle and before_agent_start are driven directly.
+// makes no model requests: the session lifecycle and before_agent_start are driven directly, and
+// /forum is submitted through session.prompt(), which runs extension commands before any model check.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -62,6 +63,8 @@ function probeSource(position) {
     state.prompts[${JSON.stringify(position)}] = event.systemPrompt
     state.ctx = ctx
   })
+  // Setting state.cancel cancels the next /new, /resume or /fork, as an extension or the user can.
+  ${position === 'before' ? "for (const name of ['session_before_switch', 'session_before_fork']) pi.on(name, () => (state.cancel ? { cancel: true } : undefined))" : ''}
 }
 `
 }
@@ -108,15 +111,24 @@ async function tearDown() {
   if (temp) await fs.rm(temp, { recursive: true, force: true })
 }
 
+// A UI context for modes with a UI (as RPC binds one): records notifications, ignores the rest.
+function recordingUI(notices) {
+  const ui = { notify: (message, type = 'info') => notices.push({ type, message }) }
+  return new Proxy(ui, {
+    get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined),
+  })
+}
+
 // Starts a Pi session runtime like the CLI does, with its own agent dir, sessions and project.
 // mode "extension" loads the package as `pi -e DIR` does; "settings" relies on `pi install`.
-async function openHost(packageDir, { supplied, mode = 'extension' } = {}) {
+// With ui, notifications are recorded in host.notices; without it, Pi's extensions have no UI.
+async function openHost(packageDir, { supplied, mode = 'extension', ui = false, PATH = BASE_PATH } = {}) {
   const dir = await fs.mkdtemp(path.join(temp, 'host-'))
   const agentDir = path.join(dir, 'agent')
   const project = path.join(dir, 'project')
   const sessions = path.join(dir, 'sessions')
   for (const d of [agentDir, project, sessions]) await fs.mkdir(d)
-  process.env.PATH = BASE_PATH
+  process.env.PATH = PATH
   process.env.PI_CODING_AGENT_DIR = agentDir
   if (supplied === undefined) delete process.env.PI_FORUM_DIR
   else process.env.PI_FORUM_DIR = supplied
@@ -126,6 +138,7 @@ async function openHost(packageDir, { supplied, mode = 'extension' } = {}) {
     mode === 'extension' ? [probes.before, packageDir, probes.after] : [probes.before, probes.after]
   globalThis.piForumProbe = { events: [], prompts: {} }
   const errors = []
+  const notices = []
   const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
     const services = await pi.createAgentSessionServices({
       cwd,
@@ -141,7 +154,8 @@ async function openHost(packageDir, { supplied, mode = 'extension' } = {}) {
     const created = await pi.createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })
     return { ...created, services, diagnostics: services.diagnostics }
   }
-  const bind = (session) => session.bindExtensions({ onError: (error) => errors.push(error) })
+  const bindings = { onError: (error) => errors.push(error), ...(ui && { uiContext: recordingUI(notices) }) }
+  const bind = (session) => session.bindExtensions(bindings)
   const runtime = await pi.createAgentSessionRuntime(createRuntime, {
     cwd: project,
     agentDir: pi.getAgentDir(),
@@ -154,6 +168,7 @@ async function openHost(packageDir, { supplied, mode = 'extension' } = {}) {
     agentDir,
     project,
     errors,
+    notices,
     probe: globalThis.piForumProbe,
     get sessionId() {
       return runtime.session.sessionId
@@ -223,6 +238,18 @@ function converse(host, text) {
   return user
 }
 
+// Submits a slash command as the editor does and returns the notifications it produced. Pi runs
+// a registered extension command with a real command context and never reaches the model.
+async function slash(host, text) {
+  host.notices.length = 0
+  await host.runtime.session.prompt(text)
+  return host.notices.splice(0)
+}
+
+const info = (message) => ({ type: 'info', message })
+const warning = (message) => ({ type: 'warning', message })
+const USAGE = 'Usage: /forum [on|off|status]'
+
 // Takes the lifecycle events recorded since the last call.
 function takeEvents(host) {
   return host.probe.events.splice(0)
@@ -230,7 +257,7 @@ function takeEvents(host) {
 
 // What a session replacement must look like: the old runtime restores everything before the new
 // one starts, and the new one binds the expected directory.
-function assertReplacement(host, events, { reason, from, to, forumDir, packageDir, supplied }) {
+function assertReplacement(host, events, { reason, from, to, forumDir, packageDir, supplied, basePath = BASE_PATH }) {
   const bin = path.join(packageDir, 'bin')
   const before = supplied
   assert.deepEqual(
@@ -243,9 +270,9 @@ function assertReplacement(host, events, { reason, from, to, forumDir, packageDi
     ],
   )
   assert.equal(events[1].forumDir, before)
-  assert.equal(events[1].path, BASE_PATH)
+  assert.equal(events[1].path, basePath)
   assert.equal(events[2].forumDir, before)
-  assert.equal(events[2].path, BASE_PATH)
+  assert.equal(events[2].path, basePath)
   assert.equal(events[3].forumDir, forumDir)
   assert.equal(events[3].path, `${bin}${path.delimiter}${BASE_PATH}`)
   assertBound(host, forumDir, packageDir)
@@ -274,13 +301,21 @@ else describe('real Pi host', () => {
     describe(['source checkout', 'packed tarball'][variant], () => {
       const pkg = () => packages[variant]
 
-      test('loads through Pi with only the three lifecycle hooks', async () => {
+      test('loads through Pi with the three lifecycle hooks, the /forum command and no tools', async () => {
         const host = await openHost(pkg().dir)
         try {
           const extension = loadedExtension(host, pkg().dir)
           assert.deepEqual([...extension.handlers.keys()].sort(), ['before_agent_start', 'session_shutdown', 'session_start'])
           assert.equal(extension.tools.size, 0)
-          assert.equal(extension.commands.size, 0)
+          assert.deepEqual([...extension.commands.keys()], ['forum'])
+          const command = host.runtime.session.extensionRunner.getCommand('forum')
+          assert.ok(command, 'Pi resolves /forum')
+          assert.match(command.description, /on or off/)
+          const complete = (prefix) => command.getArgumentCompletions(prefix).map((item) => item.value)
+          assert.deepEqual(complete(''), ['on', 'off', 'status'])
+          assert.deepEqual(complete('o'), ['on', 'off'])
+          assert.deepEqual(complete('st'), ['status'])
+          assert.deepEqual(complete('x'), [])
           assert.deepEqual(host.errors, [])
         } finally {
           await host.runtime.dispose()
@@ -425,7 +460,167 @@ else describe('real Pi host', () => {
         assert.deepEqual(host.errors, [])
       })
 
-      test('an invalid PI_FORUM_DIR is reported and leaves the session without the forum', async (t) => {
+      test('/forum reports, turns the generated binding off and on, and every rebuilt runtime starts on', async () => {
+        const { dir } = pkg()
+        const host = await openHost(dir, { ui: true })
+        const first = host.sessionId
+        const firstFile = host.runtime.session.sessionFile
+        const forumDir = host.defaultDir(first)
+        const log = path.join(forumDir, 'events.jsonl')
+        const on = `Forum is on: ${forumDir} (session default)`
+        const inactive = ` Last selected directory (inactive): ${forumDir} (session default)`
+        takeEvents(host)
+
+        // Status, the default action, reports without touching the environment or creating files.
+        let env = { ...process.env }
+        assert.deepEqual(await slash(host, '/forum'), [info(on)])
+        assert.deepEqual(await slash(host, '/forum status'), [info(on)])
+        assert.deepEqual(await slash(host, '/forum   status  '), [info(on)])
+        assert.deepEqual({ ...process.env }, env)
+        await assert.rejects(fs.access(forumDir))
+
+        // Real posts through Pi's bash while on.
+        await startRun(host)
+        const { topic } = await forum(host, ['topic', 'create', 'Plan', '--body', 'first post'])
+        await forum(host, ['message', 'post', topic.id, '--body', 'second post'])
+        const bytes = await fs.readFile(log)
+        const userEntry = converse(host, 'first question')
+        converse(host, 'second question')
+        const leaf = host.runtime.session.sessionManager.getLeafId()
+        const secondUser = host.runtime.session.sessionManager.getEntry(leaf).parentId
+
+        // Invalid arguments are case-sensitive and only produce the usage warning.
+        for (const text of ['/forum ON', '/forum Off', '/forum bogus', '/forum on now', '/forum --help']) {
+          assert.deepEqual(await slash(host, text), [warning(USAGE)], text)
+        }
+        assert.deepEqual({ ...process.env }, env)
+
+        // Off removes the generated binding and the PATH entry, and the forum section from later prompts.
+        assert.deepEqual(await slash(host, '/forum off'), [info(`Forum is off.${inactive}`)])
+        assert.equal(process.env.PI_FORUM_DIR, undefined)
+        assert.equal(process.env.PATH, BASE_PATH)
+        let run = await startRun(host)
+        assert.deepEqual(Object.keys(run.sections), ['project_rules', 'team_notes'])
+        assert.equal(run.after, run.before)
+        assert.match(run.after, /<project_rules>\nKeep changes small\.\n<\/project_rules>/)
+        assert.match(run.after, /<team_notes>\nNotes from another extension\.\n<\/team_notes>/)
+        assert.doesNotMatch(run.after, /<forum>/)
+        assert.equal((await bash(host, 'command -v pi-forum')).exit_code, 1)
+        env = { ...process.env }
+        assert.deepEqual(await slash(host, '/forum off'), [info(`Forum is already off.${inactive}`)])
+        assert.deepEqual(await slash(host, '/forum'), [info(`Forum is off.${inactive}`)])
+        assert.deepEqual(await slash(host, '/forum nope'), [warning(USAGE)])
+        assert.deepEqual({ ...process.env }, env)
+
+        // /tree and cancelled /new, /resume and /fork keep the runtime, so the forum stays off.
+        assert.equal((await host.runtime.session.navigateTree(userEntry, { summarize: false })).cancelled, false)
+        host.probe.cancel = true
+        assert.equal((await host.runtime.newSession()).cancelled, true)
+        assert.equal((await host.runtime.switchSession(firstFile)).cancelled, true)
+        assert.equal((await host.runtime.fork(secondUser)).cancelled, true)
+        host.probe.cancel = false
+        assert.deepEqual(takeEvents(host), [])
+        assert.equal(host.sessionId, first)
+        assert.deepEqual(await slash(host, '/forum status'), [info(`Forum is off.${inactive}`)])
+        assert.deepEqual({ ...process.env }, env)
+        assert.deepEqual(await fs.readFile(log), bytes)
+
+        // On rebinds the same directory; the log is byte-identical and the posts are readable.
+        assert.deepEqual(await slash(host, '/forum on'), [info(on)])
+        assertBound(host, forumDir, dir)
+        run = await startRun(host)
+        assert.deepEqual(Object.keys(run.sections), ['project_rules', 'team_notes', 'forum'])
+        assert.ok(run.after.startsWith(run.before))
+        assert.match(run.after.slice(run.before.length), /^\s*<forum>\n[\s\S]+\n<\/forum>\s*$/)
+        assert.ok(run.after.includes(`Forum directory: ${forumDir} (PI_FORUM_DIR; this session's default forum)`))
+        assert.deepEqual(await fs.readFile(log), bytes)
+        const listed = await forum(host, ['message', 'list', '--topic', topic.id])
+        assert.deepEqual(listed.items.map((m) => [m.body, m.author]), [['first post', first], ['second post', first]])
+        env = { ...process.env }
+        assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is already on: ${forumDir} (session default)`)])
+        assert.deepEqual({ ...process.env }, env)
+
+        // Off undoes only pi-forum's own PATH entry; other PATH edits made meanwhile stay.
+        process.env.PATH = ['/opt/front', process.env.PATH, '/opt/back'].join(path.delimiter)
+        assert.deepEqual(await slash(host, '/forum status'), [info(on)])
+        await slash(host, '/forum off')
+        assert.equal(process.env.PATH, ['/opt/front', BASE_PATH, '/opt/back'].join(path.delimiter))
+        process.env.PATH = BASE_PATH
+        await slash(host, '/forum on')
+        assertBound(host, forumDir, dir)
+
+        // Every runtime Pi rebuilds starts on again, even when the previous one was off.
+        await host.runtime.session.navigateTree(leaf, { summarize: false })
+        const rebuilds = [
+          ['reload', () => host.runtime.session.reload()],
+          ['new', () => host.runtime.newSession()],
+          ['resume', () => host.runtime.switchSession(firstFile)],
+          ['fork', () => host.runtime.fork(secondUser)],
+          ['fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' })], // /clone
+        ]
+        for (const [reason, rebuild] of rebuilds) {
+          assert.match((await slash(host, '/forum off'))[0].message, /^Forum is off\./)
+          assert.equal(process.env.PATH, BASE_PATH)
+          const from = host.sessionId
+          takeEvents(host)
+          await rebuild()
+          const to = host.sessionId
+          assertReplacement(host, takeEvents(host), { reason, from, to, forumDir: host.defaultDir(to), packageDir: dir })
+          assert.deepEqual(await slash(host, '/forum'), [info(`Forum is on: ${host.defaultDir(to)} (session default)`)], reason)
+          assert.ok((await startRun(host)).sections.forum.includes(`Your author identity: ${to} `))
+        }
+
+        await host.runtime.dispose()
+        assert.equal(process.env.PATH, BASE_PATH)
+        assert.equal(process.env.PI_FORUM_DIR, undefined)
+        assert.deepEqual(await fs.readFile(log), bytes)
+        assert.deepEqual(host.errors, [])
+      })
+
+      test('/forum off leaves a supplied PI_FORUM_DIR and a pre-existing bin PATH entry in place', async () => {
+        const { dir } = pkg()
+        const shared = path.join(temp, `toggled shared forum ${variant}`)
+        const userPath = `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`
+        const host = await openHost(dir, { ui: true, supplied: shared, PATH: userPath })
+        const first = host.sessionId
+        const on = `Forum is on: ${shared} (supplied PI_FORUM_DIR)`
+        takeEvents(host)
+        assertBound(host, shared, dir)
+        assert.deepEqual(await slash(host, '/forum'), [info(on)])
+        await startRun(host)
+        const { topic } = await forum(host, ['topic', 'create', 'Shared', '--body', 'kept'])
+        const bytes = await fs.readFile(path.join(shared, 'events.jsonl'))
+
+        // Nothing here is pi-forum's to remove: only its prompt guidance goes away.
+        assert.deepEqual(await slash(host, '/forum off'), [info(`Forum is off. Last selected directory (inactive): ${shared} (supplied PI_FORUM_DIR)`)])
+        assert.equal(process.env.PI_FORUM_DIR, shared)
+        assert.equal(process.env.PATH, userPath)
+        const run = await startRun(host)
+        assert.equal(run.after, run.before)
+        assert.doesNotMatch(run.after, /<forum>/)
+        // The user's own PATH entry and binding still reach the CLI; /forum is not a barrier.
+        assert.deepEqual((await forum(host, ['message', 'list', '--topic', topic.id])).items.map((m) => m.body), ['kept'])
+        assert.deepEqual(await fs.readFile(path.join(shared, 'events.jsonl')), bytes)
+
+        assert.deepEqual(await slash(host, '/forum on'), [info(on)])
+        assertBound(host, shared, dir)
+        assert.ok((await startRun(host)).sections.forum.includes(`Forum directory: ${shared} (PI_FORUM_DIR; supplied at launch`))
+
+        // A new session after off starts on with the same supplied directory.
+        await slash(host, '/forum off')
+        await host.runtime.newSession()
+        assertReplacement(host, takeEvents(host), {
+          reason: 'new', from: first, to: host.sessionId, forumDir: shared, packageDir: dir, supplied: shared, basePath: userPath,
+        })
+        assert.deepEqual(await slash(host, '/forum status'), [info(on)])
+
+        await host.runtime.dispose()
+        assert.equal(process.env.PI_FORUM_DIR, shared)
+        assert.equal(process.env.PATH, userPath)
+        assert.deepEqual(host.errors, [])
+      })
+
+      test('an invalid PI_FORUM_DIR is reported and /forum keeps it unavailable without changing anything', async (t) => {
         const reports = []
         t.mock.method(console, 'error', (...args) => reports.push(args.join(' ')))
         const host = await openHost(pkg().dir, { supplied: 'relative/forum' })
@@ -437,6 +632,21 @@ else describe('real Pi host', () => {
           const run = await startRun(host)
           assert.deepEqual(Object.keys(run.sections), ['project_rules', 'team_notes'])
           assert.equal((await bash(host, 'command -v pi-forum')).exit_code, 1)
+
+          // Without a UI, command feedback goes to stderr. Status and a failed on change nothing.
+          const command = async (text) => {
+            reports.length = 0
+            await host.runtime.session.prompt(text)
+            return reports.splice(0)
+          }
+          const unavailable = 'Forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative/forum". Run /forum on to retry.'
+          const env = { ...process.env }
+          assert.deepEqual(await command('/forum'), [unavailable])
+          assert.deepEqual(await command('/forum on'), [unavailable])
+          assert.deepEqual(await command('/forum off'), ['Forum is off.'])
+          assert.deepEqual(await command('/forum on'), [unavailable])
+          assert.deepEqual(await command('/forum bad'), [USAGE])
+          assert.deepEqual({ ...process.env }, env)
         } finally {
           await host.runtime.dispose()
         }
@@ -445,9 +655,48 @@ else describe('real Pi host', () => {
         assert.deepEqual(host.errors, [])
       })
 
+      test('/forum on recovers from an invalid binding and from binding drift', async () => {
+        const { dir } = pkg()
+        const host = await openHost(dir, { ui: true, supplied: '' })
+        const generated = host.defaultDir(host.sessionId)
+        const elsewhere = path.join(temp, `drifted forum ${variant}`)
+        try {
+          assert.deepEqual(await slash(host, '/forum'), [warning('Forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "". Run /forum on to retry.')])
+          assert.equal(process.env.PATH, BASE_PATH)
+
+          // Once the environment is fixed, only an explicit /forum on selects again.
+          delete process.env.PI_FORUM_DIR
+          assert.match((await slash(host, '/forum'))[0].message, /^Forum is unavailable: /)
+          assert.equal(process.env.PI_FORUM_DIR, undefined)
+          assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${generated} (session default)`)])
+          assertBound(host, generated, dir)
+          assert.ok((await startRun(host)).sections.forum)
+
+          // Drift: someone else changes PI_FORUM_DIR. Pi-forum stops guiding but restores nothing.
+          process.env.PI_FORUM_DIR = elsewhere
+          const env = { ...process.env }
+          const drifted = `Forum is unavailable: PI_FORUM_DIR changed from ${JSON.stringify(generated)} to ${JSON.stringify(elsewhere)}. Last selected directory (inactive): ${generated} (session default) Run /forum on to retry.`
+          assert.deepEqual(await slash(host, '/forum status'), [warning(drifted)])
+          assert.deepEqual({ ...process.env }, env)
+          const run = await startRun(host)
+          assert.deepEqual(Object.keys(run.sections), ['project_rules', 'team_notes'])
+          assert.equal(run.after, run.before)
+
+          // On selects the current value, now an externally supplied directory.
+          assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${elsewhere} (supplied PI_FORUM_DIR)`)])
+          assertBound(host, elsewhere, dir)
+          assert.ok((await startRun(host)).sections.forum.includes(`Forum directory: ${elsewhere} `))
+        } finally {
+          await host.runtime.dispose()
+        }
+        assert.equal(process.env.PI_FORUM_DIR, elsewhere)
+        assert.equal(process.env.PATH, BASE_PATH)
+        assert.deepEqual(host.errors, [])
+      })
+
       test('pi install records the package in the configured agent dir and Pi loads it from settings', async () => {
         const { dir } = pkg()
-        const host = await openHost(dir, { mode: 'settings' })
+        const host = await openHost(dir, { mode: 'settings', ui: true })
         try {
           const settings = JSON.parse(await fs.readFile(path.join(host.agentDir, 'settings.json'), 'utf8'))
           assert.equal(settings.packages.length, 1)
@@ -460,6 +709,11 @@ else describe('real Pi host', () => {
           assert.ok(run.sections.forum.includes(`Your author identity: ${host.sessionId} `))
           const created = await forum(host, ['topic', 'create', 'Installed'])
           assert.equal(created.topic.created_by, host.sessionId)
+          const on = `Forum is on: ${host.defaultDir(host.sessionId)} (session default)`
+          assert.deepEqual(await slash(host, '/forum status'), [info(on)])
+          assert.match((await slash(host, '/forum off'))[0].message, /^Forum is off\./)
+          assert.equal(process.env.PATH, BASE_PATH)
+          assert.deepEqual(await slash(host, '/forum on'), [info(on)])
         } finally {
           await host.runtime.dispose()
         }

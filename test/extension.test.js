@@ -7,7 +7,7 @@ import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { createForumRuntime, SECTION_NAME } from '../extension/runtime.js'
+import { createForumRuntime, forumCompletions, SECTION_NAME, USAGE } from '../extension/runtime.js'
 
 const exec = promisify(execFile)
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
@@ -19,8 +19,8 @@ after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
 })
 
-function ctx(sessionId) {
-  return { hasUI: false, sessionManager: { getSessionId: () => sessionId } }
+function ctx(sessionId, ui) {
+  return { hasUI: Boolean(ui), ui, sessionManager: { getSessionId: () => sessionId } }
 }
 
 function defaultDir(sessionId, agentDir = AGENT_DIR) {
@@ -31,12 +31,17 @@ function defaultDir(sessionId, agentDir = AGENT_DIR) {
 // session_shutdown completes before it. Cancelled switches and tree navigation emit neither.
 function host({ env, agentDir = () => AGENT_DIR } = {}) {
   const reports = []
+  const types = []
   let runtime = null
   let sessionId = null
-  const report = (message) => reports.push(message)
+  const report = (message, _ctx, type = 'error') => {
+    reports.push(message)
+    types.push(type)
+  }
   return {
     env,
     reports,
+    types,
     get runtime() {
       return runtime
     },
@@ -48,6 +53,13 @@ function host({ env, agentDir = () => AGENT_DIR } = {}) {
     },
     quit() {
       runtime.sessionShutdown()
+    },
+    // Runs /forum ARGS in the current runtime and returns its single feedback message.
+    forum(args) {
+      const count = reports.length
+      runtime.command(args, ctx(sessionId))
+      assert.equal(reports.length, count + 1)
+      return reports.at(-1)
     },
     prompt(sections = { cwd: '<cwd>\n/project\n</cwd>' }) {
       const event = { type: 'before_agent_start', prompt: 'hi', systemPromptOptions: { sections } }
@@ -99,7 +111,7 @@ describe('binding selection', () => {
       assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: supplied })
       assert.equal(h.runtime.binding, null)
       assert.equal(h.reports.length, 1)
-      assert.match(h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got ".*"; the forum is disabled/)
+      assert.match(h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got ".*"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
       assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
       h.quit()
       h.quit()
@@ -307,6 +319,326 @@ describe('prompt section', () => {
   })
 })
 
+const snapshot = (h) => ({ env: { ...h.env }, state: h.runtime.state })
+
+describe('/forum parsing, completion and feedback', () => {
+  for (const args of ['', '   ', 'status', '  status\t']) {
+    test(`${JSON.stringify(args)} reports the status without changing anything`, () => {
+      const h = host({ env: { PATH: BASE_PATH } })
+      h.start('s-1')
+      const before = snapshot(h)
+      assert.equal(h.forum(args), `Forum is on: ${defaultDir('s-1')} (session default)`)
+      assert.equal(h.types.at(-1), 'info')
+      assert.deepEqual(snapshot(h), before)
+    })
+  }
+
+  for (const args of ['ON', 'Off', 'Status', 'on off', 'on now', 'enable', 'statuses', '-h', '--help']) {
+    test(`${JSON.stringify(args)} shows the usage and changes nothing`, () => {
+      for (const supplied of [undefined, 'relative']) {
+        const h = host({ env: supplied === undefined ? { PATH: BASE_PATH } : { PATH: BASE_PATH, PI_FORUM_DIR: supplied } })
+        h.start('s-1')
+        const before = snapshot(h)
+        assert.equal(h.forum(args), USAGE)
+        assert.equal(h.types.at(-1), 'warning')
+        assert.deepEqual(snapshot(h), before)
+      }
+    })
+  }
+
+  test('surrounding whitespace is trimmed from on and off', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    assert.equal(h.forum('  off \n'), `Forum is off. Last selected directory (inactive): ${defaultDir('s-1')} (session default)`)
+    assert.equal(h.forum('\ton '), `Forum is on: ${defaultDir('s-1')} (session default)`)
+  })
+
+  test('completions are the actions starting with the typed prefix', () => {
+    const items = (...values) => values.map((value) => ({ value, label: value }))
+    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status'))
+    assert.deepEqual(forumCompletions('o'), items('on', 'off'))
+    assert.deepEqual(forumCompletions('of'), items('off'))
+    assert.deepEqual(forumCompletions('st'), items('status'))
+    assert.deepEqual(forumCompletions('status'), items('status'))
+    for (const prefix of ['x', 'O', 'on ', ' o', 'offx']) assert.deepEqual(forumCompletions(prefix), [])
+  })
+
+  test('feedback uses ui.notify when the mode has a UI and stderr otherwise', (t) => {
+    const stderr = t.mock.method(console, 'error', () => {})
+    const notices = []
+    const ui = { notify: (message, type) => notices.push([message, type]) }
+    const runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: () => AGENT_DIR, env: { PATH: BASE_PATH } })
+    runtime.sessionStart(ctx('s-1', ui))
+    runtime.command('', ctx('s-1', ui))
+    runtime.command('off', ctx('s-1', ui))
+    runtime.command('bogus', ctx('s-1', ui))
+    assert.deepEqual(notices, [
+      [`Forum is on: ${defaultDir('s-1')} (session default)`, 'info'],
+      [`Forum is off. Last selected directory (inactive): ${defaultDir('s-1')} (session default)`, 'info'],
+      [USAGE, 'warning'],
+    ])
+    assert.equal(stderr.mock.callCount(), 0)
+
+    runtime.command('status', ctx('s-1'))
+    runtime.command('on', ctx('s-1'))
+    assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [
+      [`Forum is off. Last selected directory (inactive): ${defaultDir('s-1')} (session default)`],
+      [`Forum is on: ${defaultDir('s-1')} (session default)`],
+    ])
+    runtime.sessionShutdown()
+  })
+})
+
+describe('/forum toggling', () => {
+  test('off releases a generated binding and on derives it again from the current agent dir', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-extension-test-'))
+    roots.push(root)
+    let agentDir = path.join(root, 'agent-a')
+    const h = host({ env: { PATH: BASE_PATH, OTHER: '1' }, agentDir: () => agentDir })
+    h.start('s-1')
+    const first = defaultDir('s-1', agentDir)
+    assert.equal(h.forum('off'), `Forum is off. Last selected directory (inactive): ${first} (session default)`)
+    assert.deepEqual(h.env, { PATH: BASE_PATH, OTHER: '1' })
+    assert.equal(h.runtime.binding, null)
+    assert.deepEqual(h.runtime.state, { status: 'off', reason: null, selected: { forumDir: first, generated: true } })
+    assert.equal(h.forum('status'), `Forum is off. Last selected directory (inactive): ${first} (session default)`)
+
+    agentDir = path.join(root, 'agent-b')
+    const second = defaultDir('s-1', agentDir)
+    assert.equal(h.forum('on'), `Forum is on: ${second} (session default)`)
+    assert.deepEqual(h.env, { PATH: withBin(), OTHER: '1', PI_FORUM_DIR: second })
+    assert.deepEqual(h.runtime.binding, { forumDir: second, generated: true })
+    // Toggling only changes the environment; no forum files are created or removed.
+    assert.deepEqual(await fs.readdir(root), [])
+  })
+
+  test('off keeps a supplied binding and on honors the PI_FORUM_DIR current at that time', () => {
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' } })
+    h.start('s-1')
+    assert.equal(h.forum('off'), 'Forum is off. Last selected directory (inactive): /shared/forum (supplied PI_FORUM_DIR)')
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' })
+    h.env.PI_FORUM_DIR = '/team/forum'
+    assert.equal(h.forum('on'), 'Forum is on: /team/forum (supplied PI_FORUM_DIR)')
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/team/forum' })
+    h.forum('off')
+    delete h.env.PI_FORUM_DIR
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('repeated on and off are idempotent', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    const on = { ...h.env }
+    assert.equal(h.forum('on'), `Forum is already on: ${defaultDir('s-1')} (session default)`)
+    assert.deepEqual(h.env, on)
+    h.forum('off')
+    assert.equal(h.forum('off'), `Forum is already off. Last selected directory (inactive): ${defaultDir('s-1')} (session default)`)
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+    for (let i = 0; i < 3; i++) {
+      h.forum('on')
+      assert.deepEqual(h.env, on)
+      h.forum('off')
+      assert.deepEqual(h.env, { PATH: BASE_PATH })
+    }
+    h.forum('on')
+    h.quit()
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('off keeps PATH edits by others and a bin component that was already present', () => {
+    const edited = host({ env: { PATH: BASE_PATH } })
+    edited.start('s-1')
+    edited.env.PATH = ['/front', edited.env.PATH, '/back'].join(path.delimiter)
+    edited.forum('off')
+    assert.equal(edited.env.PATH, ['/front', BASE_PATH, '/back'].join(path.delimiter))
+
+    const present = host({ env: { PATH: withBin() } })
+    present.start('s-1')
+    present.forum('off')
+    assert.deepEqual(present.env, { PATH: withBin() })
+    present.forum('on')
+    assert.deepEqual(present.env, { PATH: withBin(), PI_FORUM_DIR: defaultDir('s-1') })
+
+    const missing = host({ env: {} })
+    missing.start('s-1')
+    missing.forum('off')
+    assert.deepEqual(missing.env, {})
+    missing.forum('on')
+    assert.deepEqual(missing.env, { PATH: BIN_DIR, PI_FORUM_DIR: defaultDir('s-1') })
+  })
+
+  test('an invalid startup binding is unavailable until on succeeds', () => {
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' } })
+    h.start('s-1')
+    assert.match(h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
+    const reason = 'PI_FORUM_DIR must be a nonempty absolute path, got "relative"'
+    assert.deepEqual(h.runtime.state, { status: 'unavailable', reason, selected: null })
+    assert.equal(h.forum(''), `Forum is unavailable: ${reason}. Run /forum on to retry.`)
+    assert.equal(h.types.at(-1), 'warning')
+    assert.equal(h.forum('on'), `Forum is unavailable: ${reason}. Run /forum on to retry.`)
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' })
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+
+    h.env.PI_FORUM_DIR = '/fixed/forum'
+    assert.equal(h.forum('on'), 'Forum is on: /fixed/forum (supplied PI_FORUM_DIR)')
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/fixed/forum' })
+    assert.ok(h.prompt()[SECTION_NAME])
+  })
+
+  test('off from unavailable turns the forum off and on retries', () => {
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '' } })
+    h.start('s-1')
+    assert.equal(h.forum('off'), 'Forum is off.')
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '' })
+    delete h.env.PI_FORUM_DIR
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
+  })
+})
+
+describe('/forum binding drift', () => {
+  const lastGenerated = `Last selected directory (inactive): ${defaultDir('s-1')} (session default)`
+
+  test('a deleted generated PI_FORUM_DIR makes the forum unavailable without restoring it', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    delete h.env.PI_FORUM_DIR
+    const reason = `PI_FORUM_DIR was removed (was ${JSON.stringify(defaultDir('s-1'))})`
+    assert.deepEqual(h.prompt({ cwd: 'x', [SECTION_NAME]: 'stale' }), { cwd: 'x' })
+    assert.equal(h.forum('status'), `Forum is unavailable: ${reason}. ${lastGenerated} Run /forum on to retry.`)
+    assert.deepEqual(h.env, { PATH: withBin() })
+    assert.equal(h.runtime.binding, null)
+
+    // Putting the value back by hand does not reactivate it; only /forum on does.
+    h.env.PI_FORUM_DIR = defaultDir('s-1')
+    assert.match(h.forum(''), /^Forum is unavailable: PI_FORUM_DIR was removed/)
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: defaultDir('s-1') })
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('a changed PI_FORUM_DIR is unavailable, and on adopts it as supplied', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    h.env.PI_FORUM_DIR = '/other/forum'
+    const reason = `PI_FORUM_DIR changed from ${JSON.stringify(defaultDir('s-1'))} to "/other/forum"`
+    assert.equal(h.forum('status'), `Forum is unavailable: ${reason}. ${lastGenerated} Run /forum on to retry.`)
+    assert.equal(h.forum('on'), 'Forum is on: /other/forum (supplied PI_FORUM_DIR)')
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '/other/forum' })
+  })
+
+  test('a supplied PI_FORUM_DIR changed to an invalid value stays unavailable after on', () => {
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' } })
+    h.start('s-1')
+    h.env.PI_FORUM_DIR = 'relative'
+    assert.match(h.forum(''), /^Forum is unavailable: PI_FORUM_DIR changed from "\/shared\/forum" to "relative"\. Last selected directory \(inactive\): \/shared\/forum \(supplied PI_FORUM_DIR\) Run/)
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: 'relative' })
+    assert.equal(
+      h.forum('on'),
+      'Forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative". Last selected directory (inactive): /shared/forum (supplied PI_FORUM_DIR) Run /forum on to retry.',
+    )
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' })
+  })
+
+  test('a removed bin PATH component is unavailable until on puts it back', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    h.env.PATH = '/elsewhere'
+    assert.equal(
+      h.forum('status'),
+      `Forum is unavailable: the bundled pi-forum directory ${BIN_DIR} is no longer on PATH. ${lastGenerated} Run /forum on to retry.`,
+    )
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
+    assert.deepEqual(h.env, { PATH: [BIN_DIR, '/elsewhere'].join(path.delimiter), PI_FORUM_DIR: defaultDir('s-1') })
+
+    const deleted = host({ env: { PATH: BASE_PATH } })
+    deleted.start('s-1')
+    delete deleted.env.PATH
+    assert.match(deleted.forum(''), /is no longer on PATH/)
+    deleted.forum('off')
+    assert.deepEqual(deleted.env, {})
+  })
+
+  test('on right after drift reconciles instead of reporting already on', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    h.env.PATH = BASE_PATH
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: defaultDir('s-1') })
+  })
+
+  test('shutdown while unavailable releases only what is still owned', () => {
+    const h = host({ env: { PATH: BASE_PATH, OTHER: 'x' } })
+    h.start('s-1')
+    h.env.PI_FORUM_DIR = '/other/forum'
+    h.forum('')
+    h.quit()
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH, OTHER: 'x', PI_FORUM_DIR: '/other/forum' })
+    assert.deepEqual(h.runtime.state, { status: 'off', reason: null, selected: null })
+  })
+})
+
+describe('/forum across the session lifecycle', () => {
+  test('off is reset to on whenever Pi rebuilds the runtime', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    // startup, /reload, /new, /fork, /clone, /resume
+    for (const id of ['s-1', 's-1', 's-2', 's-3', 's-4', 's-1']) {
+      h.start(id)
+      assert.equal(h.runtime.state.status, 'on')
+      assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: defaultDir(id) })
+      h.forum('off')
+      assert.deepEqual(h.env, { PATH: BASE_PATH })
+    }
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('shutdown while off is a no-op on the environment and clears the state', () => {
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' } })
+    h.start('s-1')
+    h.forum('off')
+    h.quit()
+    h.quit()
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' })
+    assert.deepEqual(h.runtime.state, { status: 'off', reason: null, selected: null })
+  })
+
+  test('tree navigation and cancelled switches keep the toggle', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    h.forum('off')
+    // No session_start or session_shutdown: the same runtime keeps serving prompts.
+    for (let turn = 0; turn < 3; turn++) {
+      assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+      assert.equal(h.runtime.state.status, 'off')
+    }
+    h.forum('on')
+    assert.ok(h.prompt()[SECTION_NAME])
+  })
+
+  test('reused prompt options gain, lose and regain only the forum section', () => {
+    const h = host({ env: { PATH: BASE_PATH } })
+    h.start('s-1')
+    const others = { preamble: 'p', cwd: 'c', tool_guidance: 't' }
+    const sections = { ...others }
+    h.prompt(sections)
+    const text = sections[SECTION_NAME]
+    assert.deepEqual(Object.keys(sections), [...Object.keys(others), SECTION_NAME])
+    h.forum('off')
+    h.prompt(sections)
+    assert.deepEqual(sections, others)
+    h.forum('on')
+    h.prompt(sections)
+    assert.deepEqual(sections, { ...others, [SECTION_NAME]: text })
+  })
+})
+
 describe('extension entry', () => {
   // Stands in for the host package, which is not installed in this repository.
   registerHooks({
@@ -317,7 +649,7 @@ describe('extension entry', () => {
     },
   })
 
-  test('registers only the three lifecycle hooks and binds through the host agent dir', async (t) => {
+  test('registers the three lifecycle hooks and /forum, and binds through the host agent dir', async (t) => {
     const saved = { PATH: process.env.PATH, PI_FORUM_DIR: process.env.PI_FORUM_DIR }
     t.after(() => {
       for (const [key, value] of Object.entries(saved)) {
@@ -331,9 +663,18 @@ describe('extension entry', () => {
 
     const { default: factory } = await import('../extension/index.js')
     const handlers = new Map()
-    const result = factory({ on: (name, handler) => handlers.set(name, handler) })
+    const commands = new Map()
+    const result = factory({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: (name, options) => commands.set(name, options),
+    })
     assert.equal(result, undefined)
     assert.deepEqual([...handlers.keys()], ['session_start', 'before_agent_start', 'session_shutdown'])
+    assert.deepEqual([...commands.keys()], ['forum'])
+    const forum = commands.get('forum')
+    assert.deepEqual(Object.keys(forum).sort(), ['description', 'getArgumentCompletions', 'handler'])
+    assert.equal(typeof forum.description, 'string')
+    assert.deepEqual(forum.getArgumentCompletions('o'), [{ value: 'on', label: 'on' }, { value: 'off', label: 'off' }])
     assert.equal(process.env.PATH, BASE_PATH)
     assert.equal(process.env.PI_FORUM_DIR, undefined)
 
@@ -345,6 +686,21 @@ describe('extension entry', () => {
     const event = { systemPromptOptions: { sections: { cwd: 'c' } } }
     await handlers.get('before_agent_start')(event, ctx('s-9'))
     assert.deepEqual(Object.keys(event.systemPromptOptions.sections), ['cwd', SECTION_NAME])
+
+    const notices = []
+    const ui = { notify: (message, type) => notices.push([message, type]) }
+    const pending = forum.handler(' off ', ctx('s-9', ui))
+    assert.ok(pending instanceof Promise)
+    assert.equal(await pending, undefined)
+    assert.equal(process.env.PATH, BASE_PATH)
+    assert.equal(process.env.PI_FORUM_DIR, undefined)
+    await handlers.get('before_agent_start')(event, ctx('s-9'))
+    assert.deepEqual(event.systemPromptOptions.sections, { cwd: 'c' })
+    await forum.handler('on', ctx('s-9', ui))
+    assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', '/host/agent'))
+    assert.equal(process.env.PATH, withBin())
+    assert.deepEqual(notices.map(([, type]) => type), ['info', 'info'])
+    assert.match(notices[1][0], /^Forum is on: \/host\/agent\/forums\/sessions\/s-9 \(session default\)$/)
 
     await handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, ctx('s-9'))
     assert.equal(process.env.PATH, BASE_PATH)

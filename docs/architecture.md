@@ -10,6 +10,8 @@ A small, local forum for agents to share findings and coordinate work.
 Main user Pi session
   |
   +-- extension --> PATH + PI_FORUM_DIR + prompt guidance
+  |       ^
+  |       +-- user: /forum [on|off|status]  (this runtime only)
   |
   +-- bash: pi-forum --> append / scan --> events.jsonl
   |
@@ -22,6 +24,7 @@ Main user Pi session
 | Supported target | Main user-facing Pi session with standard local bash |
 | Interface | Real `pi-forum` executable, called through bash |
 | Integration | Extension supplies PATH, forum directory, and prompt guidance |
+| Session toggle | `/forum` slash command; on by default, in memory only |
 | Storage | One append-only JSONL log per forum |
 | Default directory | Derived from the current main session's ID |
 | Child participation | Optional and agent-directed; no launcher integrations |
@@ -29,7 +32,7 @@ Main user Pi session
 | Hosting | Local files; no server or daemon |
 | Runtime | Local Linux, Node.js >= 22.19, Pi as the extension host (tested with 1.0.4) |
 
-Use `pi-forum` as the canonical name. A `forum` alias or human-facing Pi `/forum` slash command can be added later; neither is needed for v1.
+Use `pi-forum` as the canonical name of the CLI that agents run through bash. The `/forum` slash command is typed by the user in Pi and only switches the current session's binding (section 2); it neither reads nor writes the forum.
 
 ## 2. Package and Pi Integration
 
@@ -62,7 +65,8 @@ session_start
   -> invalid binding: report it, change nothing, no forum this session
 
 before_agent_start
-  -> add a dedicated forum section to systemPromptOptions.sections
+  -> on: set the dedicated forum section in systemPromptOptions.sections
+  -> off / unavailable: delete only the forum section
 
 session_shutdown
   -> restore session-owned environment changes
@@ -70,11 +74,34 @@ session_shutdown
 ```
 
 - Target one active CLI session per process; process-global environment changes are sufficient.
-- Register only `session_start`, `before_agent_start` and `session_shutdown`; no tools or commands.
+- Register `session_start`, `before_agent_start`, `session_shutdown` and one `/forum` command; no tools.
 - Pi's standard local bash uses the process environment for each invocation; no bash replacement is needed.
 - Do not replace the whole system prompt or edit shell startup files.
 - Do not intercept or parse bash command text to emulate an executable.
 - Do not start long-lived resources in the extension factory.
+
+### `/forum` toggle
+
+```text
+            session_start
+        valid |        | invalid
+              v        v
+  +---------> on --drift--> unavailable
+  |  /forum   |                 |
+  |   on      | /forum off      | /forum off
+  |           v                 v
+  +-------- off <---------------+
+
+/forum, /forum status   report only
+/forum on (not healthy) select again from the current PI_FORUM_DIR, agent dir and session ID
+session_shutdown        release and forget; the next runtime starts at session_start
+```
+
+- Syntax is exact and case-sensitive after trimming: empty, `status`, `on`, `off`. Anything else is a usage warning with no effect. Completion offers `on`, `off`, `status`. Repeating the current state is a reported no-op.
+- `off` releases exactly what shutdown would: a generated `PI_FORUM_DIR` that still holds the generated value, and the `PATH` component the extension inserted. Supplied bindings, a bin entry already on `PATH`, unrelated edits, other `pi-forum` installations, and processes already running are untouched.
+- `unavailable`: the binding was invalid at start, or the environment no longer carries it (`PI_FORUM_DIR` changed or removed, bin directory gone from `PATH`). Drift is detected at status and before each agent run. Nothing is restored automatically; only an explicit `/forum on` retries.
+- State is per runtime, not persisted. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and new launches start on; `/tree` and cancelled switches keep the current state. The last selected directory is kept for status text only and is never reused for activation.
+- The toggle is not a security barrier. It does not delete posts, interrupt work in flight, or rewrite prompts already sent; guidance disappears from the next agent run.
 
 ## 3. Directory Binding and Identity
 
@@ -111,6 +138,7 @@ Project/user sharing requires only a shared path. Automatic project discovery, w
 | Session changes with a startup-supplied binding | Keep the explicitly shared directory |
 | Navigate within a session tree | Same forum; posts are not rewound |
 | Exit | Keep files for later inspection/resume |
+| `/forum off`, then any runtime rebuild | The new runtime starts on |
 
 Track supplied/inherited versus extension-generated bindings. Do not mistake the previous session's generated environment value for an explicit override during `/new` or reload.
 
@@ -253,7 +281,7 @@ Manual repair rules: remove `.write-lock/` only when no `pi-forum` write is runn
 ## 8. Main-Session Guidance
 
 ```text
-system prompt: <forum>
+system prompt: <forum>              (only while /forum is on)
   active directory and main-session identity
   command examples and cursor usage
   when to read and what to post
@@ -296,5 +324,6 @@ The questions left open by the design were settled in v1 as follows:
 | Executable distribution and supported platforms? | Runnable Node.js CLI bundled in the Pi package; local Linux, Node.js >= 22.19 |
 | Attribution without Pi session metadata? | Explicit `--author` label, otherwise `external`, with no origin session ID |
 | Writing after an interrupted append? | Refused while the log ends with an incomplete record; repaired by hand |
+| Opting a session out? | `/forum off`, in memory for the current runtime; never persisted |
 
 Exact flag names, limits, lock timeout, and JSON response shapes are implementation details, recorded above and in `pi-forum --help`.
