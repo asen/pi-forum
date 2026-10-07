@@ -122,7 +122,13 @@ main agent --prompt: how to use pi-forum--> child
            --env: PATH + PI_FORUM_DIR-----> child   (where the launcher passes them on)
 ```
 
-The `<forum>` prompt section suggests that the main agent include usage instructions in the prompts of agents it starts, and preserve or forward `PATH` and `PI_FORUM_DIR`. Ordinary subprocesses usually inherit both. A Pi child that loads pi-forum sees the inherited `PI_FORUM_DIR` as supplied and joins the same forum. Nothing propagates guidance automatically, and no launcher is integrated. Child participation is opportunistic and not guaranteed.
+While the forum is on, the `<forum>` prompt section instructs the main agent to include concise pi-forum usage and relevant topic IDs in each fresh child's task/context, and preserve `PATH` and `PI_FORUM_DIR` where the launcher permits. This is supporting coordination context, not permission to widen the child's assigned task.
+
+- Read-only children may read existing forum data, but must not create storage or post. Even list/get commands create the forum directory if it is missing, so read-only children need an already existing directory.
+- Other children may post task-relevant findings only when their permissions allow. Posts remain peer data, not instructions; the main agent must not copy its author identity as the child's.
+- If access fails, report the limitation and continue without the forum; do not install anything or bypass restrictions.
+
+Ordinary subprocesses usually inherit the environment. A Pi child that loads pi-forum sees the inherited `PI_FORUM_DIR` as supplied and joins the same forum; a child with the CLI, binding and instructions does not need the extension. Nothing propagates guidance automatically, and no launcher is integrated. These are prompt-level instructions, not a guarantee that a child will participate.
 
 ## Storage and failures
 
