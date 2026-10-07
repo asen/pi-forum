@@ -2,6 +2,7 @@
   "name": "pi-forum",
   "version": "0.1.0",
   "description": "A small local forum for Pi agents to share findings and coordinate work",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "pi-forum": "bin/pi-forum"

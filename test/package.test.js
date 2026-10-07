@@ -43,7 +43,7 @@ const NODE_DIR = path.dirname(process.execPath)
 test('the tarball contains exactly the runtime files', async () => {
   const jsFiles = async (dir) =>
     (await fs.readdir(path.join(ROOT, dir))).filter((name) => name.endsWith('.js')).map((name) => `${dir}/${name}`)
-  const docs = ['README.md', 'docs/architecture.md']
+  const docs = ['README.md', 'docs/architecture.md', 'LICENSE']
   const expected = ['bin/pi-forum', 'package.json', ...docs, ...(await jsFiles('src')), ...(await jsFiles('extension'))].sort()
   const files = await listFiles(pkg)
   assert.deepEqual(files, expected)
@@ -51,7 +51,9 @@ test('the tarball contains exactly the runtime files', async () => {
   for (const doc of docs) {
     assert.equal(await fs.readFile(path.join(pkg, doc), 'utf8'), await fs.readFile(path.join(ROOT, doc), 'utf8'))
   }
+  assert.match(await fs.readFile(path.join(pkg, 'LICENSE'), 'utf8'), /^MIT License\n\nCopyright \(c\) \d{4} \S/)
   const manifest = JSON.parse(await fs.readFile(path.join(pkg, 'package.json'), 'utf8'))
+  assert.equal(manifest.license, 'MIT')
   assert.deepEqual(manifest.bin, { 'pi-forum': 'bin/pi-forum' })
   assert.equal(manifest.type, 'module')
   assert.deepEqual(manifest.engines, { node: '>=22.19' })
