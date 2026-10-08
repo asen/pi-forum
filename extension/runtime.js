@@ -1,3 +1,4 @@
+import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { createForum as sharedCreateForum } from '../src/forum.js'
 import { createBrowser } from './browser-state.js'
@@ -29,6 +30,7 @@ export function createForumRuntime({
   getAgentDir,
   env = process.env,
   report = defaultReport,
+  mkdir = mkdirSync,
   createForum = sharedCreateForum,
   openBrowser = textBrowser,
 }) {
@@ -107,6 +109,15 @@ export function createForumRuntime({
     if (binding.error) {
       status = 'unavailable'
       reason = binding.error
+      return false
+    }
+    // Initialize only the directory, never a log or post. Keep activation synchronous so off or
+    // shutdown cannot race a pending initialization and have the binding republished afterward.
+    try {
+      mkdir(binding.forumDir, { recursive: true })
+    } catch (err) {
+      status = 'unavailable'
+      reason = `cannot initialize forum directory ${binding.forumDir}: ${err?.message ?? err}`
       return false
     }
     const pathChange = prependPath(env, binDir)

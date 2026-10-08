@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import { registerHooks } from 'node:module'
 import os from 'node:os'
@@ -30,7 +31,8 @@ function defaultDir(sessionId, agentDir = AGENT_DIR) {
 
 // Mimics Pi: every session start gets a fresh extension runtime, and the previous runtime's
 // session_shutdown completes before it. Cancelled switches and tree navigation emit neither.
-function host({ env, agentDir = () => AGENT_DIR, createForum, openBrowser } = {}) {
+// Most unit tests use virtual paths; directory tests opt into node:fs with mkdir: mkdirSync.
+function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, openBrowser } = {}) {
   const reports = []
   const types = []
   let runtime = null
@@ -48,7 +50,7 @@ function host({ env, agentDir = () => AGENT_DIR, createForum, openBrowser } = {}
     },
     start(id) {
       runtime?.sessionShutdown()
-      runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: agentDir, env, report, createForum, openBrowser })
+      runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: agentDir, env, report, mkdir, createForum, openBrowser })
       sessionId = id
       runtime.sessionStart(ctx(id))
     },
@@ -485,7 +487,7 @@ describe('/forum parsing, completion and feedback', () => {
     const stderr = t.mock.method(console, 'error', () => {})
     const notices = []
     const ui = { notify: (message, type) => notices.push([message, type]) }
-    const runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: () => AGENT_DIR, env: { PATH: BASE_PATH } })
+    const runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: () => AGENT_DIR, env: { PATH: BASE_PATH }, mkdir: () => {} })
     runtime.sessionStart(ctx('s-1', ui))
     assert.deepEqual(notices, [])
     runtime.command('on', ctx('s-1', ui))
@@ -511,11 +513,30 @@ describe('/forum parsing, completion and feedback', () => {
 })
 
 describe('/forum toggling', () => {
+  test('directory creation failure leaves the forum unavailable without exposing a binding', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-extension-test-'))
+    roots.push(root)
+    const obstruction = path.join(root, 'forums')
+    await fs.writeFile(obstruction, 'not a directory')
+    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => root, mkdir: mkdirSync })
+    h.start('s-1')
+    assert.match(h.forum('on'), /Forum is unavailable: cannot initialize forum directory .*: ENOTDIR/)
+    assert.equal(h.runtime.binding, null)
+    assert.equal(h.runtime.state.selected, null)
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+
+    await fs.rm(obstruction)
+    assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1', root)} (session default)`)
+    assert.deepEqual(await fs.readdir(defaultDir('s-1', root)), [])
+    h.quit()
+  })
+
   test('off releases a generated binding and on derives it again from the current agent dir', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-extension-test-'))
     roots.push(root)
     let agentDir = path.join(root, 'agent-a')
-    const h = host({ env: { PATH: BASE_PATH, OTHER: '1' }, agentDir: () => agentDir })
+    const h = host({ env: { PATH: BASE_PATH, OTHER: '1' }, agentDir: () => agentDir, mkdir: mkdirSync })
     h.start('s-1')
     h.forum('on')
     const first = defaultDir('s-1', agentDir)
@@ -530,8 +551,10 @@ describe('/forum toggling', () => {
     assert.equal(h.forum('on'), `Forum is on: ${second} (session default)`)
     assert.deepEqual(h.env, { PATH: withBin(), OTHER: '1', PI_FORUM_DIR: second })
     assert.deepEqual(h.runtime.binding, { forumDir: second, generated: true })
-    // Toggling only changes the environment; no forum files are created or removed.
-    assert.deepEqual(await fs.readdir(root), [])
+    // Activation creates directories only; off keeps them and neither toggle creates a log.
+    assert.deepEqual((await fs.readdir(root)).sort(), ['agent-a', 'agent-b'])
+    assert.deepEqual(await fs.readdir(first), [])
+    assert.deepEqual(await fs.readdir(second), [])
   })
 
   test('off keeps a supplied binding and on honors the PI_FORUM_DIR current at that time', () => {
@@ -962,12 +985,16 @@ describe('/forum browsing', () => {
     assert.equal(recorded.clients.length, 3)
   })
 
-  test('a missing directory is reported as an error and is not created', async () => {
+  test('a fresh forum browses as empty; browsing does not recreate a directory removed afterward', async () => {
     const agentDir = await tempDir()
-    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => agentDir })
+    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => agentDir, mkdir: mkdirSync })
     h.start('s-1')
     h.forum('on')
     const forumDir = defaultDir('s-1', agentDir)
+    assert.deepEqual(await h.browse('topics'), [['No topics yet.', 'info']])
+    assert.deepEqual(await h.browse('messages'), [['No messages yet.', 'info']])
+    assert.deepEqual(await fs.readdir(forumDir), [])
+    await fs.rm(path.join(agentDir, 'forums'), { recursive: true })
     for (const view of VIEWS) {
       const [[message, type]] = await h.browse(view)
       assert.equal(type, 'error')
@@ -1042,6 +1069,7 @@ describe('/forum browsing', () => {
       binDir: BIN_DIR,
       getAgentDir: () => AGENT_DIR,
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      mkdir: () => {},
       openBrowser: () => assert.fail('only the terminal UI opens the browser'),
     })
     runtime.sessionStart(ctx('s-1'))
@@ -1274,7 +1302,9 @@ describe('extension entry', () => {
     })
     delete process.env.PI_FORUM_DIR
     process.env.PATH = BASE_PATH
-    globalThis.piForumTestAgentDir = '/host/agent'
+    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-entry-test-'))
+    roots.push(agentDir)
+    globalThis.piForumTestAgentDir = agentDir
 
     const { default: factory } = await import('../extension/index.js')
     const handlers = new Map()
@@ -1303,7 +1333,8 @@ describe('extension entry', () => {
     const notices = []
     const ui = { notify: (message, type) => notices.push([message, type]) }
     await forum.handler('on', ctx('s-9', ui))
-    assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', '/host/agent'))
+    assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', agentDir))
+    assert.deepEqual(await fs.readdir(process.env.PI_FORUM_DIR), [])
     assert.equal(process.env.PATH, withBin())
     await fs.access(path.join(process.env.PATH.split(path.delimiter)[0], 'pi-forum'), fs.constants.X_OK)
     await handlers.get('before_agent_start')(event, ctx('s-9'))
@@ -1317,15 +1348,15 @@ describe('extension entry', () => {
     await handlers.get('before_agent_start')(event, ctx('s-9'))
     assert.deepEqual(event.systemPromptOptions.sections, { cwd: 'c' })
     await forum.handler('on', ctx('s-9', ui))
-    assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', '/host/agent'))
+    assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', agentDir))
     assert.equal(process.env.PATH, withBin())
     assert.deepEqual(notices.map(([, type]) => type), ['info', 'info', 'info'])
-    assert.match(notices[2][0], /^Forum is on: \/host\/agent\/forums\/sessions\/s-9 \(session default\)$/)
+    assert.equal(notices[2][0], `Forum is on: ${defaultDir('s-9', agentDir)} (session default)`)
 
     // Browsing is wired to the selected forum; RPC gets text and never the terminal browser.
     const rpc = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
     assert.equal(await forum.handler('topics', rpc), undefined)
-    const dir = defaultDir('s-9', '/host/agent')
+    const dir = defaultDir('s-9', agentDir)
     assert.deepEqual(notices.at(-1), [
       `Forum directory: ${dir} (session default). The forum browser needs the terminal UI; run: PI_FORUM_DIR=${dir} ${path.join(BIN_DIR, 'pi-forum')} topic list`,
       'info',

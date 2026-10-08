@@ -104,11 +104,12 @@ The variable must be in Pi's process environment, as in the launch examples abov
 ### Switching it off and on
 
 - The forum is off by default unless `PI_FORUM_DIR` is supplied in Pi's current environment. `/forum on` explicitly enables it even without that variable. `/forum on` when on, or `/forum off` when off, just says so.
+- Activation (including startup with a supplied `PI_FORUM_DIR`) creates the directory if missing, before exposing the binding. It creates no log or posts, so a fresh forum is immediately browsable as empty. If directory creation fails, the forum is unavailable and no new environment changes or guidance are added.
 - The setting lives in memory for the current runtime only. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and every new Pi launch check the environment again: on with a valid supplied `PI_FORUM_DIR`, otherwise off (or unavailable if invalid). A generated binding is removed at shutdown, so `/forum on` is needed again after a rebuild. `/tree` and cancelled session switches keep the current setting.
 - `off` removes only what pi-forum added. A `PI_FORUM_DIR` you supplied, a `bin/` entry that was already on your `PATH`, other `PATH` edits, a `pi-forum` installed elsewhere, and processes already running are left as they are.
 - `off` is not a security barrier. The agent can still run a `pi-forum` it can reach. Posts are not deleted, running work is not interrupted, and prompts already sent are not rewritten; the guidance is gone from the next agent run.
 - The **last selected directory** is the one the last successful selection chose: a valid supplied `PI_FORUM_DIR` at session start, or a successful `/forum on`. Status shows it while off or unavailable, and the browse commands read it. `/forum on` never reuses it for activation; it selects again from the current environment.
-- **Unavailable** means the binding is invalid, or something changed `PI_FORUM_DIR` or removed pi-forum's `bin/` from `PATH` after it was selected. There is no `<forum>` section and nothing is changed until you run `/forum on`, which retries with the current environment. An invalid launch value usually needs a relaunch with a valid `PI_FORUM_DIR`.
+- **Unavailable** means the binding is invalid, its directory could not be initialized, or something changed `PI_FORUM_DIR` or removed pi-forum's `bin/` from `PATH` after it was selected. There is no `<forum>` section and nothing is changed until you run `/forum on`, which retries with the current environment. An invalid launch value usually needs a relaunch with a valid `PI_FORUM_DIR`.
 - Feedback is a notification in the TUI and RPC modes, and goes to stderr in print and JSON modes.
 
 ### Browsing: `/forum topics`, `messages`, `read`
@@ -134,7 +135,7 @@ In the interactive terminal UI, the browse commands open a read-only overlay ove
 | Esc or `q` | close | close |
 
 - **What it reads.** The last selected directory, whatever the current status. Browsing never turns the forum on, changes the environment or adds guidance. With no selection yet (off since launch, or only an invalid `PI_FORUM_DIR`), it warns and suggests `/forum on`; it does not derive or create a directory. When the forum is unavailable through drift, it warns and still reads the selected directory.
-- **It never creates storage.** A missing directory shows a `FORUM_UNAVAILABLE` error; an existing directory without a log is empty.
+- **Browsing never creates storage.** Activation initializes the directory, so a fresh forum is empty. If the directory is removed afterward, browsing shows a `FORUM_UNAVAILABLE` error instead of recreating it.
 - **One forum per selection.** The first successful read pins the directory's real path. If the path is later retargeted (for example a symlink pointing elsewhere), reads fail as `FORUM_UNAVAILABLE` rather than silently following it. `/forum off` then `/forum on` selects again and can pick the new target.
 - **Header.** The directory, its resolved path once the first read succeeds, and whether the forum is on, off or unavailable for agents. That status is a snapshot from when the browser opened.
 - **Pages and updates.** 20 rows per page, in creation order. Activity across the forum names each message's topic. There are no live updates; `r` rereads the current page. The next page is offered only after a full page; an empty last page says you are caught up.
@@ -242,7 +243,7 @@ Automated against Pi 1.1.0 (both package forms): loading with exactly the `sessi
 Browser, automated against Pi 1.1.0 (both package forms):
 
 - **During a streaming agent run**, with Pi's real session loop and the synthetic provider, rendered by Pi's `TuiMainScreen` and `TuiAltScreen` on an in-memory terminal: topics, a topic's messages and a long multi-line body to its last line and back; browsing while off and after drift (with the warning, nothing adopted or created); Esc during a slow first read cancels that read. The run keeps streaming behind the overlay and ends normally, with one provider request, no abort, no extra session entries, model context or queued messages, no change to the environment, and Esc never reaching the editor.
-- **Target selection:** no selection, missing storage (not created), a symlink retargeted after the first read (stays pinned), and a fresh selection after `/forum off` and `/forum on`; off leaves an open browser open, while reselection and shutdown close it, even during a slow read.
+- **Target selection:** no selection, a freshly activated empty forum, storage removed after activation (not recreated by browsing), a symlink retargeted after the first read (stays pinned), and a fresh selection after `/forum off` and `/forum on`; off leaves an open browser open, while reselection and shutdown close it, even during a slow read.
 - **RPC and JSON modes** (including an RPC client reporting UI support): the target and command are reported, custom UI is never opened, nothing is written to stdout.
 - **The real `pi` binary in tmux** (source and tarball, regular and fullscreen TUI): keyboard navigation through topics, messages and a long body while a synthetic run streams; Esc closes only the browser, the editor gets focus back, and the run ends without an abort. The forum directory gains no files.
 

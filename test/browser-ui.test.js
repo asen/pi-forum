@@ -407,6 +407,7 @@ for (const lib of libraries) {
           getAgentDir: () => '/agent',
           env,
           report: (message) => reports.push(message),
+          mkdir: () => {},
           createForum: () => client,
           openBrowser: createBrowserOpener(lib),
         })
@@ -439,6 +440,7 @@ for (const lib of libraries) {
         getAgentDir: () => '/agent',
         env: { PATH: '/usr/bin', PI_FORUM_DIR: '/forums/shared' },
         report: () => {},
+        mkdir: () => {},
         createForum: () => assert.fail('text modes bind no client'),
         openBrowser: createBrowserOpener(lib),
       })

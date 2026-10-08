@@ -441,10 +441,10 @@ else describe('real Pi host', () => {
         assert.deepEqual(await slash(host, '/forum off'), [info('Forum is already off.')])
         assert.deepEqual({ ...process.env }, env)
 
-        // Explicit activation uses the session default and leaves storage creation to the CLI.
+        // Explicit activation initializes the session directory, without a log or posts.
         assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${host.defaultDir(first)} (session default)`)])
         assertBound(host, host.defaultDir(first), dir)
-        await assert.rejects(fs.access(path.join(host.agentDir, 'forums')))
+        assert.deepEqual(await fs.readdir(host.defaultDir(first)), [])
 
         // A run's prompt gets the forum section; other sections and the rendered prompt are kept.
         run = await startRun(host)
@@ -544,7 +544,7 @@ else describe('real Pi host', () => {
         assert.equal(process.env.PI_FORUM_DIR, undefined)
         assert.deepEqual(host.errors, [])
         const forums = (await fs.readdir(path.join(host.agentDir, 'forums', 'sessions'))).sort()
-        assert.deepEqual(forums, [first, second, forked].sort())
+        assert.deepEqual(forums, [first, second, forked, cloned].sort())
       })
 
       test('a supplied PI_FORUM_DIR is shared across sessions and survives quit', async () => {
@@ -556,6 +556,7 @@ else describe('real Pi host', () => {
         assert.deepEqual(startup.map((e) => [e.probe, e.reason, e.forumDir]), [['before', 'startup', shared], ['after', 'startup', shared]])
         assert.equal(startup[0].path, BASE_PATH)
         assertBound(host, shared, dir)
+        assert.deepEqual(await fs.readdir(shared), [])
         let run = await startRun(host)
         assert.ok(run.after.includes(`Forum directory: ${shared} (PI_FORUM_DIR; supplied at launch; other sessions may share it)`))
         const { topic } = await forum(host, ['topic', 'create', 'Shared', '--body', 'from the first session'])
@@ -607,7 +608,7 @@ else describe('real Pi host', () => {
         assert.deepEqual(await slash(host, '/forum status'), [info(on)])
         assert.deepEqual(await slash(host, '/forum   status  '), [info(on)])
         assert.deepEqual({ ...process.env }, env)
-        await assert.rejects(fs.access(forumDir))
+        assert.deepEqual(await fs.readdir(forumDir), [])
 
         // Real posts through Pi's bash while on.
         await startRun(host)
@@ -1067,10 +1068,17 @@ else describe('real Pi host', () => {
           assert.deepEqual({ ...process.env }, env)
           await assert.rejects(fs.access(path.join(host.agentDir, 'forums')), { code: 'ENOENT' })
 
-          // A selected directory that does not exist yet is reported, and browsing does not create it.
+          // Activation initializes an empty forum; browsing still creates no files.
           await session.prompt('/forum on')
           const generated = host.defaultDir(host.sessionId)
-          let { pending } = await browse('/forum topics', 'FORUM_UNAVAILABLE')
+          let { pending } = await browse('/forum topics', 'No topics yet.')
+          assert.doesNotMatch(ui.screen(), /FORUM_UNAVAILABLE/)
+          await close(pending)
+          assert.deepEqual(await fs.readdir(generated), [])
+
+          // A directory removed after activation is reported, not recreated by browsing.
+          await fs.rm(path.join(host.agentDir, 'forums'), { recursive: true })
+          pending = (await browse('/forum topics', 'FORUM_UNAVAILABLE')).pending
           assert.match(ui.screen(), /ENOENT/)
           assert.match(ui.screen(), /r retry/)
           await close(pending)
