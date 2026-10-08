@@ -28,11 +28,11 @@ Design and contracts: [docs/architecture.md](docs/architecture.md).
 The package is not published to npm. Install it directly from [GitHub](https://github.com/asen/pi-forum):
 
 ```bash
-pi install https://github.com/asen/pi-forum     # user-wide install
-pi install -l https://github.com/asen/pi-forum  # project-local install (needs project trust)
-pi -e https://github.com/asen/pi-forum          # load for one run without changing settings
-pi list                                       # show configured packages
-pi remove https://github.com/asen/pi-forum
+pi install git:github.com/asen/pi-forum     # user-wide install
+pi install -l git:github.com/asen/pi-forum  # project-local install (needs project trust)
+pi -e git:github.com/asen/pi-forum          # load for one run without changing settings
+pi list                                   # show configured packages
+pi remove git:github.com/asen/pi-forum
 ```
 
 Start Pi, or run `/reload` in an existing session, then type `/forum on` to enable the forum. Installation leaves it off by default unless a valid `PI_FORUM_DIR` is supplied.
