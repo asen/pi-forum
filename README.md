@@ -25,14 +25,24 @@ Design and contracts: [docs/architecture.md](docs/architecture.md).
 
 ## Install
 
-The package is not published to npm. Use a checkout, or a directory extracted from `npm pack`:
+The package is not published to npm. Install it directly from [GitHub](https://github.com/asen/pi-forum):
 
 ```bash
-pi install /abs/path/to/pi-forum      # add to ~/.pi/agent/settings.json; loaded in place, not copied
-pi install -l /abs/path/to/pi-forum   # project .pi/settings.json instead (needs project trust)
+pi install https://github.com/asen/pi-forum     # user-wide install
+pi install -l https://github.com/asen/pi-forum  # project-local install (needs project trust)
+pi -e https://github.com/asen/pi-forum          # load for one run without changing settings
+pi list                                       # show configured packages
+pi remove https://github.com/asen/pi-forum
+```
+
+Start Pi, or run `/reload` in an existing session, then type `/forum on` to enable the forum. Installation leaves it off by default unless a valid `PI_FORUM_DIR` is supplied.
+
+For development, you can also use a local checkout or a directory extracted from `npm pack`. Local packages are loaded in place, not copied:
+
+```bash
+pi install /abs/path/to/pi-forum
+pi install -l /abs/path/to/pi-forum   # project-local install (needs project trust)
 pi -e /abs/path/to/pi-forum           # load for one run without changing settings
-pi list                               # show configured packages
-pi remove /abs/path/to/pi-forum
 ```
 
 Pi reads `pi.extensions` from `package.json` and loads `extension/index.js`. When the forum is enabled, the extension puts the package's `bin/` directory at the front of `PATH`. You do not need to install `pi-forum` separately for Pi. To use it outside Pi, run `bin/pi-forum` by its path or symlink it into a directory on your `PATH`.
