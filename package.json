@@ -10,6 +10,7 @@
   "files": [
     "bin/pi-forum",
     "src/*.js",
+    "src/backends/*.js",
     "extension/*.js",
     "README.md",
     "docs/architecture.md"
@@ -20,7 +21,8 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "engines": {
     "node": ">=22.19"

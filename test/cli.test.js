@@ -5,7 +5,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { main } from '../src/cli.js'
+import { createForum } from '../src/forum.js'
 import { createTopic, postMessage } from '../src/storage.js'
+import { fakeAdapter } from './fake-adapter.js'
 
 const BIN = fileURLToPath(new URL('../bin/pi-forum', import.meta.url))
 const roots = []
@@ -84,7 +87,16 @@ describe('help and binding', () => {
       const result = await run(args)
       assert.equal(result.code, 0)
       assert.equal(result.stderr, '')
-      for (const text of ['PI_FORUM_DIR', 'PI_SESSION_ID', '--body-file', '--body-stdin', 'next_cursor', '--after']) {
+      for (const text of [
+        'PI_FORUM_DIR',
+        'PI_SESSION_ID',
+        '--body-file',
+        '--body-stdin',
+        'next_cursor',
+        '--after',
+        'pi-forum message get MESSAGE_ID',
+        'message get     {"message": Message}',
+      ]) {
         assert.ok(result.stdout.includes(text), `help mentions ${text}`)
       }
     }
@@ -127,6 +139,8 @@ describe('help and binding', () => {
       ['message', 'post', '-h'],
       ['message', 'post', 'x', '--help'],
       ['message', 'list', '--topic', 't', '--limit', '5', '--after', 'c', '-h'],
+      ['message', 'get', '-h'],
+      ['message', 'get', 'x', '--help'],
     ]
     for (const args of forms) {
       const result = await run(args, forumEnv(dir))
@@ -167,6 +181,8 @@ describe('help and binding', () => {
       [['message', 'post', 'x', '--body', 'a', '--body-stdin', '--help'], /use only one of --body, --body-stdin/],
       [['topic', 'list', '--limit', 'ten', '-h'], /--limit must be an integer/],
       [['topic', 'get', 'a', 'b', '--help'], /unexpected argument "b"/],
+      [['message', 'get', 'a', 'b', '-h'], /unexpected argument "b"/],
+      [['message', 'get', 'a', '--topic', 't', '--help'], /Unknown option '--topic'/],
       [['topic', 'delete', '--help'], /unknown command "topic delete"/],
     ]
     for (const [args, pattern] of cases) await fails(args, forumEnv(dir), pattern)
@@ -301,6 +317,10 @@ describe('message commands', () => {
     return (await createTopic(dir, { title: 'Topic', author: 'seed' })).topic
   }
 
+  function seededMessage(dir, topic) {
+    return postMessage(dir, { topicId: topic.id, author: 'seed', body: 'seed' })
+  }
+
   test('post from each body source with attribution and replies', async () => {
     const dir = await tempForum()
     const cwd = await tempRoot()
@@ -381,6 +401,36 @@ describe('message commands', () => {
     assert.equal(typeof page.next_cursor, 'string')
   })
 
+  test('get prints one complete stored message', async () => {
+    const dir = await tempForum()
+    const topic = await seededTopic(dir)
+    const bodies = [
+      '  leading and trailing whitespace\n\n\t kept  \r\n',
+      'Ünïcödé 日本語 🧵\u2028 line separator, ZWJ 👩\u200d💻 and combining e\u0301',
+      `${'x'.repeat(64 * 1024 - 4)}🧵`,
+    ]
+    for (const body of bodies) {
+      const posted = await postMessage(dir, { topicId: topic.id, author: 'seed', body, originSessionId: 's' })
+      const result = await ok(['message', 'get', posted.id], forumEnv(dir))
+      assert.deepEqual(Object.keys(result), ['message'])
+      assert.deepEqual(result, { message: posted })
+      assert.equal(result.message.body, body)
+    }
+    assert.equal(Buffer.byteLength(bodies[2]), 64 * 1024)
+    const reply = await ok(['message', 'post', topic.id, '--body', 'r', '--reply-to', (await seededMessage(dir, topic)).id], forumEnv(dir))
+    assert.deepEqual(await ok(['message', 'get', '--', reply.message.id], forumEnv(dir)), reply)
+  })
+
+  test('get reports unknown messages and writes nothing', async () => {
+    const dir = await tempForum()
+    const topic = await seededTopic(dir)
+    const before = await readLog(dir)
+    assert.equal(await fails(['message', 'get', 'nope'], forumEnv(dir)), 'pi-forum: error: message nope not found\n')
+    await fails(['message', 'get', topic.id], forumEnv(dir), new RegExp(`message ${topic.id} not found`))
+    await fails(['message', 'get', '--', '-h'], forumEnv(dir), /message -h not found/)
+    assert.equal(await readLog(dir), before)
+  })
+
   test('list defaults to 50 messages', async () => {
     const dir = await tempForum()
     const topic = await seededTopic(dir)
@@ -431,6 +481,10 @@ describe('input errors', () => {
       [['message', 'post', topic.id, '--body', 'x', '--reply-to', ' '], /replyTo must be a non-blank string/],
       [['message', 'list', '--topic', ''], /topicId must be a non-blank string/],
       [['message', 'list', '--verbose'], /Unknown option '--verbose'/],
+      [['message', 'get'], /missing MESSAGE_ID for message get/],
+      [['message', 'get', 'a', 'b'], /unexpected argument "b" for message get/],
+      [['message', 'get', 'a', '--body', 'x'], /Unknown option '--body'/],
+      [['message', 'get', ' '], /messageId must be a non-blank string/],
     ]
     for (const [args, pattern] of cases) {
       const stderr = await fails(args, { ...env, input: ' ' }, pattern)
@@ -513,5 +567,154 @@ fs.appendFile = async (file, data, ...rest) => {
     assert.match(stderr, new RegExp(`topic ${event.id} was created, but its initial message may be missing`))
     assert.match(stderr, new RegExp(`pi-forum message list --topic ${event.id}`))
     await ok(['topic', 'get', event.id], forumEnv(dir))
+  })
+})
+
+// main() in process with injected output streams and client factory: a recording wrapper around the
+// shared API over an in-memory adapter, so nothing reaches the file system.
+describe('dispatch through the shared API', () => {
+  const FORUM_DIR = path.join(os.tmpdir(), 'pi-forum-cli-dispatch-never-created')
+
+  function recordingFactory(adapter = fakeAdapter()) {
+    const configs = []
+    const calls = []
+    const factory = (config) => {
+      configs.push(config)
+      const client = createForum({ ...config, adapter })
+      return new Proxy(client, {
+        get(target, name) {
+          const value = target[name]
+          if (typeof value !== 'function') return value
+          return (...args) => {
+            calls.push({ name, args })
+            return value(...args)
+          }
+        },
+      })
+    }
+    return { adapter, factory, configs, calls }
+  }
+
+  // Runs main with captured output streams.
+  async function invoke(argv, env, factory) {
+    const out = []
+    const err = []
+    const stream = (chunks) => ({ write: (chunk) => chunks.push(chunk) > 0 })
+    const code = await main(argv, env, { createForum: factory, stdout: stream(out), stderr: stream(err) })
+    return { code, stdout: out.join(''), stderr: err.join('') }
+  }
+
+  test('each command binds one client with the CLI configuration and calls its public method', async () => {
+    const recording = recordingFactory()
+    const env = { PI_FORUM_DIR: FORUM_DIR, PI_SESSION_ID: 'sess' }
+    // Runs one command and returns its JSON result and the client calls it made.
+    const command = async (argv) => {
+      const configs = recording.configs.length
+      const calls = recording.calls.length
+      const result = await invoke(argv, env, recording.factory)
+      assert.equal(result.stderr, '', argv.join(' '))
+      assert.equal(result.code, 0)
+      assert.deepEqual(recording.configs.slice(configs), [{ forumDir: FORUM_DIR, createOnRead: true }])
+      // Every call passes the CLI's warning reporter in its final options; the rest is compared exactly.
+      const made = recording.calls.slice(calls).map(({ name, args }) => {
+        const { onWarning, ...options } = args.at(-1)
+        assert.equal(typeof onWarning, 'function')
+        return [name, ...args.slice(0, -1), options]
+      })
+      return { json: JSON.parse(result.stdout), calls: made }
+    }
+
+    const created = await command(['topic', 'create', 'T', '--body', '  b  '])
+    const { topic, message } = created.json
+    assert.deepEqual(created.calls, [
+      ['createTopic', { title: 'T', body: '  b  ', author: 'sess', originSessionId: 'sess' }, {}],
+    ])
+    assert.equal(message.topic_id, topic.id)
+
+    const topics = await command(['topic', 'list', '--limit', '5'])
+    assert.deepEqual(topics.json.items, [topic])
+    assert.match(topics.json.next_cursor, /^fake-/)
+    assert.deepEqual(topics.calls, [['listTopics', { after: undefined, limit: 5 }]])
+
+    const gotTopic = await command(['topic', 'get', topic.id])
+    assert.deepEqual(gotTopic.json, { topic })
+    assert.deepEqual(gotTopic.calls, [['getTopic', topic.id, {}]])
+
+    const posted = await command(['message', 'post', topic.id, '--body', 'r', '--reply-to', message.id, '--author', 'bot'])
+    assert.deepEqual(posted.calls, [
+      ['postMessage', { topicId: topic.id, body: 'r', replyTo: message.id, author: 'bot', originSessionId: 'sess' }, {}],
+    ])
+    assert.equal(posted.json.message.reply_to, message.id)
+
+    const listed = await command(['message', 'list', '--topic', topic.id, '--after', topics.json.next_cursor])
+    // The topic list's cursor is past the initial message, so only the later post follows it.
+    assert.deepEqual(listed.json.items, [posted.json.message])
+    assert.deepEqual(listed.calls, [
+      ['listMessages', { topicId: topic.id, after: topics.json.next_cursor, limit: undefined }],
+    ])
+
+    const got = await command(['message', 'get', posted.json.message.id])
+    assert.deepEqual(got.json, { message: posted.json.message })
+    assert.deepEqual(got.calls, [['getMessage', posted.json.message.id, {}]])
+
+    assert.deepEqual(
+      recording.calls.map((call) => call.name),
+      ['createTopic', 'listTopics', 'getTopic', 'postMessage', 'listMessages', 'getMessage'],
+    )
+    await assert.rejects(fs.stat(FORUM_DIR), { code: 'ENOENT' })
+  })
+
+  test('help, usage errors and an invalid binding never bind a client', async () => {
+    const recording = recordingFactory()
+    const env = { PI_FORUM_DIR: FORUM_DIR }
+    for (const argv of [['--help'], ['message', 'get', '-h'], ['message', 'get', 'x', '--help']]) {
+      const result = await invoke(argv, env, recording.factory)
+      assert.equal(result.code, 0)
+      assert.match(result.stdout, /^Usage:\n/)
+    }
+    for (const [argv, argEnv] of [
+      [['message', 'get'], env],
+      [['message', 'get', 'a', 'b'], env],
+      [['message', 'get', 'x'], {}],
+      [['message', 'get', 'x'], { PI_FORUM_DIR: 'relative' }],
+    ]) {
+      const result = await invoke(argv, argEnv, recording.factory)
+      assert.equal(result.code, 1)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /^pi-forum: error: /)
+    }
+    assert.deepEqual(recording.configs, [])
+  })
+
+  test('warnings go to the injected stderr and results to the injected stdout', async () => {
+    const forumDir = await tempForum()
+    await fs.mkdir(forumDir)
+    await fs.writeFile(logPath(forumDir), 'not json\n')
+    const { topic } = await createTopic(forumDir, { title: 'T', author: 'a' })
+    const result = await invoke(['topic', 'get', topic.id], { PI_FORUM_DIR: forumDir }, createForum)
+    assert.equal(result.code, 0)
+    assert.deepEqual(JSON.parse(result.stdout), { topic })
+    assert.match(result.stderr, /^pi-forum: warning: skipping malformed record at byte offset 0: .*\n$/)
+  })
+
+  test('client errors keep their messages and recovery advice', async () => {
+    const recording = recordingFactory()
+    const env = { PI_FORUM_DIR: FORUM_DIR }
+    const missing = await invoke(['message', 'get', 'nope'], env, recording.factory)
+    assert.deepEqual(missing, { code: 1, stdout: '', stderr: 'pi-forum: error: message nope not found\n' })
+
+    recording.adapter.failAppends((event) => event.type === 'message_posted')
+    const partial = await invoke(['topic', 'create', 'Partial', '--body', 'lost'], env, recording.factory)
+    recording.adapter.failAppends(() => false)
+    assert.equal(partial.code, 1)
+    assert.equal(partial.stdout, '')
+    const [{ events }] = recording.adapter.forums.values()
+    const id = events[0].data.id
+    assert.equal(
+      partial.stderr,
+      `pi-forum: error: topic ${id} was created, but its initial message may be missing (fake append failed).\n` +
+        `Check with "pi-forum message list --topic ${id}" and, if needed, post the body with ` +
+        `"pi-forum message post ${id} ..." instead of creating the topic again.\n`,
+    )
   })
 })

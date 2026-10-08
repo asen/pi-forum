@@ -6,8 +6,9 @@
 //
 // With the variable set, a root that cannot be loaded fails the suite. Every run uses its own agent
 // directory, sessions, working directory, HOME, TMPDIR and npm cache under one temp directory, and
-// makes no model requests: the session lifecycle and before_agent_start are driven directly, and
+// makes no network requests: the session lifecycle and before_agent_start are driven directly, and
 // /forum is submitted through session.prompt(), which runs extension commands before any model check.
+// Agent runs, where needed, stream from a synthetic provider extension the test controls.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -16,6 +17,16 @@ import path from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
+import { createForum } from '../src/forum.js'
+import {
+  FILE_SYNTHETIC_PROVIDER,
+  SYNTHETIC_PROVIDER,
+  createTerminalUI,
+  hasTmux,
+  installSyntheticProvider,
+  tmuxSession,
+  until,
+} from './pi-fixtures.js'
 
 const exec = promisify(execFile)
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -28,6 +39,9 @@ const SKIP_REASON =
   'host-specific: set PI_FORUM_TEST_PI_ROOT to an installed @earendil-works/pi-coding-agent root to run it'
 
 let pi
+let piAi
+let piTui
+let piTheme
 let piManifest
 let temp
 let savedEnv
@@ -60,6 +74,7 @@ function probeSource(position) {
   }
   pi.on('before_agent_start', (event, ctx) => {
     ${position === 'before' ? "event.systemPromptOptions.sections.team_notes = 'Notes from another extension.'" : ''}
+    state.starts = (state.starts ?? 0) + 1
     state.prompts[${JSON.stringify(position)}] = event.systemPrompt
     state.ctx = ctx
   })
@@ -92,12 +107,29 @@ async function setUp() {
   })
 
   pi = await import(pathToFileURL(path.join(PI_ROOT, piManifest.exports['.'].import)).href)
+  // The host's own copies of its AI and terminal libraries, which it also gives extensions.
+  const hostLibrary = async (name) => {
+    for (const dir of [path.join(PI_ROOT, 'node_modules', '@earendil-works'), path.dirname(PI_ROOT)]) {
+      const entry = path.join(dir, name, 'dist', 'index.js')
+      if (await fs.access(entry).then(() => true, () => false)) return import(pathToFileURL(entry).href)
+    }
+    throw new Error(`cannot find @earendil-works/${name} for ${PI_ROOT}`)
+  }
+  piAi = await hostLibrary('pi-ai')
+  piTui = await hostLibrary('pi-tui')
+  pi.initTheme('dark')
+  // Pi passes custom UI factories this live view of the active theme.
+  piTheme = new Proxy({}, { get: (_target, key) => globalThis[Symbol.for('@earendil-works/pi-coding-agent:theme')][key] })
 
   probes = {}
   for (const position of ['before', 'after']) {
     probes[position] = path.join(temp, 'probes', `probe-${position}.js`)
     await fs.writeFile(probes[position], probeSource(position))
   }
+  probes.synthetic = path.join(temp, 'probes', 'synthetic.js')
+  await fs.writeFile(probes.synthetic, SYNTHETIC_PROVIDER)
+  probes.fileSynthetic = path.join(temp, 'probes', 'synthetic-file.js')
+  await fs.writeFile(probes.fileSynthetic, FILE_SYNTHETIC_PROVIDER)
 
   const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', temp], { cwd: ROOT })
   const [{ filename }] = JSON.parse(stdout)
@@ -122,7 +154,12 @@ function recordingUI(notices) {
 // Starts a Pi session runtime like the CLI does, with its own agent dir, sessions and project.
 // mode "extension" loads the package as `pi -e DIR` does; "settings" relies on `pi install`.
 // With ui, notifications are recorded in host.notices; without it, Pi's extensions have no UI.
-async function openHost(packageDir, { supplied, mode = 'extension', ui = false, PATH = BASE_PATH } = {}) {
+// uiContext and uiMode bind another UI and mode instead; abortHandler receives extension aborts;
+// synthetic also loads the synthetic provider.
+async function openHost(
+  packageDir,
+  { supplied, mode = 'extension', ui = false, PATH = BASE_PATH, uiContext, uiMode, abortHandler, synthetic = false } = {},
+) {
   const dir = await fs.mkdtemp(path.join(temp, 'host-'))
   const agentDir = path.join(dir, 'agent')
   const project = path.join(dir, 'project')
@@ -134,8 +171,10 @@ async function openHost(packageDir, { supplied, mode = 'extension', ui = false, 
   else process.env.PI_FORUM_DIR = supplied
   if (mode === 'settings') await piCli(['install', packageDir], { cwd: project })
 
-  const extensionPaths =
-    mode === 'extension' ? [probes.before, packageDir, probes.after] : [probes.before, probes.after]
+  const extensionPaths = [
+    ...(synthetic ? [probes.synthetic] : []),
+    ...(mode === 'extension' ? [probes.before, packageDir, probes.after] : [probes.before, probes.after]),
+  ]
   globalThis.piForumProbe = { events: [], prompts: {} }
   const errors = []
   const notices = []
@@ -154,7 +193,13 @@ async function openHost(packageDir, { supplied, mode = 'extension', ui = false, 
     const created = await pi.createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })
     return { ...created, services, diagnostics: services.diagnostics }
   }
-  const bindings = { onError: (error) => errors.push(error), ...(ui && { uiContext: recordingUI(notices) }) }
+  const bindings = {
+    onError: (error) => errors.push(error),
+    ...(ui && { uiContext: recordingUI(notices) }),
+    ...(uiContext && { uiContext }),
+    ...(uiMode && { mode: uiMode }),
+    ...(abortHandler && { abortHandler }),
+  }
   const bind = (session) => session.bindExtensions(bindings)
   const runtime = await pi.createAgentSessionRuntime(createRuntime, {
     cwd: project,
@@ -248,7 +293,7 @@ async function slash(host, text) {
 
 const info = (message) => ({ type: 'info', message })
 const warning = (message) => ({ type: 'warning', message })
-const USAGE = 'Usage: /forum [on|off|status]'
+const USAGE = 'Usage: /forum [on|off|status] | /forum topics | /forum messages [TOPIC_ID] | /forum read MESSAGE_ID'
 
 // Takes the lifecycle events recorded since the last call.
 function takeEvents(host) {
@@ -291,6 +336,44 @@ function assertBound(host, forumDir, packageDir) {
   assert.equal(process.env.PI_SESSION_ID, undefined)
 }
 
+// A forum with a topic of three messages, the second long enough to scroll, and another topic.
+async function seedForum(forumDir) {
+  const forum = createForum({ forumDir })
+  const { topic, message: kickoff } = await forum.createTopic({ title: 'Release plan', author: 'ralph', body: 'Kickoff' })
+  const body = `${Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(4, '0')}`).join('\n')}\nLAST LINE ✓`
+  const long = await forum.postMessage({ topicId: topic.id, author: 'sam', body })
+  const reply = await forum.postMessage({ topicId: topic.id, author: 'ralph', body: 'Thanks', replyTo: long.id })
+  await forum.createTopic({ title: 'Other', author: 'sam' })
+  return { topic, kickoff, long, reply }
+}
+
+// Complete records of another topic, about size bytes, so a full scan takes many chunk reads.
+function filler(size) {
+  const line = `${JSON.stringify({ type: 'message_posted', id: 'filler', topic_id: 'filler-topic', author: 'f', body: 'x'.repeat(900), created_at: '2026-01-01T00:00:00.000Z' })}\n`
+  return line.repeat(Math.ceil(size / line.length))
+}
+
+// Slows each read of file and records its descriptors and reads, so Esc can land mid-scan.
+function slowReads(t, file) {
+  const trace = { handles: [], reads: [] }
+  const open = fs.open
+  const mock = t.mock.method(fs, 'open', async (...args) => {
+    const handle = await open(...args)
+    if (args[0] === file) {
+      trace.handles.push(handle)
+      const read = handle.read.bind(handle)
+      handle.read = async (...readArgs) => {
+        trace.reads.push(readArgs[3])
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        return read(...readArgs)
+      }
+    }
+    return handle
+  })
+  trace.restore = () => mock.mock.restore()
+  return trace
+}
+
 if (!PI_ROOT) test('real Pi host acceptance', { skip: SKIP_REASON }, () => {})
 else describe('real Pi host', () => {
   before(setUp)
@@ -319,7 +402,7 @@ else describe('real Pi host', () => {
           assert.ok(command, 'Pi resolves /forum')
           assert.match(command.description, /on or off/)
           const complete = (prefix) => command.getArgumentCompletions(prefix).map((item) => item.value)
-          assert.deepEqual(complete(''), ['on', 'off', 'status'])
+          assert.deepEqual(complete(''), ['on', 'off', 'status', 'topics', 'messages', 'read'])
           assert.deepEqual(complete('o'), ['on', 'off'])
           assert.deepEqual(complete('st'), ['status'])
           assert.deepEqual(complete('x'), [])
@@ -776,8 +859,458 @@ else describe('real Pi host', () => {
         assert.equal(process.env.PATH, BASE_PATH)
         assert.equal(process.env.PI_FORUM_DIR, undefined)
       })
+
+      // Browsing in the terminal UI while an agent run streams from the synthetic provider. The UI
+      // host is Pi's real renderer on an in-memory terminal (see createTerminalUI).
+      for (const [screen, renderer] of [['regular', 'TuiMainScreen'], ['fullscreen', 'TuiAltScreen']]) {
+        test(`browsing during a streaming agent run (${screen} renderer) leaves the run, its context and the environment alone`, { timeout: 60000 }, async (t) => {
+          const { dir } = pkg()
+          const shared = path.join(temp, `browsed forum ${variant} ${screen}`)
+          const seeded = await seedForum(shared)
+          const { topic, long } = seeded
+          let extensionAborts = 0
+          const ui = createTerminalUI(piTui, piTui[renderer], piTheme, {
+            onEditorEscape: () => assert.fail('Esc reached the editor, where it would abort the agent'),
+          })
+          const host = await openHost(dir, { supplied: shared, uiContext: ui.ui, uiMode: 'tui', abortHandler: () => extensionAborts++, synthetic: true })
+          const { session } = host.runtime
+          const sessionAborts = t.mock.method(session, 'abort')
+          const calls = installSyntheticProvider(piAi.createAssistantMessageEventStream)
+          const unsubscribe = session.subscribe((event) => {
+            if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') ui.showStreamed(event.assistantMessageEvent.delta)
+          })
+          try {
+            await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held'))
+            let settled = false
+            const run = session.prompt('Plan the release.').finally(() => {
+              settled = true
+            })
+            await until(() => calls.length === 1 && session.isStreaming, 'the synthetic run to start')
+            ui.setMark()
+            calls[0].delta('first')
+            await until(() => ui.screen().includes('assistant: first'), 'the first delta to render')
+
+            // What browsing must not change: persisted entries, model context, queues, prompt,
+            // provider requests and the environment.
+            const state = () => ({
+              entries: session.sessionManager.getEntries().length,
+              messages: session.messages.length,
+              steering: session.getSteeringMessages().length,
+              followUp: session.getFollowUpMessages().length,
+              pending: session.pendingMessageCount,
+              systemPrompt: session.systemPrompt,
+              starts: host.probe.starts,
+              requests: calls.length,
+              env: { ...process.env },
+            })
+            const baseline = state()
+            const stillRunning = (env = baseline.env) => {
+              assert.deepEqual(state(), { ...baseline, env })
+              assert.equal(settled, false)
+              assert.equal(session.isStreaming, true)
+              assert.equal(calls[0].aborted, false)
+            }
+            const browse = async (text, shown) => {
+              ui.setMark()
+              const pending = session.prompt(text)
+              await until(() => ui.overlayFocused() && ui.shows(shown), `${text} to show ${shown}`, { detail: ui.screen })
+              // Wrapped, so awaiting the overlay does not also await the command it belongs to.
+              return { pending }
+            }
+            const press = async (key, shown) => {
+              ui.setMark()
+              ui.type(key)
+              if (shown) await until(() => ui.shows(shown), `${JSON.stringify(key)} to show ${shown}`, { detail: ui.screen })
+            }
+            // Esc goes to the focused overlay; the interaction ends through done and the editor
+            // gets focus back.
+            const close = async (pending) => {
+              ui.type('\x1b')
+              assert.equal(await pending, undefined)
+              assert.equal(ui.component, null)
+              assert.equal(ui.tui.getFocusedComponent(), ui.editor)
+            }
+
+            // Topics -> messages -> complete body and back, while the run keeps streaming and
+            // the renderer keeps drawing it behind the focused overlay.
+            let { pending } = await browse('/forum topics', 'Forum · Topics · page 1')
+            assert.match(ui.screen(), /Forum is on for agents/)
+            ui.setMark()
+            calls[0].delta(' second')
+            await until(
+              () => ui.written().includes('assistant: first second') && ui.screen().includes('assistant: first second') && ui.screen().includes('Forum · Topics'),
+              'a delta to render while the overlay is open',
+            )
+            assert.ok(ui.overlayFocused())
+            await press('\r', 'Forum · Messages in "Release plan" · page 1')
+            await until(() => ui.shows('› ralph'), 'the messages to load', { detail: ui.screen })
+            await press('\x1b[B')
+            // The reader's header, not the body's first line, which the list row shows too.
+            await press('\r', 'From sam')
+            assert.match(ui.screen(), new RegExp(`Forum · Message ${long.id}`))
+            assert.match(ui.screen(), /line 0000/)
+            await press('\x1b[F', 'LAST LINE ✓')
+            await press('\x1b[H', 'line 0000')
+            await press('b', '› sam')
+            await press('b', '› Release plan')
+            await press('r', 'Release plan')
+            stillRunning()
+            await close(pending)
+            stillRunning()
+
+            // Off: the selected forum stays browsable and the forum stays off.
+            await session.prompt('/forum off')
+            const offEnv = { ...process.env }
+            pending = (await browse(`/forum messages ${topic.id}`, `Forum · Messages in topic ${topic.id} · page 1`)).pending
+            assert.match(ui.screen(), /Forum is off for agents; browsing only/)
+            ui.setMark()
+            calls[0].delta(' third')
+            await until(
+              () => ui.screen().includes('assistant: first second third') && ui.screen().includes('Forum is off for agents'),
+              'a delta to render while browsing off',
+            )
+            await close(pending)
+            stillRunning(offEnv)
+            ui.notices.length = 0
+            await session.prompt('/forum status')
+            assert.match(ui.notices[0].message, /^Forum is off\./)
+
+            // Esc during a slow first read cancels only that read: the log is closed early.
+            const trace = slowReads(t, path.join(shared, 'events.jsonl'))
+            await fs.appendFile(path.join(shared, 'events.jsonl'), filler(4 * 1024 * 1024))
+            pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+            await until(() => trace.reads.length > 0, 'the scan to start')
+            await close(pending)
+            await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close')
+            const reads = trace.reads.length
+            await new Promise((resolve) => setTimeout(resolve, 100))
+            assert.equal(trace.reads.length, reads)
+            assert.ok(reads < 32, `${reads} reads of a 64-chunk log`)
+            trace.restore()
+            stillRunning(offEnv)
+
+            // Drift after on: the last selected directory, with a visible warning; nothing adopted.
+            await session.prompt('/forum on')
+            const elsewhere = path.join(temp, `elsewhere ${variant} ${screen}`)
+            process.env.PI_FORUM_DIR = elsewhere
+            const driftEnv = { ...process.env }
+            ui.notices.length = 0
+            pending = (await browse(`/forum read ${long.id}`, 'From sam')).pending
+            assert.deepEqual(ui.notices, [
+              {
+                type: 'warning',
+                message: `Warning: the forum is unavailable (PI_FORUM_DIR changed from ${JSON.stringify(shared)} to ${JSON.stringify(elsewhere)}); browsing the last selected directory. Forum directory: ${shared} (supplied PI_FORUM_DIR).`,
+              },
+            ])
+            assert.match(ui.screen(), /Unavailable: PI_FORUM_DIR changed/)
+            await press('\x1b[F', 'LAST LINE ✓')
+            await close(pending)
+            stillRunning(driftEnv)
+            await assert.rejects(fs.access(elsewhere), { code: 'ENOENT' })
+
+            // Released, the run completes normally with every delta and one provider request.
+            process.env.PI_FORUM_DIR = shared
+            calls[0].delta(' done')
+            calls[0].finish()
+            await run
+            assert.equal(session.isStreaming, false)
+            const reply = session.messages.at(-1)
+            assert.equal(reply.role, 'assistant')
+            assert.equal(reply.stopReason, 'stop')
+            assert.deepEqual(reply.content, [{ type: 'text', text: 'first second third done' }])
+            const added = session.sessionManager.getEntries().slice(baseline.entries)
+            assert.deepEqual(added.map((entry) => [entry.type, entry.message?.role]), [['message', 'assistant']])
+            assert.equal(session.messages.length, baseline.messages + 1)
+            assert.deepEqual([session.getSteeringMessages(), session.getFollowUpMessages()], [[], []])
+            assert.equal(host.probe.starts, baseline.starts)
+            assert.equal(calls.length, 1)
+            assert.equal(calls[0].aborted, false)
+            assert.equal(extensionAborts, 0)
+            assert.equal(sessionAborts.mock.callCount(), 0)
+            assert.equal(ui.editor.escapes, 0)
+            assert.deepEqual(ui.customs.length, 4)
+          } finally {
+            // A failure must not leave the run held open, or disposing would wait for it.
+            for (const call of calls) if (!call.finished && !call.aborted) call.finish()
+            unsubscribe()
+            ui.stop()
+            await host.runtime.dispose()
+          }
+          assert.deepEqual(host.errors, [])
+        })
+      }
+
+      test('the terminal browser reads only the selected target: none, missing storage, a pinned symlink, a fresh reselection', { timeout: 60000 }, async (t) => {
+        const { dir } = pkg()
+        const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, {})
+        const host = await openHost(dir, { uiContext: ui.ui, uiMode: 'tui' })
+        const { session } = host.runtime
+        const browse = async (text, shown) => {
+          ui.setMark()
+          const pending = session.prompt(text)
+          await until(() => ui.overlayFocused() && ui.shows(shown), `${text} to show ${shown}`, { detail: ui.screen })
+          // Wrapped, so awaiting the overlay does not also await the command it belongs to.
+          return { pending }
+        }
+        const close = async (pending) => {
+          ui.type('\x1b')
+          await pending
+          assert.equal(ui.tui.getFocusedComponent(), ui.editor)
+        }
+        let disposed = false
+        try {
+          // Startup without a selection: guidance only, no overlay, no default directory.
+          const env = { ...process.env }
+          await session.prompt('/forum topics')
+          assert.deepEqual(ui.notices, [{ type: 'warning', message: 'No forum is selected in this session. Run /forum on to select one, then browse it.' }])
+          assert.deepEqual(ui.customs, [])
+          assert.deepEqual({ ...process.env }, env)
+          await assert.rejects(fs.access(path.join(host.agentDir, 'forums')), { code: 'ENOENT' })
+
+          // A selected directory that does not exist yet is reported, and browsing does not create it.
+          await session.prompt('/forum on')
+          const generated = host.defaultDir(host.sessionId)
+          let { pending } = await browse('/forum topics', 'FORUM_UNAVAILABLE')
+          assert.match(ui.screen(), /ENOENT/)
+          assert.match(ui.screen(), /r retry/)
+          await close(pending)
+          await assert.rejects(fs.access(path.join(host.agentDir, 'forums')), { code: 'ENOENT' })
+
+          // A supplied symlink: the browser pins where it first resolved until a fresh selection.
+          const a = path.join(temp, `pinned a ${variant}`)
+          const b = path.join(temp, `pinned b ${variant}`)
+          const link = path.join(temp, `pinned link ${variant}`)
+          await createForum({ forumDir: a }).createTopic({ title: 'In A', author: 'a' })
+          await createForum({ forumDir: b }).createTopic({ title: 'In B', author: 'b' })
+          await fs.symlink(a, link)
+          process.env.PI_FORUM_DIR = link
+          await session.prompt('/forum on')
+          pending = (await browse('/forum topics', 'In A')).pending
+          await close(pending)
+          await fs.rm(link)
+          await fs.symlink(b, link)
+          pending = (await browse('/forum topics', 'now resolves to')).pending
+          assert.doesNotMatch(ui.screen(), /In B/)
+          await close(pending)
+          await session.prompt('/forum off')
+          await session.prompt('/forum on')
+          pending = (await browse('/forum topics', 'In B')).pending
+          await close(pending)
+
+          // Reselection during a slow read closes the browser; off alone leaves it open.
+          const log = path.join(b, 'events.jsonl')
+          await fs.appendFile(log, filler(4 * 1024 * 1024))
+          let trace = slowReads(t, log)
+          pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+          const notices = ui.notices.length
+          await session.prompt('/forum off')
+          assert.notEqual(ui.component, null)
+          await session.prompt('/forum on')
+          assert.equal(await pending, undefined)
+          assert.equal(ui.component, null)
+          assert.equal(ui.tui.getFocusedComponent(), ui.editor)
+          await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close after reselection')
+          assert.deepEqual(ui.notices.slice(notices).map((notice) => notice.message.split(' ').slice(0, 3).join(' ')), ['Forum is off.', 'Forum is on:'])
+          trace.restore()
+
+          // Shutdown during a slow read closes it too, without later notifications.
+          trace = slowReads(t, log)
+          pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+          const before = ui.notices.length
+          disposed = true
+          await host.runtime.dispose()
+          assert.equal(await pending, undefined)
+          assert.equal(ui.component, null)
+          await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close after shutdown')
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          assert.equal(ui.notices.length, before)
+          trace.restore()
+        } finally {
+          ui.stop()
+          if (!disposed) await host.runtime.dispose()
+        }
+        assert.deepEqual(host.errors, [])
+      })
+
+      test('RPC and JSON modes report the target and command, never open custom UI and write nothing to stdout', { timeout: 60000 }, async (t) => {
+        const { dir } = pkg()
+        const shared = path.join(temp, `text mode forum ${variant}`)
+        const { long } = await seedForum(shared)
+        const command = `PI_FORUM_DIR='${shared}' ${path.join(dir, 'bin', 'pi-forum')} topic list`
+        const expected = `Forum directory: ${shared} (supplied PI_FORUM_DIR). The forum browser needs the terminal UI; run: ${command}`
+        // Records what anyone writes to stdout as text; the test runner's own binary frames pass.
+        const captureStdout = async (fn) => {
+          const written = []
+          const write = process.stdout.write
+          process.stdout.write = function (chunk, ...rest) {
+            if (typeof chunk === 'string') return written.push(chunk) > 0
+            return write.call(this, chunk, ...rest)
+          }
+          try {
+            await fn()
+          } finally {
+            process.stdout.write = write
+          }
+          return written
+        }
+
+        const notices = []
+        const rpcUI = new Proxy(
+          { notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') },
+          { get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined) },
+        )
+        let host = await openHost(dir, { supplied: shared, uiContext: rpcUI, uiMode: 'rpc' })
+        try {
+          const written = await captureStdout(async () => {
+            await host.runtime.session.prompt('/forum topics')
+            await host.runtime.session.prompt(`/forum read ${long.id}`)
+          })
+          assert.deepEqual(written, [])
+          assert.deepEqual(notices[0], { type: 'info', message: expected })
+          assert.match(notices[1].message, new RegExp(`message get -- ${long.id}$`))
+        } finally {
+          await host.runtime.dispose()
+        }
+
+        const stderr = t.mock.method(console, 'error', () => {})
+        host = await openHost(dir, { supplied: shared, uiMode: 'json' })
+        try {
+          const written = await captureStdout(() => host.runtime.session.prompt('/forum topics'))
+          assert.deepEqual(written, [])
+          assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[expected]])
+        } finally {
+          await host.runtime.dispose()
+        }
+      })
     })
   }
+
+  // The real pi executable in a real terminal: tmux runs it in a pane and reports the visible
+  // screen. The synthetic provider is driven through files; nothing goes to the network.
+  describe('real pi in a terminal', async () => {
+    const skip = (await hasTmux()) ? false : 'tmux is not installed'
+    for (const variant of [0, 1]) {
+      for (const tuiMode of ['regular', 'fullscreen']) {
+        const label = `${['source checkout', 'packed tarball'][variant]}, ${tuiMode}`
+        test(`${label}: browsing works by keyboard while a run streams, and Esc closes only the browser`, { skip, timeout: 120000 }, async () => {
+          const { dir } = packages[variant]
+          const run = await fs.mkdtemp(path.join(temp, 'terminal-'))
+          const paths = Object.fromEntries(['home', 'agent', 'project', 'control', 'tmp'].map((name) => [name, path.join(run, name)]))
+          for (const target of Object.values(paths)) await fs.mkdir(target)
+          const forumDir = path.join(run, 'forum')
+          const { topic, long } = await seedForum(forumDir)
+          const env = {
+            PATH: BASE_PATH,
+            HOME: paths.home,
+            TMPDIR: paths.tmp,
+            TERM: 'xterm-256color',
+            PI_CODING_AGENT_DIR: paths.agent,
+            PI_OFFLINE: '1',
+            PI_TELEMETRY: '0',
+            PI_SKIP_VERSION_CHECK: '1',
+            PI_FORUM_DIR: forumDir,
+            PI_FORUM_SYNTHETIC_DIR: paths.control,
+          }
+          const args = [
+            path.join(PI_ROOT, piManifest.bin.pi),
+            ...['--no-session', '--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'],
+            ...['-e', probes.fileSynthetic, '-e', dir, '--model', 'forum-synthetic/held', '--tui-mode', tuiMode],
+          ]
+          const command = ['exec', 'env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), process.execPath, ...args]
+            .map(quote)
+            .join(' ')
+          const terminal = tmuxSession('pi-forum', path.join(run, 'tmux.sock'))
+          const log = async () =>
+            (await fs.readFile(path.join(paths.control, 'log.jsonl'), 'utf8').catch(() => ''))
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+          let delta = 0
+          const stream = (text) => fs.writeFile(path.join(paths.control, `delta-${++delta}`), text)
+          const shows = async (...texts) => {
+            const screen = (await terminal.screen()).replace(/\s+/g, ' ')
+            return texts.every((text) => screen.includes(text))
+          }
+          const waitFor = (...texts) => until(() => shows(...texts), texts.join(' and '), { detail: () => '(see the screen above)' }).catch(async (err) => {
+            err.message += `\n${await terminal.screen()}`
+            throw err
+          })
+          const gone = (text) => until(async () => !(await shows(text)), `${text} to go away`)
+          // A trailing space closes Pi's argument completion, so Enter submits rather than picks a
+          // completion; /forum trims its arguments.
+          const submit = async (text) => {
+            await terminal.text(`${text} `)
+            await waitFor(text)
+            await terminal.keys('Enter')
+          }
+          try {
+            await terminal.start(command, { cwd: paths.project })
+            await waitFor('held')
+            await submit('Plan the release.')
+            await until(async () => (await log()).some((entry) => entry.event === 'request'), 'the synthetic request')
+            // Deltas start on new lines so they show in the margin beside the overlay.
+            await stream('\nD1')
+            await waitFor('D1')
+
+            await submit('/forum topics')
+            await waitFor('Forum · Topics · page 1', 'Forum is on for agents', '› Release plan')
+            await stream('\nD2')
+            await waitFor('Forum · Topics · page 1', 'D2')
+            await terminal.keys('Enter')
+            await waitFor('Forum · Messages in "Release plan"', '› ralph')
+            await terminal.keys('Down', 'Enter')
+            // The reader's header, not the body's first line, which the list row shows too.
+            await waitFor('From sam', 'line 0000')
+            await terminal.keys('End')
+            await waitFor('LAST LINE ✓')
+            await terminal.keys('b')
+            await waitFor('› sam')
+            await terminal.keys('b')
+            await waitFor('› Release plan')
+            await terminal.keys('r')
+            await waitFor('Forum · Topics · page 1')
+            await terminal.keys('Escape')
+            await gone('Forum · Topics')
+            const closedAt = Date.now()
+
+            // The editor has focus again: typed text lands there, and is removed unsent.
+            await terminal.text('typed after closing')
+            await waitFor('typed after closing')
+            await terminal.keys(...Array(19).fill('BSpace'))
+            await gone('typed after closing')
+
+            await submit(`/forum messages ${topic.id}`)
+            await waitFor(`Forum · Messages in topic ${topic.id}`)
+            await stream('\nD3')
+            await waitFor(`Forum · Messages in topic ${topic.id}`, 'D3')
+            await terminal.keys('Escape')
+            await gone('Forum · Messages')
+            await submit(`/forum read ${long.id}`)
+            await waitFor(`Forum · Message ${long.id}`, 'From sam', 'line 0000')
+            await terminal.keys('End')
+            await waitFor('LAST LINE ✓')
+            await terminal.keys('Escape')
+            await gone(`Forum · Message ${long.id}`)
+
+            // Released, the run ends normally after the one request, never aborted.
+            await fs.writeFile(path.join(paths.control, 'finish'), '')
+            await until(async () => (await log()).some((entry) => entry.event === 'agent_end'), 'the run to end')
+            const entries = await log()
+            assert.deepEqual(entries.filter((entry) => entry.event === 'request').length, 1)
+            assert.deepEqual(entries.filter((entry) => entry.event === 'abort'), [])
+            const updates = entries.filter((entry) => entry.event === 'message_update').map((entry) => [entry.delta, entry.at])
+            assert.deepEqual(updates.map(([text]) => text), ['\nD1', '\nD2', '\nD3'])
+            assert.ok(updates[1][1] < closedAt, 'the second delta reached the agent while the browser was open')
+            await waitFor('D1', 'D2', 'D3')
+          } finally {
+            await terminal.kill()
+          }
+          // Browsing created nothing in the forum directory.
+          assert.deepEqual(await fs.readdir(forumDir), ['events.jsonl'])
+        })
+      }
+    }
+  })
 
   test('nothing was written outside the isolated temp directory', async () => {
     assert.deepEqual(await fs.readdir(path.join(temp, 'home')), [])

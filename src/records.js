@@ -11,6 +11,10 @@ export class ForumError extends Error {
   }
 }
 
+export function throwIfAborted(signal) {
+  if (signal?.aborted) throw new ForumError('ABORTED', 'the operation was aborted', { cause: signal.reason })
+}
+
 function invalid(message) {
   return new ForumError('INVALID_INPUT', message)
 }
@@ -81,7 +85,7 @@ export function newMessage({ topicId, author, body, originSessionId, replyTo }) 
   })
 }
 
-// Field name -> required. Events are flattened: { type, ...fields }.
+// Field name -> required. Events are { type, data } with data holding the canonical record.
 const EVENT_FIELDS = {
   topic_created: { id: true, title: true, created_by: true, created_at: true, origin_session_id: false },
   message_posted: {
@@ -95,13 +99,9 @@ const EVENT_FIELDS = {
   },
 }
 
-export function encodeEvent(type, data) {
-  return `${JSON.stringify({ type, ...data })}\n`
-}
-
-// Parses one complete log line into { type, data }; throws with a reason if it is malformed or unknown.
-export function parseEvent(line) {
-  const event = JSON.parse(line)
+// Builds the canonical { type, data } from a flattened { type, ...fields } value; throws with a
+// reason if it is malformed or of an unknown type.
+export function canonicalEvent(event) {
   if (event === null || typeof event !== 'object' || Array.isArray(event)) {
     throw new Error('record is not a JSON object')
   }

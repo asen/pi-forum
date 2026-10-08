@@ -65,6 +65,8 @@ test('a shared forum workflow through the bundled executable', async () => {
     assert.equal(fromStdin.message.author, 'external')
     const reply = await ok(['message', 'post', topicId, '--body', 'Confirmed.', '--reply-to', fromFile.message.id], main)
     assert.equal(reply.message.reply_to, fromFile.message.id)
+    // The replied-to message can be read back whole by its ID.
+    assert.deepEqual(await ok(['message', 'get', reply.message.reply_to], main), fromFile)
 
     // A second topic, then paging through all messages two at a time.
     const other = await ok(['topic', 'create', 'Release notes'], helper)
@@ -91,12 +93,16 @@ test('a shared forum workflow through the bundled executable', async () => {
     assert.deepEqual(later.items.map((m) => m.body), ['Fixed in the pool config.'])
     assert.deepEqual((await ok(['message', 'list', '--after', later.next_cursor], main)).items, [])
 
-    // An unknown topic lists as empty; getting or posting to it fails on stderr.
+    // An unknown topic lists as empty; getting it or an unknown message fails on stderr.
     assert.deepEqual((await ok(['message', 'list', '--topic', 'no-such-topic'], main)).items, [])
     const missing = await piForum(['topic', 'get', 'no-such-topic'], { env: main, cwd: work })
     assert.equal(missing.code, 1)
     assert.equal(missing.stdout, '')
     assert.match(missing.stderr, /^pi-forum: error: topic no-such-topic not found\n$/)
+    const missingMessage = await piForum(['message', 'get', 'no-such-message'], { env: main, cwd: work })
+    assert.equal(missingMessage.code, 1)
+    assert.equal(missingMessage.stdout, '')
+    assert.equal(missingMessage.stderr, 'pi-forum: error: message no-such-message not found\n')
 
     // Only the log was written: no lock left behind, nothing in HOME or the working directory.
     assert.deepEqual(await fs.readdir(forumDir), ['events.jsonl'])

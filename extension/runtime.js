@@ -1,9 +1,11 @@
 import path from 'node:path'
+import { createForum as sharedCreateForum } from '../src/forum.js'
+import { createBrowser } from './browser-state.js'
 
 export const SECTION_NAME = 'forum'
 export const COMMAND_NAME = 'forum'
-export const USAGE = 'Usage: /forum [on|off|status]'
-const ACTIONS = ['on', 'off', 'status']
+export const USAGE = 'Usage: /forum [on|off|status] | /forum topics | /forum messages [TOPIC_ID] | /forum read MESSAGE_ID'
+const ACTIONS = ['on', 'off', 'status', 'topics', 'messages', 'read']
 
 // Session-scoped forum binding for one Pi extension runtime. Pi tears down the old runtime
 // (session_shutdown) before the next one starts (session_start) on /new, resume, fork, clone and
@@ -13,13 +15,33 @@ const ACTIONS = ['on', 'off', 'status']
 // /forum toggles the binding in memory only: new runtimes start off unless PI_FORUM_DIR is supplied.
 // "unavailable" means the binding could not be selected, or the environment no longer carries it;
 // only /forum on retries.
-export function createForumRuntime({ binDir, getAgentDir, env = process.env, report = defaultReport }) {
+//
+// /forum topics, messages and read browse the last successfully selected directory, whatever the
+// status: browsing never selects, activates or changes the environment. It reads through one lazily
+// created client per selection, so the forum it first resolves to stays pinned; a successful /forum on
+// or shutdown discards it, off keeps it. Only the terminal UI (ctx.mode "tui") opens openBrowser;
+// other modes get the target and the equivalent pi-forum command as feedback.
+//
+// At most one browser is open per runtime. openBrowser receives its controller (browser-state.js)
+// and resolves once it is closed; discarding the selection closes it, off leaves it open.
+export function createForumRuntime({
+  binDir,
+  getAgentDir,
+  env = process.env,
+  report = defaultReport,
+  createForum = sharedCreateForum,
+  openBrowser = textBrowser,
+}) {
   let status = 'off'
   let reason = null
   // What this runtime exposed and owns; kept while unavailable so off, on and shutdown can undo it.
   let active = null
-  // The last successfully selected directory, for status only; never reused for activation.
+  // The last successfully selected directory, for status and browsing; never reused for activation.
   let selected = null
+  // The selection's read client, created on first browse: { forum, controller }.
+  let reader = null
+  // The open browser's controller, if any.
+  let browser = null
 
   function sessionStart(ctx) {
     sessionShutdown()
@@ -48,14 +70,18 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
     status = 'off'
     reason = null
     selected = null
+    discardReader()
   }
 
+  // Control actions report synchronously; browsing returns a promise that settles when it ends.
   function command(args, ctx) {
-    const action = args.trim() || 'status'
-    if (!ACTIONS.includes(action)) {
+    const request = parseCommand(args)
+    if (!request) {
       report(USAGE, ctx, 'warning')
       return
     }
+    if (request.view) return browse(request.view, ctx)
+    const { action } = request
     if (action === 'on') {
       if (checkHealth()) {
         report(`Forum is already on: ${describe(active)}`, ctx, 'info')
@@ -87,6 +113,7 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
     if (binding.generated) env.PI_FORUM_DIR = binding.forumDir
     active = { ...binding, pathChange }
     selected = { forumDir: binding.forumDir, generated: binding.generated }
+    discardReader()
     status = 'on'
     reason = null
     return true
@@ -126,6 +153,58 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
     return selected ? ` Last selected directory (inactive): ${describe(selected)}` : ''
   }
 
+  // Ends the selection's read client; its signal closes an open browser.
+  function discardReader() {
+    reader?.controller.abort()
+    reader = null
+    browser = null
+  }
+
+  async function browse(view, ctx) {
+    checkHealth()
+    if (!selected) {
+      const why = status === 'unavailable' ? ` The forum is unavailable: ${reason}.` : ''
+      report(`No forum is selected in this session.${why} Run /forum on to select one, then browse it.`, ctx, 'warning')
+      return
+    }
+    const target = {
+      forumDir: selected.forumDir,
+      generated: selected.generated,
+      resolved: reader?.forum.resolved,
+      status,
+      warning: status === 'unavailable' ? reason : null,
+    }
+    if (ctx.mode !== 'tui') {
+      const text = `${describeTarget(target)} The forum browser needs the terminal UI; run: ${cliCommand(binDir, target, view)}`
+      report(text, ctx, target.warning ? 'warning' : 'info')
+      return
+    }
+    if (browser) {
+      report('The forum browser is already open; close it with Esc before opening another view.', ctx, 'warning')
+      return
+    }
+    if (target.warning) report(describeTarget(target), ctx, 'warning')
+    reader ??= {
+      forum: createForum({ forumDir: selected.forumDir, createOnRead: false }),
+      controller: new AbortController(),
+    }
+    const { forum, controller } = reader
+    const opened = createBrowser({ forum, target, view, signal: controller.signal })
+    browser = opened
+    // Nothing is reported for a browser that has closed, so a discarded one stays silent.
+    const scoped = (message, type = 'info') => {
+      if (!opened.closed) report(message, ctx, type)
+    }
+    try {
+      await openBrowser({ browser: opened, forum, target, view, ctx, signal: controller.signal, report: scoped })
+    } catch (err) {
+      scoped(`Could not browse ${target.forumDir}: ${err?.message ?? err}`, 'error')
+    } finally {
+      opened.close()
+      if (browser === opened) browser = null
+    }
+  }
+
   return {
     get binding() {
       return status === 'on' ? { forumDir: active.forumDir, generated: active.generated } : null
@@ -140,6 +219,17 @@ export function createForumRuntime({ binDir, getAgentDir, env = process.env, rep
   }
 }
 
+// Parses /forum arguments: { action } for on, off and status (the default), { view } for browsing,
+// or null for anything else. Words are exact and lowercase; IDs are single words.
+function parseCommand(args) {
+  const [word = 'status', ...rest] = args.trim().split(/\s+/).filter(Boolean)
+  if (['on', 'off', 'status'].includes(word)) return rest.length === 0 ? { action: word } : null
+  if (word === 'topics' && rest.length === 0) return { view: { kind: 'topics' } }
+  if (word === 'messages' && rest.length <= 1) return { view: { kind: 'messages', topicId: rest[0] } }
+  if (word === 'read' && rest.length === 1) return { view: { kind: 'read', messageId: rest[0] } }
+  return null
+}
+
 // Argument completions for /forum: the actions starting with the typed prefix.
 export function forumCompletions(prefix) {
   return ACTIONS.filter((action) => action.startsWith(prefix)).map((action) => ({ value: action, label: action }))
@@ -147,6 +237,63 @@ export function forumCompletions(prefix) {
 
 function describe({ forumDir, generated }) {
   return `${forumDir} (${generated ? 'session default' : 'supplied PI_FORUM_DIR'})`
+}
+
+// The browsed target: the requested directory, where it resolved once known, and its status.
+export function describeTarget({ forumDir, generated, resolved, status, warning }) {
+  const where = `Forum directory: ${describe({ forumDir, generated })}${resolved ? `, resolved to ${resolved}` : ''}.`
+  if (warning) return `Warning: the forum is unavailable (${warning}); browsing the last selected directory. ${where}`
+  if (status === 'off') return `${where} The forum is off; browsing does not turn it on.`
+  return where
+}
+
+// The pi-forum command that reads the same view, quoted for a POSIX shell. It runs the bundled
+// executable by path, since PATH carries it only while the forum is on.
+export function cliCommand(binDir, { forumDir }, view) {
+  const args =
+    view.kind === 'topics'
+      ? ['topic', 'list']
+      : view.kind === 'messages'
+        ? ['message', 'list', ...(view.topicId === undefined ? [] : [`--topic=${view.topicId}`])]
+        : ['message', 'get', '--', view.messageId]
+  return [`PI_FORUM_DIR=${shellQuote(forumDir)}`, ...[path.join(binDir, 'pi-forum'), ...args].map(shellQuote)].join(' ')
+}
+
+function shellQuote(word) {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`
+}
+
+// Replaces terminal control characters in forum text, which is peer data, before it is shown.
+const printable = (text) => text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '\ufffd')
+
+// The default opener for hosts without the terminal browser (Pi gets browser.js): loads the
+// requested view through the controller and reports it as text.
+export async function textBrowser({ browser, report }) {
+  await browser.start()
+  const { status, error, warnings, page, message, target } = browser.state
+  if (status === 'error') {
+    report(`Could not browse ${target.forumDir}: ${error.message}`, 'error')
+    return
+  }
+  const lines = []
+  if (message) {
+    const reply = message.reply_to ? `, replying to ${message.reply_to}` : ''
+    lines.push(`Message ${message.id} in topic ${message.topic_id} by ${message.author} at ${message.created_at}${reply}:`)
+    lines.push(message.body)
+  } else if (browser.state.view.kind === 'topics') {
+    lines.push(page.items.length ? `First ${page.items.length} topic(s):` : 'No topics yet.')
+    for (const topic of page.items) lines.push(`${topic.id}  ${topic.title}  (${topic.created_by}, ${topic.created_at})`)
+  } else {
+    lines.push(page.items.length ? `First ${page.items.length} message(s):` : 'No messages yet.')
+    for (const item of page.items) {
+      const first = [...item.body.split('\n')[0]]
+      const line = first.length > 80 ? `${first.slice(0, 79).join('')}…` : first.join('')
+      lines.push(`${item.id}  ${item.author}, ${item.created_at}: ${line}`)
+    }
+  }
+  const skipped = warnings.items.length + warnings.omitted
+  if (skipped) lines.push(`(${skipped} damaged record(s) skipped)`)
+  report(printable(lines.join('\n')))
 }
 
 function bindingDrift(env, binDir, forumDir) {

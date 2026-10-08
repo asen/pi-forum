@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
+import { createForum } from './forum.js'
 import { MAX_BODY_BYTES, MAX_LABEL_CHARS } from './records.js'
-import { createTopic, getTopic, listMessages, listTopics, postMessage } from './storage.js'
 
 const HELP = `Usage:
   pi-forum topic create TITLE [BODY] [--author LABEL]
@@ -10,6 +10,7 @@ const HELP = `Usage:
   pi-forum topic get TOPIC_ID
   pi-forum message post TOPIC_ID BODY [--reply-to MESSAGE_ID] [--author LABEL]
   pi-forum message list [--topic TOPIC_ID] [--after CURSOR] [--limit N]
+  pi-forum message get MESSAGE_ID
 
 BODY is exactly one of:
   --body TEXT         inline text
@@ -38,6 +39,7 @@ Output:
     topic create    {"topic": Topic, "message": Message | null}
     topic get       {"topic": Topic}
     message post    {"message": Message}
+    message get     {"message": Message}
     topic list      {"items": [Topic, ...], "next_cursor": CURSOR}
     message list    {"items": [Message, ...], "next_cursor": CURSOR}
   Errors and warnings go to stderr; failures exit with status 1.
@@ -57,45 +59,52 @@ const BODY_OPTIONS = {
 }
 const LIST_OPTIONS = { after: { type: 'string' }, limit: { type: 'string' } }
 
-// Each command: option definitions, positional argument names, and a handler.
+// Each command: option definitions, positional argument names, and a handler that runs against
+// the invocation's bound forum client.
 const COMMANDS = {
   'topic create': {
     options: { ...BODY_OPTIONS, author: { type: 'string' } },
     args: ['TITLE'],
     body: 'optional',
-    async run(forumDir, { TITLE }, values, env) {
+    async run(forum, { TITLE }, values, env, onWarning) {
       const body = await readBody(values)
-      return createTopic(forumDir, { title: TITLE, body, ...attribution(values, env) })
+      return forum.createTopic({ title: TITLE, body, ...attribution(values, env) }, { onWarning })
     },
   },
   'topic list': {
     options: LIST_OPTIONS,
     args: [],
-    run: (forumDir, _, values, env, onWarning) =>
-      listTopics(forumDir, { after: values.after, limit: values.limit, onWarning }),
+    run: (forum, _, values, env, onWarning) => forum.listTopics({ after: values.after, limit: values.limit, onWarning }),
   },
   'topic get': {
     options: {},
     args: ['TOPIC_ID'],
-    run: async (forumDir, { TOPIC_ID }, values, env, onWarning) => ({
-      topic: await getTopic(forumDir, TOPIC_ID, { onWarning }),
+    run: async (forum, { TOPIC_ID }, values, env, onWarning) => ({
+      topic: await forum.getTopic(TOPIC_ID, { onWarning }),
     }),
   },
   'message post': {
     options: { ...BODY_OPTIONS, 'reply-to': { type: 'string' }, author: { type: 'string' } },
     args: ['TOPIC_ID'],
     body: 'required',
-    async run(forumDir, { TOPIC_ID }, values, env, onWarning) {
+    async run(forum, { TOPIC_ID }, values, env, onWarning) {
       const body = await readBody(values)
       const input = { topicId: TOPIC_ID, body, replyTo: values['reply-to'], ...attribution(values, env) }
-      return { message: await postMessage(forumDir, input, { onWarning }) }
+      return { message: await forum.postMessage(input, { onWarning }) }
     },
   },
   'message list': {
     options: { topic: { type: 'string' }, ...LIST_OPTIONS },
     args: [],
-    run: (forumDir, _, values, env, onWarning) =>
-      listMessages(forumDir, { topicId: values.topic, after: values.after, limit: values.limit, onWarning }),
+    run: (forum, _, values, env, onWarning) =>
+      forum.listMessages({ topicId: values.topic, after: values.after, limit: values.limit, onWarning }),
+  },
+  'message get': {
+    options: {},
+    args: ['MESSAGE_ID'],
+    run: async (forum, { MESSAGE_ID }, values, env, onWarning) => ({
+      message: await forum.getMessage(MESSAGE_ID, { onWarning }),
+    }),
   },
 }
 
@@ -208,20 +217,28 @@ function describeError(err) {
   return err.message
 }
 
-// Runs one CLI invocation and returns its exit status.
-export async function main(argv, env = process.env) {
-  const onWarning = (message) => process.stderr.write(`pi-forum: warning: ${message}\n`)
+// Runs one CLI invocation and returns its exit status. Commands run against one forum client bound
+// for the invocation by options.createForum, and output goes to options.stdout and options.stderr;
+// the defaults are the shared API and the process streams, and tests may inject others. Reads create
+// a missing forum directory, as they always have.
+export async function main(
+  argv,
+  env = process.env,
+  { createForum: bind = createForum, stdout = process.stdout, stderr = process.stderr } = {},
+) {
+  const onWarning = (message) => stderr.write(`pi-forum: warning: ${message}\n`)
   try {
     const { help, command, args, values } = parseCommand(argv)
     if (help) {
-      process.stdout.write(HELP)
+      stdout.write(HELP)
       return 0
     }
-    const result = await command.run(forumDirectory(env), args, values, env, onWarning)
-    process.stdout.write(`${JSON.stringify(result)}\n`)
+    const forum = bind({ forumDir: forumDirectory(env), createOnRead: true })
+    const result = await command.run(forum, args, values, env, onWarning)
+    stdout.write(`${JSON.stringify(result)}\n`)
     return 0
   } catch (err) {
-    process.stderr.write(`pi-forum: error: ${describeError(err)}\n`)
+    stderr.write(`pi-forum: error: ${describeError(err)}\n`)
     return 1
   }
 }

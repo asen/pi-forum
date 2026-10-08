@@ -8,6 +8,7 @@ import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { createForumRuntime, forumCompletions, SECTION_NAME, USAGE } from '../extension/runtime.js'
+import { createForum } from '../src/forum.js'
 
 const exec = promisify(execFile)
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
@@ -19,8 +20,8 @@ after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
 })
 
-function ctx(sessionId, ui) {
-  return { hasUI: Boolean(ui), ui, sessionManager: { getSessionId: () => sessionId } }
+function ctx(sessionId, ui, mode) {
+  return { hasUI: Boolean(ui), ui, mode, sessionManager: { getSessionId: () => sessionId } }
 }
 
 function defaultDir(sessionId, agentDir = AGENT_DIR) {
@@ -29,7 +30,7 @@ function defaultDir(sessionId, agentDir = AGENT_DIR) {
 
 // Mimics Pi: every session start gets a fresh extension runtime, and the previous runtime's
 // session_shutdown completes before it. Cancelled switches and tree navigation emit neither.
-function host({ env, agentDir = () => AGENT_DIR } = {}) {
+function host({ env, agentDir = () => AGENT_DIR, createForum, openBrowser } = {}) {
   const reports = []
   const types = []
   let runtime = null
@@ -47,7 +48,7 @@ function host({ env, agentDir = () => AGENT_DIR } = {}) {
     },
     start(id) {
       runtime?.sessionShutdown()
-      runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: agentDir, env, report })
+      runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: agentDir, env, report, createForum, openBrowser })
       sessionId = id
       runtime.sessionStart(ctx(id))
     },
@@ -60,6 +61,13 @@ function host({ env, agentDir = () => AGENT_DIR } = {}) {
       runtime.command(args, ctx(sessionId))
       assert.equal(reports.length, count + 1)
       return reports.at(-1)
+    },
+    // Runs a browsing /forum ARGS in the given mode; resolves to the [message, type] reports it made.
+    async browse(args, mode = 'tui') {
+      const count = reports.length
+      const ui = mode === 'tui' || mode === 'rpc' ? { notify: () => assert.fail('reports go through report') } : undefined
+      assert.equal(await runtime.command(args, ctx(sessionId, ui, mode)), undefined)
+      return reports.slice(count).map((message, i) => [message, types[count + i]])
     },
     prompt(sections = { cwd: '<cwd>\n/project\n</cwd>' }) {
       const event = { type: 'before_agent_start', prompt: 'hi', systemPromptOptions: { sections } }
@@ -415,10 +423,32 @@ describe('/forum parsing, completion and feedback', () => {
     })
   }
 
-  for (const args of ['ON', 'Off', 'Status', 'on off', 'on now', 'enable', 'statuses', '-h', '--help']) {
+  for (const args of [
+    'ON',
+    'Off',
+    'Status',
+    'on off',
+    'on now',
+    'enable',
+    'statuses',
+    '-h',
+    '--help',
+    'Topics',
+    'topics all',
+    'messages a b',
+    'read',
+    'read a b',
+    'READ m',
+    'topic',
+    'message m',
+  ]) {
     test(`${JSON.stringify(args)} shows the usage and changes nothing`, () => {
       for (const supplied of [undefined, '/shared/forum', 'relative']) {
-        const h = host({ env: supplied === undefined ? { PATH: BASE_PATH } : { PATH: BASE_PATH, PI_FORUM_DIR: supplied } })
+        const h = host({
+          env: supplied === undefined ? { PATH: BASE_PATH } : { PATH: BASE_PATH, PI_FORUM_DIR: supplied },
+          createForum: () => assert.fail('usage errors bind no forum client'),
+          openBrowser: () => assert.fail('usage errors open no browser'),
+        })
         h.start('s-1')
         const before = snapshot(h)
         assert.equal(h.forum(args), USAGE)
@@ -438,12 +468,17 @@ describe('/forum parsing, completion and feedback', () => {
 
   test('completions are the actions starting with the typed prefix', () => {
     const items = (...values) => values.map((value) => ({ value, label: value }))
-    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status'))
+    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'topics', 'messages', 'read'))
     assert.deepEqual(forumCompletions('o'), items('on', 'off'))
     assert.deepEqual(forumCompletions('of'), items('off'))
     assert.deepEqual(forumCompletions('st'), items('status'))
     assert.deepEqual(forumCompletions('status'), items('status'))
-    for (const prefix of ['x', 'O', 'on ', ' o', 'offx']) assert.deepEqual(forumCompletions(prefix), [])
+    assert.deepEqual(forumCompletions('t'), items('topics'))
+    assert.deepEqual(forumCompletions('m'), items('messages'))
+    assert.deepEqual(forumCompletions('re'), items('read'))
+    for (const prefix of ['x', 'O', 'on ', ' o', 'offx', 'messages ', 'read x', 'T']) {
+      assert.deepEqual(forumCompletions(prefix), [])
+    }
   })
 
   test('feedback uses ui.notify when the mode has a UI and stderr otherwise', (t) => {
@@ -761,13 +796,471 @@ describe('/forum across the session lifecycle', () => {
   })
 })
 
+describe('/forum browsing', () => {
+  const VIEWS = ['topics', 'messages', 'messages t-1', 'read m-1']
+
+  async function tempDir() {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-browse-test-')))
+    roots.push(root)
+    return root
+  }
+
+  // A forum directory holding one topic with an initial message.
+  async function seededForum(dir) {
+    const { topic, message } = await createForum({ forumDir: dir }).createTopic({ title: 'Seeded', author: 'a', body: 'hello' })
+    return { topic, message }
+  }
+
+  // The shared API, recording each client it binds.
+  function recordingFactory() {
+    const clients = []
+    const factory = (config) => {
+      const forum = createForum(config)
+      clients.push({ config, forum })
+      return forum
+    }
+    return { clients, factory }
+  }
+
+  // An opener that records each request and reads the requested view through its client.
+  function recordingOpener() {
+    const requests = []
+    const open = async (request) => {
+      requests.push(request)
+      const { forum, view } = request
+      if (view.kind === 'topics') request.result = await forum.listTopics()
+      else if (view.kind === 'messages') request.result = await forum.listMessages({ topicId: view.topicId })
+      else request.result = await forum.getMessage(view.messageId)
+    }
+    return { requests, open }
+  }
+
+  test('without a selection, browsing explains /forum on and reads, derives and changes nothing', async () => {
+    for (const supplied of [undefined, 'relative']) {
+      const h = host({
+        env: supplied === undefined ? { PATH: BASE_PATH } : { PATH: BASE_PATH, PI_FORUM_DIR: supplied },
+        agentDir: () => assert.fail('browsing must not derive a default directory'),
+        createForum: () => assert.fail('browsing without a selection binds no client'),
+        openBrowser: () => assert.fail('browsing without a selection opens nothing'),
+      })
+      h.start('s-1')
+      const before = snapshot(h)
+      const why = supplied === undefined ? '' : ' The forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative".'
+      for (const args of VIEWS) {
+        for (const mode of ['tui', 'rpc', 'print', 'json']) {
+          assert.deepEqual(await h.browse(args, mode), [
+            [`No forum is selected in this session.${why} Run /forum on to select one, then browse it.`, 'warning'],
+          ])
+          assert.deepEqual(snapshot(h), before)
+        }
+      }
+    }
+  })
+
+  test('the terminal UI opens the selected forum whether it is on, off or unavailable', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'shared')
+    const { topic, message } = await seededForum(forumDir)
+    const recorded = recordingFactory()
+    const opener = recordingOpener()
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir }, createForum: recorded.factory, openBrowser: opener.open })
+    h.start('s-1')
+    const supplied = `Forum directory: ${forumDir} (supplied PI_FORUM_DIR)`
+
+    // On: the browser gets the selection's client, target, view, context and lifetime signal.
+    let before = snapshot(h)
+    assert.deepEqual(await h.browse('topics'), [])
+    assert.deepEqual(snapshot(h), before)
+    const [first] = opener.requests
+    assert.deepEqual(first.view, { kind: 'topics' })
+    assert.deepEqual(first.target, { forumDir, generated: false, resolved: undefined, status: 'on', warning: null })
+    assert.equal(first.ctx.mode, 'tui')
+    assert.equal(first.signal.aborted, false)
+    assert.equal(typeof first.report, 'function')
+    assert.deepEqual(first.result.items, [topic])
+    assert.deepEqual(recorded.clients.map((client) => client.config), [{ forumDir, createOnRead: false }])
+    assert.equal(first.forum, recorded.clients[0].forum)
+
+    // Off: the same client and pinned forum; browsing leaves the forum off and the prompt without it.
+    h.forum('off')
+    before = snapshot(h)
+    assert.deepEqual(await h.browse('messages ' + topic.id), [])
+    assert.deepEqual(snapshot(h), before)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    const second = opener.requests[1]
+    assert.equal(second.forum, first.forum)
+    assert.deepEqual(second.view, { kind: 'messages', topicId: topic.id })
+    assert.deepEqual(second.target, { forumDir, generated: false, resolved: forumDir, status: 'off', warning: null })
+    assert.deepEqual(second.result.items, [message])
+
+    // Unavailable after drift: the last selected directory, with a visible warning; the new value is
+    // neither browsed nor adopted.
+    h.forum('on')
+    h.env.PI_FORUM_DIR = '/elsewhere/forum'
+    const reason = `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere/forum"`
+    assert.deepEqual(await h.browse('read ' + message.id), [
+      [`Warning: the forum is unavailable (${reason}); browsing the last selected directory. ${supplied}.`, 'warning'],
+    ])
+    assert.equal(h.runtime.state.status, 'unavailable')
+    assert.equal(h.runtime.binding, null)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
+    const third = opener.requests[2]
+    assert.deepEqual(third.target, { forumDir, generated: false, resolved: undefined, status: 'unavailable', warning: reason })
+    assert.deepEqual(third.result, message)
+    assert.deepEqual(recorded.clients.map((client) => client.config.forumDir), [forumDir, forumDir])
+  })
+
+  test('the selection client is reused until a successful reselection or shutdown', async () => {
+    const dir = await tempDir()
+    const a = path.join(dir, 'a')
+    const b = path.join(dir, 'b')
+    const link = path.join(dir, 'link')
+    await seededForum(a)
+    await createForum({ forumDir: b }).createTopic({ title: 'In B', author: 'b' })
+    await fs.symlink(a, link)
+    const recorded = recordingFactory()
+    const opener = recordingOpener()
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: link }, createForum: recorded.factory, openBrowser: opener.open })
+    h.start('s-1')
+
+    await h.browse('topics')
+    await h.browse('topics')
+    assert.equal(recorded.clients.length, 1)
+    assert.equal(opener.requests[1].target.resolved, a)
+    assert.deepEqual(opener.requests[1].result.items.map((t) => t.title), ['Seeded'])
+
+    // A retargeted link is refused by the pinned client, and is not followed silently.
+    await fs.rm(link)
+    await fs.symlink(b, link)
+    const [[refused, type]] = await h.browse('topics')
+    assert.equal(type, 'error')
+    assert.match(refused, new RegExp(`^Could not browse ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
+    assert.equal(recorded.clients.length, 1)
+
+    // Off keeps the client; a failed on keeps the selection and client too.
+    h.forum('off')
+    h.env.PI_FORUM_DIR = 'relative'
+    h.forum('on')
+    await h.browse('topics')
+    assert.equal(recorded.clients.length, 1)
+
+    // A successful on discards the client and its browser signal; the new client follows the link.
+    const signal = opener.requests[0].signal
+    h.env.PI_FORUM_DIR = link
+    h.forum('on')
+    assert.equal(signal.aborted, true)
+    await h.browse('topics')
+    assert.equal(recorded.clients.length, 2)
+    assert.deepEqual(opener.requests.at(-1).result.items.map((t) => t.title), ['In B'])
+
+    // Shutdown discards it as well, and the next runtime binds its own.
+    const last = opener.requests.at(-1).signal
+    h.start('s-2')
+    assert.equal(last.aborted, true)
+    await h.browse('topics')
+    assert.equal(recorded.clients.length, 3)
+  })
+
+  test('a missing directory is reported as an error and is not created', async () => {
+    const agentDir = await tempDir()
+    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => agentDir })
+    h.start('s-1')
+    h.forum('on')
+    const forumDir = defaultDir('s-1', agentDir)
+    for (const view of VIEWS) {
+      const [[message, type]] = await h.browse(view)
+      assert.equal(type, 'error')
+      assert.ok(message.startsWith(`Could not browse ${forumDir}: forum directory ${forumDir} is unavailable: ENOENT`), message)
+    }
+    h.forum('off')
+    const [[message]] = await h.browse('topics')
+    assert.match(message, /is unavailable: ENOENT/)
+    await assert.rejects(fs.stat(forumDir), { code: 'ENOENT' })
+    assert.deepEqual(await fs.readdir(agentDir), [])
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('opener failures are reported as errors without changing anything', async () => {
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      openBrowser: async () => {
+        throw new Error('browser failed')
+      },
+    })
+    h.start('s-1')
+    const before = snapshot(h)
+    assert.deepEqual(await h.browse('topics'), [['Could not browse /shared/forum: browser failed', 'error']])
+    assert.deepEqual(snapshot(h), before)
+  })
+
+  test('modes other than the terminal UI report the target and the equivalent command', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, "it's a forum")
+    const { topic, message } = await seededForum(forumDir)
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir },
+      createForum: () => assert.fail('text modes read nothing'),
+      openBrowser: () => assert.fail('only the terminal UI opens the browser'),
+    })
+    h.start('s-1')
+    const quoted = `'${forumDir.replaceAll("'", "'\\''")}'`
+    const bin = path.join(BIN_DIR, 'pi-forum')
+    const where = `Forum directory: ${forumDir} (supplied PI_FORUM_DIR).`
+    const expected = {
+      topics: `PI_FORUM_DIR=${quoted} ${bin} topic list`,
+      [`messages ${topic.id}`]: `PI_FORUM_DIR=${quoted} ${bin} message list --topic=${topic.id}`,
+      'messages -odd': `PI_FORUM_DIR=${quoted} ${bin} message list --topic=-odd`,
+      [`read ${message.id}`]: `PI_FORUM_DIR=${quoted} ${bin} message get -- ${message.id}`,
+    }
+    for (const mode of ['rpc', 'print', 'json']) {
+      for (const [args, command] of Object.entries(expected)) {
+        assert.deepEqual(await h.browse(args, mode), [
+          [`${where} The forum browser needs the terminal UI; run: ${command}`, 'info'],
+        ])
+      }
+    }
+    // The commands run as shown and read the same forum.
+    const run = async (command) => JSON.parse((await exec('/bin/sh', ['-c', command], { env: { PATH: NODE_DIR } })).stdout)
+    assert.deepEqual((await run(expected.topics)).items, [topic])
+    assert.deepEqual((await run(expected[`messages ${topic.id}`])).items, [message])
+    assert.deepEqual(await run(expected[`read ${message.id}`]), { message })
+
+    h.env.PI_FORUM_DIR = '/elsewhere'
+    const [[warned, type]] = await h.browse('topics', 'rpc')
+    assert.equal(type, 'warning')
+    assert.ok(warned.startsWith(`Warning: the forum is unavailable (PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere"); browsing the last selected directory. ${where}`))
+    assert.ok(warned.endsWith(`run: ${expected.topics}`))
+  })
+
+  test('text feedback goes to ui.notify in RPC and to stderr in print and JSON modes', async (t) => {
+    const stderr = t.mock.method(console, 'error', () => {})
+    const stdout = [t.mock.method(console, 'log', () => {}), t.mock.method(console, 'info', () => {})]
+    const notices = []
+    const ui = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('RPC has no custom UI') }
+    const runtime = createForumRuntime({
+      binDir: BIN_DIR,
+      getAgentDir: () => AGENT_DIR,
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      openBrowser: () => assert.fail('only the terminal UI opens the browser'),
+    })
+    runtime.sessionStart(ctx('s-1'))
+    const text = `Forum directory: /shared/forum (supplied PI_FORUM_DIR). The forum browser needs the terminal UI; run: PI_FORUM_DIR=/shared/forum ${path.join(BIN_DIR, 'pi-forum')} topic list`
+    await runtime.command('topics', { ...ctx('s-1', ui), mode: 'rpc' })
+    assert.deepEqual(notices, [[text, 'info']])
+    assert.equal(stderr.mock.callCount(), 0)
+    for (const mode of ['print', 'json']) await runtime.command('topics', ctx('s-1', undefined, mode))
+    assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[text], [text]])
+    for (const spy of stdout) assert.equal(spy.mock.callCount(), 0)
+    runtime.sessionShutdown()
+  })
+
+  test('the transitional terminal browser reports reads as text with control characters replaced', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'forum')
+    const forum = createForum({ forumDir })
+    const { topic, message } = await forum.createTopic({ title: 'Plan \u001b[31mred', author: 'a', body: 'first line\nsecond' })
+    const long = await forum.postMessage({ topicId: topic.id, author: 'b', body: `${'é'.repeat(100)}\nmore`, replyTo: message.id })
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
+    h.start('s-1')
+    assert.deepEqual(await h.browse('topics'), [
+      [`First 1 topic(s):\n${topic.id}  Plan �[31mred  (a, ${topic.created_at})`, 'info'],
+    ])
+    assert.deepEqual(await h.browse(`messages ${topic.id}`), [
+      [
+        `First 2 message(s):\n${message.id}  a, ${message.created_at}: first line\n` +
+          `${long.id}  b, ${long.created_at}: ${'é'.repeat(79)}…`,
+        'info',
+      ],
+    ])
+    assert.deepEqual(await h.browse(`read ${long.id}`), [
+      [`Message ${long.id} in topic ${topic.id} by b at ${long.created_at}, replying to ${message.id}:\n${long.body}`, 'info'],
+    ])
+    const [[missing, type]] = await h.browse('read nope')
+    assert.equal(type, 'error')
+    assert.equal(missing, `Could not browse ${forumDir}: message nope not found`)
+    assert.deepEqual(await h.browse('messages none'), [['No messages yet.', 'info']])
+  })
+})
+
+// Browsers here stay open until closed, so a lifecycle regression fails by timeout rather than hanging.
+describe('/forum browser lifecycle', { timeout: 10000 }, () => {
+  const tui = (ui = { notify: () => assert.fail('reports go through report') }) => ctx('s-1', ui, 'tui')
+  const settle = () => new Promise(setImmediate)
+
+  // A long-lived opener, like the terminal browser: starts loading and stays open until closed.
+  function longLived() {
+    const opened = []
+    const open = async (request) => {
+      opened.push(request)
+      request.browser.start()
+      await request.browser.done
+      // Anything an opener reports after its browser closed is dropped.
+      request.report('late report from a closed browser')
+    }
+    return { opened, open }
+  }
+
+  // A client whose reads stay pending until the test settles them.
+  function pendingClient() {
+    const calls = []
+    const read = (...args) => new Promise((resolve) => calls.push({ options: args.at(-1), resolve }))
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } }
+  }
+
+  test('one browser is open per runtime; Esc closes it and another may open', async () => {
+    const opener = longLived()
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => pendingClient().forum, openBrowser: opener.open })
+    h.start('s-1')
+    const before = snapshot(h)
+    const first = h.runtime.command('topics', tui())
+    await settle()
+    assert.equal(opener.opened.length, 1)
+    const { browser, view, target, signal } = opener.opened[0]
+    assert.deepEqual(view, { kind: 'topics' })
+    assert.deepEqual(browser.state.view, { kind: 'topics' })
+    assert.equal(browser.state.target.forumDir, target.forumDir)
+    assert.equal(signal.aborted, false)
+
+    assert.equal(await h.runtime.command('read m-1', tui()), undefined)
+    assert.deepEqual(h.reports, ['The forum browser is already open; close it with Esc before opening another view.'])
+    assert.deepEqual(h.types, ['warning'])
+    assert.equal(opener.opened.length, 1)
+    assert.deepEqual(snapshot(h), before)
+
+    browser.close()
+    assert.equal(await first, undefined)
+    assert.equal(h.reports.length, 1)
+    const second = h.runtime.command('messages', tui())
+    await settle()
+    assert.equal(opener.opened.length, 2)
+    assert.notEqual(opener.opened[1].browser, browser)
+    // The same selection keeps its client and lifetime signal.
+    assert.equal(opener.opened[1].forum, opener.opened[0].forum)
+    assert.equal(opener.opened[1].signal, signal)
+    opener.opened[1].browser.back()
+    await second
+    assert.equal(h.reports.length, 1)
+  })
+
+  test('off leaves the browser open; a failed on keeps it; a successful on closes it silently mid-load', async () => {
+    const opener = longLived()
+    const clients = []
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      createForum: () => {
+        clients.push(pendingClient())
+        return clients.at(-1).forum
+      },
+      openBrowser: opener.open,
+    })
+    h.start('s-1')
+    const pending = h.runtime.command('topics', tui())
+    await settle()
+    const { browser } = opener.opened[0]
+    const [load] = clients[0].calls
+
+    h.forum('off')
+    assert.equal(browser.closed, false)
+    h.env.PI_FORUM_DIR = 'relative'
+    h.forum('on')
+    assert.equal(browser.closed, false)
+    assert.equal(load.options.signal.aborted, false)
+    assert.equal(await h.runtime.command('topics', tui()), undefined)
+    assert.equal(h.reports.at(-1), 'The forum browser is already open; close it with Esc before opening another view.')
+
+    h.env.PI_FORUM_DIR = '/other/forum'
+    const reports = h.reports.length
+    h.forum('on')
+    assert.equal(browser.closeReason, 'discarded')
+    assert.equal(load.options.signal.aborted, true)
+    load.resolve({ items: [{ id: 'late' }], next_cursor: 'c' })
+    assert.equal(await pending, undefined)
+    await settle()
+    assert.deepEqual(h.reports.slice(reports), ['Forum is on: /other/forum (supplied PI_FORUM_DIR)'])
+    assert.deepEqual(browser.state.page.items, [])
+
+    // The new selection opens a new browser on a new client.
+    const next = h.runtime.command('topics', tui())
+    await settle()
+    assert.equal(clients.length, 2)
+    assert.equal(opener.opened[1].target.forumDir, '/other/forum')
+    opener.opened[1].browser.close()
+    await next
+  })
+
+  test('shutdown closes an open browser without late notifications, and cleanup is idempotent', async () => {
+    const opener = longLived()
+    const client = pendingClient()
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client.forum, openBrowser: opener.open })
+    h.start('s-1')
+    const pending = h.runtime.command('messages t-1', tui())
+    await settle()
+    const { browser } = opener.opened[0]
+    h.quit()
+    h.quit()
+    assert.equal(browser.closeReason, 'discarded')
+    client.calls[0].resolve({ items: [], next_cursor: 'c' })
+    assert.equal(await pending, undefined)
+    await settle()
+    assert.deepEqual(h.reports, [])
+    assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' })
+  })
+
+  test('opener failures are reported while open and dropped once the selection is discarded', async () => {
+    let fail
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      createForum: () => pendingClient().forum,
+      openBrowser: async ({ browser }) => {
+        await (fail === 'after discard' ? browser.done : undefined)
+        throw new Error('renderer failed')
+      },
+    })
+    h.start('s-1')
+    fail = 'now'
+    await h.runtime.command('topics', tui())
+    assert.deepEqual(h.reports, ['Could not browse /shared/forum: renderer failed'])
+    fail = 'after discard'
+    const pending = h.runtime.command('topics', tui())
+    await settle()
+    h.env.PI_FORUM_DIR = '/other/forum'
+    h.forum('on')
+    await pending
+    assert.deepEqual(h.reports.slice(1), ['Forum is on: /other/forum (supplied PI_FORUM_DIR)'])
+  })
+
+  test('an open browser leaves activation, environment and the prompt as they were', async () => {
+    const opener = longLived()
+    const h = host({ env: { PATH: BASE_PATH }, createForum: () => pendingClient().forum, openBrowser: opener.open })
+    h.start('s-1')
+    h.forum('on')
+    h.forum('off')
+    const before = snapshot(h)
+    const pending = h.runtime.command('topics', tui())
+    await settle()
+    assert.deepEqual(snapshot(h), before)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    h.forum('on')
+    assert.equal(opener.opened[0].browser.closeReason, 'discarded')
+    await pending
+    assert.ok(h.prompt()[SECTION_NAME])
+  })
+})
+
 describe('extension entry', () => {
-  // Stands in for the host package, which is not installed in this repository.
+  // Stand in for the host packages, which are not installed in this repository. The terminal
+  // helpers are never called here: the overlay itself is tested in browser-ui.test.js.
+  const HOST_MODULES = {
+    '@earendil-works/pi-coding-agent': 'export const getAgentDir = () => globalThis.piForumTestAgentDir',
+    '@earendil-works/pi-tui': ['matchesKey', 'truncateToWidth', 'visibleWidth', 'wrapTextWithAnsi']
+      .map((name) => `export const ${name} = () => { throw new Error('${name} is not stubbed') }`)
+      .join('\n'),
+  }
   registerHooks({
     resolve(specifier, context, nextResolve) {
-      if (specifier !== '@earendil-works/pi-coding-agent') return nextResolve(specifier, context)
-      const source = 'export const getAgentDir = () => globalThis.piForumTestAgentDir'
-      return { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true }
+      if (!Object.hasOwn(HOST_MODULES, specifier)) return nextResolve(specifier, context)
+      return { url: `data:text/javascript,${encodeURIComponent(HOST_MODULES[specifier])}`, shortCircuit: true }
     },
   })
 
@@ -828,6 +1321,26 @@ describe('extension entry', () => {
     assert.equal(process.env.PATH, withBin())
     assert.deepEqual(notices.map(([, type]) => type), ['info', 'info', 'info'])
     assert.match(notices[2][0], /^Forum is on: \/host\/agent\/forums\/sessions\/s-9 \(session default\)$/)
+
+    // Browsing is wired to the selected forum; RPC gets text and never the terminal browser.
+    const rpc = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
+    assert.equal(await forum.handler('topics', rpc), undefined)
+    const dir = defaultDir('s-9', '/host/agent')
+    assert.deepEqual(notices.at(-1), [
+      `Forum directory: ${dir} (session default). The forum browser needs the terminal UI; run: PI_FORUM_DIR=${dir} ${path.join(BIN_DIR, 'pi-forum')} topic list`,
+      'info',
+    ])
+    assert.equal(process.env.PI_FORUM_DIR, dir)
+
+    // The terminal UI opens one overlay; ending its interaction ends the command.
+    const shown = []
+    const custom = (factory, options) => {
+      shown.push(options)
+      return Promise.resolve(undefined)
+    }
+    const terminal = { ...ctx('s-9', { ...ui, custom }), mode: 'tui' }
+    assert.equal(await forum.handler('topics', terminal), undefined)
+    assert.deepEqual(shown, [{ overlay: true, overlayOptions: { anchor: 'center', width: '90%', maxHeight: '80%' } }])
 
     await handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, ctx('s-9'))
     assert.equal(process.env.PATH, BASE_PATH)

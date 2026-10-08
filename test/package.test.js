@@ -44,7 +44,14 @@ test('the tarball contains exactly the runtime files', async () => {
   const jsFiles = async (dir) =>
     (await fs.readdir(path.join(ROOT, dir))).filter((name) => name.endsWith('.js')).map((name) => `${dir}/${name}`)
   const docs = ['README.md', 'docs/architecture.md', 'LICENSE']
-  const expected = ['bin/pi-forum', 'package.json', ...docs, ...(await jsFiles('src')), ...(await jsFiles('extension'))].sort()
+  const expected = [
+    'bin/pi-forum',
+    'package.json',
+    ...docs,
+    ...(await jsFiles('src')),
+    ...(await jsFiles('src/backends')),
+    ...(await jsFiles('extension')),
+  ].sort()
   const files = await listFiles(pkg)
   assert.deepEqual(files, expected)
   for (const file of files) assert.doesNotMatch(file, /(^|\/)(\.idea|\.git|node_modules|test)(\/|$)|\.tgz$/)
@@ -59,8 +66,9 @@ test('the tarball contains exactly the runtime files', async () => {
   assert.deepEqual(manifest.engines, { node: '>=22.19' })
   assert.equal(manifest.dependencies, undefined)
   assert.deepEqual(manifest.pi, { extensions: ['./extension/index.js'] })
-  assert.deepEqual(manifest.peerDependencies, { '@earendil-works/pi-coding-agent': '*' })
+  assert.deepEqual(manifest.peerDependencies, { '@earendil-works/pi-coding-agent': '*', '@earendil-works/pi-tui': '*' })
   assert.ok(files.includes('extension/index.js'))
+  assert.ok(files.includes('src/backends/jsonl.js'))
 })
 
 test('the packaged executable has mode 0755 and a node shebang', async () => {
