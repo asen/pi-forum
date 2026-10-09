@@ -67,7 +67,8 @@ test('the tarball contains exactly the runtime files', async () => {
   assert.equal(manifest.dependencies, undefined)
   assert.deepEqual(manifest.pi, { extensions: ['./extension/index.js'] })
   assert.deepEqual(manifest.peerDependencies, { '@earendil-works/pi-coding-agent': '*', '@earendil-works/pi-tui': '*' })
-  for (const file of ['extension/index.js', 'extension/runtime.js', 'extension/output.js', 'extension/entry-renderer.js', 'src/backends/jsonl.js']) {
+  const runtime = ['extension/index.js', 'extension/runtime.js', 'extension/preferences.js', 'extension/output.js', 'extension/entry-renderer.js']
+  for (const file of [...runtime, 'src/backends/jsonl.js']) {
     assert.ok(files.includes(file), file)
   }
 })
@@ -92,6 +93,23 @@ test('the packaged text output and session entry renderer load from the tarball'
   }
   const drawn = createEntryRenderer({ Text })({ type: 'custom', customType: ENTRY_TYPE, data: entryData('a\x1b[31mb\nc') }, { expanded: false }, {})
   assert.deepEqual({ ...drawn }, { shown: 'a␛[31mb\nc', paddingX: 1, paddingY: 0 })
+})
+
+// The saved-defaults store imports only Node built-ins, so the packaged copy runs here too.
+test('the packaged preference store saves and resets defaults from the tarball', async () => {
+  const { createPreferenceStore, PREFERENCES_FILE } = await import(pathToFileURL(path.join(pkg, 'extension', 'preferences.js')).href)
+  const agentDir = path.join(temp, 'prefs-agent')
+  const cwd = path.join(temp, 'prefs-project')
+  const store = createPreferenceStore({ getAgentDir: () => agentDir })
+  const ctx = { cwd, isProjectTrusted: () => true }
+  assert.equal(PREFERENCES_FILE, 'forum.json')
+  assert.deepEqual(store.set('user', true, ctx), { ok: true, scope: 'user', path: path.join(agentDir, 'forum.json'), enabled: true, changed: true })
+  assert.deepEqual(store.set('project', false, ctx), { ok: true, scope: 'project', path: path.join(cwd, '.pi', 'forum.json'), enabled: false, changed: true })
+  assert.deepEqual([store.load(ctx).enabled, store.load(ctx).source], [false, 'project'])
+  assert.equal(store.reset('project', ctx).changed, true)
+  assert.equal(await fs.readFile(path.join(cwd, '.pi', 'forum.json'), 'utf8'), '{}\n')
+  assert.deepEqual([store.load(ctx).enabled, store.load(ctx).source], [true, 'user'])
+  assert.equal(store.load({ cwd, isProjectTrusted: () => false }).project.ignored.code, 'untrusted')
 })
 
 test('the packaged executable has mode 0755 and a node shebang', async () => {

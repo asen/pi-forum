@@ -3,21 +3,41 @@ import path from 'node:path'
 import { createForum as sharedCreateForum } from '../src/forum.js'
 import { createBrowser } from './browser-state.js'
 import { formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.js'
+import { createPreferenceStore } from './preferences.js'
 
 export const SECTION_NAME = 'forum'
 export const COMMAND_NAME = 'forum'
 export const USAGE =
-  'Usage: /forum [on|off|status] | /forum topics [--after CURSOR] | /forum messages [TOPIC_ID] [--after CURSOR] | ' +
-  '/forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
-const ACTIONS = ['on', 'off', 'status', 'topics', 'messages', 'read', 'ui']
+  'Usage: /forum [on|off|status] | /forum on|off|reset project|user | /forum topics [--after CURSOR] | ' +
+  '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
+const ACTIONS = ['on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'ui']
 const UI_VIEWS = ['topics', 'messages', 'read']
+const SCOPES = ['project', 'user']
+// The words completed after an action and a space.
+const NESTED = new Map([
+  ['on', SCOPES],
+  ['off', SCOPES],
+  ['reset', SCOPES],
+  ['ui', UI_VIEWS],
+])
 
 // Session-scoped forum binding for one Pi extension runtime. Pi tears down the old runtime
 // (session_shutdown) before the next one starts (session_start) on /new, resume, fork, clone and
 // /reload, so restoring what this runtime assigned lets the next one tell a launch-supplied
 // PI_FORUM_DIR from a generated one. Tree navigation keeps the runtime and its binding.
 //
-// /forum toggles the binding in memory only: new runtimes start off unless PI_FORUM_DIR is supplied.
+// Each runtime starts from its default, by precedence: a supplied PI_FORUM_DIR (inherited or set at
+// launch, never the one this runtime generated) turns it on, then the saved project and user defaults
+// (preferences.js), then off. The saved defaults are read once at session start and again after each
+// successful /forum on|off|reset project|user; status reports what was last read. Saving only
+// records whether to activate: the directory is still the session default unless PI_FORUM_DIR is
+// supplied.
+//
+// Bare /forum on and off override the default in memory until the runtime ends. A successful scoped
+// command drops that override and applies the default again: off releases as /forum off does; on
+// activates a binding that is off, keeps a healthy one as it is, and leaves an unavailable one for
+// /forum on. A failed one changes nothing in the runtime.
+//
 // "unavailable" means the binding could not be selected, or the environment no longer carries it;
 // only /forum on retries.
 //
@@ -46,9 +66,13 @@ export function createForumRuntime({
   openBrowser = noBrowser,
   onText = () => {},
   visibleWidth,
+  preferences = createPreferenceStore({ getAgentDir }),
 }) {
   let status = 'off'
   let reason = null
+  // The saved defaults as last loaded, and the bare /forum on or off (true or false) overriding them.
+  let saved = null
+  let override = null
   // What this runtime exposed and owns; kept while unavailable so off, on and shutdown can undo it.
   let active = null
   // The last successfully selected directory, for status and browsing; never reused for activation.
@@ -62,7 +86,9 @@ export function createForumRuntime({
 
   function sessionStart(ctx) {
     sessionShutdown()
-    if (env.PI_FORUM_DIR === undefined) return
+    saved = preferences.load(ctx)
+    for (const problem of loadProblems()) report(printable(`pi-forum: ${problem}`), ctx, 'warning')
+    if (!effectiveDefault().enabled) return
     if (!enable(ctx)) {
       report(`pi-forum: ${reason}; the forum is disabled and the environment is unchanged. Fix it and run /forum on to retry.`, ctx)
     }
@@ -87,6 +113,8 @@ export function createForumRuntime({
     status = 'off'
     reason = null
     selected = null
+    saved = null
+    override = null
     discardReader()
   }
 
@@ -99,24 +127,107 @@ export function createForumRuntime({
     }
     if (request.text) return readText(request.text, ctx)
     if (request.ui) return browse(request.ui, ctx)
-    const { action } = request
-    if (action === 'on') {
+    const { action, scope } = request
+    if (scope) {
+      saveDefault(action, scope, ctx)
+    } else if (action === 'on') {
+      override = true
       if (checkHealth()) {
-        report(`Forum is already on: ${describe(active)}`, ctx, 'info')
+        report(`Forum is already on: ${describe(active)}${temporaryNote()}`, ctx, 'info')
       } else if (enable(ctx)) {
-        report(`Forum is on: ${describe(active)}`, ctx, 'info')
+        report(`Forum is on: ${describe(active)}${temporaryNote()}`, ctx, 'info')
       } else {
-        report(statusText(), ctx, 'warning')
+        report(`${statusText()}${temporaryNote()}`, ctx, 'warning')
       }
     } else if (action === 'off') {
+      override = false
       const wasOff = status === 'off'
       disable()
-      report(wasOff ? `Forum is already off.${lastSelected()}` : statusText(), ctx, 'info')
+      report(`${wasOff ? `Forum is already off.${lastSelected()}` : statusText()}${temporaryNote()}`, ctx, 'info')
     } else {
       checkHealth()
-      report(statusText(), ctx, status === 'unavailable' ? 'warning' : 'info')
+      report([statusText(), ...defaultsText()].join('\n'), ctx, status === 'unavailable' ? 'warning' : 'info')
     }
   }
+
+  // Saves (on, off) or clears (reset) the scope's default, then applies the defaults reloaded from disk.
+  function saveDefault(action, scope, ctx) {
+    const result = action === 'reset' ? preferences.reset(scope, ctx) : preferences.set(scope, action === 'on', ctx)
+    if (!result.ok) {
+      const verb = action === 'reset' ? 'clear' : 'save'
+      report(printable(`Could not ${verb} the ${scope} default: ${result.error.message}. This session is unchanged.`), ctx, 'error')
+      return
+    }
+    const lines = [savedText(result)]
+    if (override !== null) lines.push(`The temporary /forum ${onOff(override)} for this session is dropped.`)
+    saved = preferences.load(ctx)
+    const problems = loadProblems()
+    lines.push(...problems.map((problem) => `Warning: ${problem}`))
+    override = null
+    if (!effectiveDefault().enabled) {
+      if (status !== 'off') disable()
+    } else if (status === 'off') {
+      enable(ctx)
+    } else {
+      checkHealth()
+    }
+    lines.push(statusText(), effectiveText())
+    report(lines.map(printable).join('\n'), ctx, status === 'unavailable' || problems.length > 0 ? 'warning' : 'info')
+  }
+
+  // The saved files the last load could not use, one message each; ignored scopes are not problems.
+  function loadProblems() {
+    return [saved.user, saved.project]
+      .filter(({ error }) => error)
+      .map(({ error }) => `${error.message}; this saved default is ignored. Run /forum status for details.`)
+  }
+
+  // A PI_FORUM_DIR this runtime did not generate.
+  function suppliedDir() {
+    const current = env.PI_FORUM_DIR
+    if (current === undefined || (active?.generated && current === active.forumDir)) return undefined
+    return current
+  }
+
+  // { enabled, source }: source is "env" for a supplied PI_FORUM_DIR, the saved scope, or null for off.
+  function effectiveDefault() {
+    if (suppliedDir() !== undefined) return { enabled: true, source: 'env' }
+    if (saved?.enabled !== undefined) return { enabled: saved.enabled, source: saved.source }
+    return { enabled: false, source: null }
+  }
+
+  function effectiveText() {
+    const { enabled, source } = effectiveDefault()
+    if (source === 'env') {
+      const over = saved?.enabled !== undefined ? `, which takes precedence over the saved ${saved.source} default (${onOff(saved.enabled)})` : ''
+      return `Effective default: on, because PI_FORUM_DIR is supplied${over}.`
+    }
+    if (source === 'project' && saved.user.enabled !== undefined) {
+      return `Effective default: ${onOff(enabled)}, from the project default, which takes precedence over the user default (${onOff(saved.user.enabled)}).`
+    }
+    if (source) return `Effective default: ${onOff(enabled)}, from the ${source} default.`
+    return 'Effective default: off (nothing saved applies).'
+  }
+
+  // The lines /forum status adds after the state: saved defaults, the effective one and any override.
+  function defaultsText() {
+    const lines = ['Saved defaults, as last read:']
+    if (!saved) lines.push('  not read yet')
+    else lines.push(`  user: ${scopeText(saved.user)}`, `  project: ${scopeText(saved.project)}`)
+    lines.push(effectiveText())
+    if (override !== null) {
+      lines.push(`Temporary override: ${onOff(override)} from /forum ${onOff(override)}, until this session is reloaded or replaced.`)
+    }
+    return lines.map(printable)
+  }
+
+  // After a bare on or off: when it differs from a saved default, says that the saved one comes back.
+  function temporaryNote() {
+    const { enabled, source } = effectiveDefault()
+    if ((source !== 'user' && source !== 'project') || override === enabled) return ''
+    return `\n${printable(`This lasts until the session is reloaded or replaced; the saved ${source} default (${onOff(enabled)}) applies then.`)}`
+  }
+
   // Selects from the current environment and session after releasing any previous exposure.
   function enable(ctx) {
     release()
@@ -304,6 +415,10 @@ export function createForumRuntime({
     get state() {
       return { status, reason, selected: selected && { ...selected } }
     },
+    // The default this runtime applies and the bare /forum on (true) or off (false) overriding it.
+    get defaults() {
+      return { ...effectiveDefault(), override }
+    },
     sessionStart,
     beforeAgentStart,
     sessionShutdown,
@@ -311,15 +426,20 @@ export function createForumRuntime({
   }
 }
 
-// Parses /forum arguments: { action } for on, off and status (the default), { text } for a text read,
-// { ui } for the browser, or null for anything else. Words are exact and lowercase; IDs are single
+// Parses /forum arguments: { action } for on, off and status (the default), { action, scope } for
+// on, off and reset with project or user, { text } for a text read, { ui } for the browser, or null
+// for anything else. Words are exact and lowercase; IDs are single
 // words. Before the first standalone "--", text lists take one --after CURSOR (or --after=CURSOR) and
 // any other word starting with "-" is an unknown flag; read takes no options. That "--" is dropped and
 // every word after it, another "--" included, is an ID. The browser views take their IDs as before
 // and no flags.
 function parseCommand(args) {
   const [word = 'status', ...rest] = args.trim().split(/\s+/).filter(Boolean)
-  if (['on', 'off', 'status'].includes(word)) return rest.length === 0 ? { action: word } : null
+  if (['on', 'off', 'status'].includes(word) && rest.length === 0) return { action: word }
+  if (['on', 'off', 'reset'].includes(word)) {
+    return rest.length === 1 && SCOPES.includes(rest[0]) ? { action: word, scope: rest[0] } : null
+  }
+  if (word === 'status') return null
   if (word === 'ui') {
     if (rest.length === 0) return { ui: { kind: 'topics' } }
     const [kind, ...ids] = rest
@@ -351,14 +471,30 @@ function parseView(kind, ids) {
   return null
 }
 
-// Argument completions for /forum: the actions, or after "ui " its views, starting with the typed prefix.
+// Argument completions for /forum: the actions, or after "on ", "off " or "reset " the scopes and
+// after "ui " the views, starting with the typed prefix.
 export function forumCompletions(prefix) {
-  const values = prefix.startsWith('ui ') ? UI_VIEWS.map((view) => `ui ${view}`) : ACTIONS
+  const space = prefix.indexOf(' ')
+  const action = prefix.slice(0, space)
+  const values = space === -1 ? ACTIONS : (NESTED.get(action) ?? []).map((word) => `${action} ${word}`)
   return values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }))
 }
 
 function describe({ forumDir, generated }) {
   return `${forumDir} (${generated ? 'session default' : 'supplied PI_FORUM_DIR'})`
+}
+
+const onOff = (enabled) => (enabled ? 'on' : 'off')
+
+function savedText({ scope, path: file, enabled, changed }) {
+  if (enabled === undefined) return changed ? `Cleared the ${scope} default (${file}).` : `The ${scope} default was not set (${file}).`
+  return changed ? `Saved the ${scope} default: ${onOff(enabled)} (${file}).` : `The ${scope} default was already ${onOff(enabled)} (${file}).`
+}
+
+function scopeText({ path: file, enabled, ignored, error }) {
+  if (error) return `unusable, ${error.message}`
+  if (ignored) return `ignored, ${ignored.message}`
+  return `${enabled === undefined ? 'not set' : onOff(enabled)} (${file})`
 }
 
 // The default opener for hosts without the terminal browser (Pi gets browser.js).

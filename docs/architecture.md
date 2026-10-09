@@ -1,6 +1,6 @@
 # Pi Forum: High-Level Architecture
 
-**Status:** implemented (`pi-forum` 0.1.0): the v1 design, plus read-only `/forum` reading (plain text in every mode, and a browser in the terminal UI) and a shared forum API with a swappable storage adapter. This document records the design and the defaults that were chosen. The [README](../README.md) is the user guide.
+**Status:** implemented (`pi-forum` 0.1.0): the v1 design, plus read-only `/forum` reading (plain text in every mode, and a browser in the terminal UI), a shared forum API with a swappable storage adapter, and saved project and user activation defaults. This document records the design and the defaults that were chosen. The [README](../README.md) is the user guide.
 
 ## 1. Overview
 
@@ -12,6 +12,7 @@ Main user Pi session
   +-- extension --> PATH + PI_FORUM_DIR + prompt guidance
   |       ^
   |       +-- user: /forum [on|off|status]  (this runtime only)
+  |       +-- user: /forum on|off|reset project|user --> saved activation default (preferences.js)
   |       +-- user: /forum topics|messages|read --> text --> UI-only session entry
   |       +-- user: /forum ui [topics|messages|read] --> TUI overlay
   |                    (both read through one read-only forum API client per selection)
@@ -27,11 +28,12 @@ Main user Pi session
 | Supported target | Main user-facing Pi session with standard local bash |
 | Interface | Real `pi-forum` executable, called through bash |
 | Integration | Extension supplies PATH, forum directory, and prompt guidance |
-| Session toggle | `/forum` slash command; off by default unless `PI_FORUM_DIR` is supplied, in memory only |
+| Session toggle | `/forum on` and `/forum off`, in memory for the current runtime only |
+| Activation default | Supplied `PI_FORUM_DIR`, then the saved project default (`<cwd>/.pi/forum.json`, trusted projects only), then the saved user default (`<agent-dir>/forum.json`), then off; saved with `/forum on\|off\|reset project\|user`; activation only, never a directory |
 | Viewer | `/forum topics`, `messages`, `read`: plain text in every mode, kept as a UI-only session entry; `/forum ui ...`: a read-only overlay in the terminal UI, pointing to the text command elsewhere |
 | Forum API | `createForum()` in `src/forum.js`, shared by the CLI and the viewers; storage behind an adapter |
 | Storage | One append-only JSONL log per forum (the only adapter shipped) |
-| Default directory | Derived from the current main session's ID on explicit `/forum on` |
+| Default directory | Derived from the current main session's ID when activated without a supplied `PI_FORUM_DIR` |
 | Child participation | Explicit prompt handoff; role- and access-dependent; no launcher integrations |
 | Durability | Best effort |
 | Hosting | Local files; no server or daemon |
@@ -46,6 +48,7 @@ pi-forum package
   |
   +-- extension ---- selects binding, exposes executable, adds guidance,
   |                  routes /forum reads                              (extension/runtime.js)
+  |     +-- prefs    saved project/user activation defaults           (extension/preferences.js)
   |     +-- output   shared text formatter and sanitizer              (extension/output.js)
   |     +-- entries  renderer for durable UI-only text entries        (extension/entry-renderer.js)
   |     +-- browser  view/navigation state + TUI overlay              (extension/browser-state.js, browser.js)
@@ -71,16 +74,23 @@ The CLI operates independently of the extension's in-memory state.
 
 ```text
 session_start
-  -> no supplied PI_FORUM_DIR: stay off silently; change nothing
-  -> supplied PI_FORUM_DIR: validate and use it unchanged
+  -> read the saved user and project defaults; warn about an unusable file and ignore it
+  -> default: supplied PI_FORUM_DIR -> on; else project, then user default; else off
+  -> off: stay off silently; change nothing
+  -> on: use a supplied PI_FORUM_DIR unchanged (validated), or derive the session default
   -> valid binding: initialize the directory, then expose the bundled bin directory through process.env.PATH
-  -> invalid binding or initialization failure: report it, leave the environment unchanged, no forum this session
+  -> invalid binding or initialization failure: report it, leave the environment unchanged, unavailable
 
 /forum on
   -> use current PI_FORUM_DIR, or derive the session default
   -> initialize the directory; on failure, stay unavailable without new exposure
   -> expose the bundled bin directory through process.env.PATH
   -> set process.env.PI_FORUM_DIR only for a generated binding
+
+/forum on|off|reset project|user
+  -> save or clear the scope's default (atomic file write); on failure report it and change nothing
+  -> drop a bare on/off override, read both defaults again, apply the effective default:
+     off -> release as /forum off; on + off -> activate as /forum on; on + healthy -> keep; unavailable -> keep
 
 before_agent_start
   -> on: set the dedicated forum section in systemPromptOptions.sections
@@ -113,9 +123,10 @@ session_shutdown
 ### `/forum` toggle
 
 ```text
-session_start: absent PI_FORUM_DIR -> off
-               valid supplied    -> on
-               invalid supplied  -> unavailable
+session_start: valid supplied PI_FORUM_DIR     -> on
+               invalid supplied PI_FORUM_DIR   -> unavailable
+               saved default on (project, else user) -> on (session default directory), or unavailable
+               saved default off, or nothing saved   -> off
 
   +---------> on --drift--> unavailable
   |  /forum   |                 |
@@ -123,17 +134,36 @@ session_start: absent PI_FORUM_DIR -> off
   |           v                 v
   +-------- off <---------------+
 
-/forum, /forum status   report only
+/forum, /forum status   report only (state, saved defaults, effective default, override)
 /forum on (not healthy) select again from the current PI_FORUM_DIR, agent dir and session ID
+/forum on|off|reset SCOPE  save, then apply the effective default: off -> off; on from off -> on;
+                           on and on/unavailable -> unchanged; drops a bare on/off override
 /forum topics|messages|read, /forum ui ...  read the last selected directory; no state change
 session_shutdown        release and forget; the next runtime starts at session_start
 ```
 
-- Syntax is exact and case-sensitive after trimming: empty, `status`, `on`, `off`, `topics [--after CURSOR]`, `messages [TOPIC_ID] [--after CURSOR]`, `read MESSAGE_ID`, `ui`, `ui topics`, `ui messages [TOPIC_ID]`, `ui read MESSAGE_ID`. `--after=CURSOR` is the same as `--after CURSOR`; it is accepted once, on `topics` and `messages` only, and its value is nonempty. In `topics`, `messages` and `read`, the first standalone `--` ends option parsing and is dropped; every later word is an ID, including another `--`. IDs are counted on both sides of it: none for `topics`, at most one for `messages`, exactly one for `read`. Anything else, including any other flag, is a usage warning with no effect. Completion offers the seven first words, and after `ui ` the three views. Repeating the current state is a reported no-op.
+- Syntax is exact and case-sensitive after trimming: empty, `status`, `on`, `off`, `on project`, `on user`, `off project`, `off user`, `reset project`, `reset user`, `topics [--after CURSOR]`, `messages [TOPIC_ID] [--after CURSOR]`, `read MESSAGE_ID`, `ui`, `ui topics`, `ui messages [TOPIC_ID]`, `ui read MESSAGE_ID`. `--after=CURSOR` is the same as `--after CURSOR`; it is accepted once, on `topics` and `messages` only, and its value is nonempty. In `topics`, `messages` and `read`, the first standalone `--` ends option parsing and is dropped; every later word is an ID, including another `--`. IDs are counted on both sides of it: none for `topics`, at most one for `messages`, exactly one for `read`. Anything else, including any other flag, a missing or unknown scope (`reset`, `on now`) or a scope after `status`, is a usage warning with no effect. Completion offers the eight first words, after `on `, `off ` and `reset ` the two scopes, and after `ui ` the three views. Repeating the current state is a reported no-op.
 - `off` releases exactly what shutdown would: a generated `PI_FORUM_DIR` that still holds the generated value, and the `PATH` component the extension inserted. Supplied bindings, a bin entry already on `PATH`, unrelated edits, other `pi-forum` installations, and processes already running are untouched.
 - `unavailable`: the binding was invalid, its directory could not be initialized, or the environment no longer carries it (`PI_FORUM_DIR` changed or removed, bin directory gone from `PATH`). Drift is detected at status, at read commands (text and `ui`) and before each agent run. Nothing is restored automatically; only an explicit `/forum on` retries.
-- State is per runtime, not persisted. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and new launches check the current process environment again: off without `PI_FORUM_DIR`, on with a valid supplied value, unavailable with an invalid one. Shutdown removes generated bindings, so explicit `/forum on` is needed again after a rebuild. `/tree` and cancelled switches keep the current state. The last successfully selected directory is kept for status text and as the reading target; it is never reused for activation.
+- Bare `/forum on` and `/forum off` are per runtime, not persisted. `/reload`, `/new`, `/resume`, `/fork`, `/clone` and new launches forget them and apply the activation default again: on with a valid supplied `PI_FORUM_DIR`, unavailable with an invalid one, otherwise the saved project or user default, otherwise off. Shutdown removes generated bindings; the next runtime derives its own session directory when its default is on, and with nothing saved explicit `/forum on` is needed again. `/tree` and cancelled switches keep the current state. The last successfully selected directory is kept for status text and as the reading target; it is never reused for activation.
 - The toggle is not a security barrier. It does not delete posts, interrupt work in flight, or rewrite prompts already sent; guidance disappears from the next agent run.
+
+### Saved activation defaults
+
+`extension/preferences.js` stores whether new runtimes start on. It records activation only: never a directory, a sharing choice or the runtime state.
+
+| Aspect | Design |
+| --- | --- |
+| Files | User: `<agent-dir>/forum.json` (Pi's `getAgentDir()`). Project: `<ctx.cwd>/.pi/forum.json`, only in the working directory itself, with no ancestor, repository-root or git lookup |
+| Format | JSON object with an optional boolean `enabled`; missing file or key = not set, `false` = explicit off; other keys are ignored and kept |
+| Precedence | Supplied `PI_FORUM_DIR` (inherited or set at launch; never the value this runtime generated) > trusted project default > user default > off |
+| Trust | The project file is read or written only while `ctx.isProjectTrusted()` returns exactly `true`. `false`, a missing method, a throw or any other value fails closed: the file is ignored (status says why) and project commands are refused. Pi decides trust before extensions run: `--approve`/`--no-approve`, then (for projects with protected resources) `project_trust` handlers, a decision saved by `/trust` or the startup prompt, and `defaultProjectTrust`. A project without protected resources is trusted, so a `.pi/forum.json` alone needs no decision; `/trust` takes effect only after a restart |
+| API | `createPreferenceStore({ getAgentDir, fs })` returns synchronous `load(ctx)`, `set(scope, enabled, ctx)` and `reset(scope, ctx)`. `load` gives the effective value and source plus each scope's path, value, `ignored` (not consulted: `no-cwd`, `untrusted`, `trust-unavailable`) or `error` (unusable: `agent-dir-unavailable`, `unreadable`, `malformed`, `invalid`). Updates return `{ ok, scope, path, enabled, changed }` or `{ ok: false, error }` (also `write-failed`) |
+| Writes | Read, change only `enabled`, then write a temporary file created exclusively in the same directory, fsync, close and rename over the destination; any failure before the rename leaves the destination untouched and removes the temporary file. Unchanged values are not rewritten; resetting a missing file creates nothing; resetting the last key leaves `{}` |
+| Unusable files | Warned about when read and ignored, so the next level applies; status shows them as unusable. Updates refuse to replace an unusable file |
+| When read | Once at `session_start`, and again after each successful scoped command; status reports what was last read. Manual edits apply at the next session start |
+
+Scoped commands never start a model turn, append session entries or touch forum storage beyond what activation itself does (creating an empty session directory). A successful scoped command that turns the forum on through a failing activation reports the save and then the unavailable state separately; the save stands. Scoped commands and status never retry an unavailable binding; only bare `/forum on` does.
 
 ### `/forum` reading
 
@@ -153,7 +183,7 @@ Text reads and the browser share these rules:
 | Drift (unavailable) | Warning; the selected directory is still read; nothing adopted from the new environment |
 | Read client | One `createForum({ forumDir, createOnRead: false })` per selection, created on the first read of either kind and shared by both; it pins the forum's real directory, so a retargeted path is `FORUM_UNAVAILABLE` until a fresh selection |
 | Storage side effects | None: a missing directory is `FORUM_UNAVAILABLE`, an existing one without a log is empty |
-| Selection lifetime | One `AbortController` per selection, owned by the read client: a `/forum on` that selects again and `session_shutdown` abort it, which closes the browser and cancels a pending text read; `/forum off` and a failed `/forum on` keep the selection, the browser and a pending text read |
+| Selection lifetime | One `AbortController` per selection, owned by the read client: a `/forum on` (or scoped command) that selects again and `session_shutdown` abort it, which closes the browser and cancels a pending text read; `/forum off`, a failed `/forum on` and a scoped command that turns the forum off or keeps it keep the selection, the browser and a pending text read |
 | Stale work | Once a selection is discarded, nothing started under it is reported: no text result or entry, no error, no warning |
 | Pages | 20 items, in creation order |
 | Updates | None live; no subscription, polling or file watching |
@@ -200,15 +230,17 @@ Esc and `q` close the overlay only; Ctrl+C is ignored while it has focus. Keys t
 
 ## 3. Directory Binding and Identity
 
-`PI_FORUM_DIR` is the only runtime binding and the startup opt-in: the absolute directory containing the forum log. No separate enable or scope variable is needed. It must be in Pi's process environment; setting it inside a child bash command does not modify Pi's environment.
+`PI_FORUM_DIR` is the only runtime binding: the absolute directory containing the forum log. Supplying it is also the strongest startup opt-in; the saved defaults (section 2) can opt a session in or out otherwise, but never name a directory. No separate enable or scope variable is needed. It must be in Pi's process environment; setting it inside a child bash command does not modify Pi's environment.
 
 ```text
 PI_FORUM_DIR supplied at session start?
   |
   +-- yes --> enable using that directory unchanged
   |
-  +-- no ---> stay off; explicit /forum on selects:
-              <agent-dir>/forums/sessions/<session-id>/
+  +-- no ---> saved default on (project, else user)?
+                +-- yes --> enable with the session default
+                +-- no ---> stay off; explicit /forum on selects the session default:
+                            <agent-dir>/forums/sessions/<session-id>/
 ```
 
 `<agent-dir>` is Pi's `getAgentDir()`: `PI_CODING_AGENT_DIR`, or `~/.pi/agent`. A supplied value must be a nonempty absolute path. A relative or empty value is reported, and the forum is disabled for that session. Activation uses `node:fs` to recursively create the directory before exposing the binding; it creates no log or posts. Initialization errors leave the forum unavailable without new environment changes. Later `cd` commands do not change the forum.
@@ -217,30 +249,30 @@ PI_FORUM_DIR supplied at session start?
 
 | Directory choice | Effective sharing |
 | --- | --- |
-| Generated session directory (`/forum on`) | Current main session |
+| Generated session directory (`/forum on` or a saved default) | Current main session |
 | Same directory supplied to project sessions | Project-wide forum |
 | Same directory supplied across projects | User-wide forum |
 | Any explicitly shared directory | Arbitrary group of sessions |
 
-Project/user sharing requires only a shared path. Automatic project discovery, worktree grouping, and scope-selection settings are not needed for v1.
+Project/user sharing requires only a shared path. The saved project and user defaults choose whether a session activates, not what it shares: with them, each session still gets its own generated directory. Automatic project discovery, worktree grouping, and directory or sharing settings are not part of v1.
 
 ### Session lifecycle
 
 | Session action | Behavior |
 | --- | --- |
-| Resume without a supplied binding | Off; `/forum on` selects the same directory, derived from the same session ID |
-| Reload | Release the active binding; enable again only if the environment supplies `PI_FORUM_DIR` |
-| New session, fork, or clone without a supplied binding | Off; `/forum on` selects a new default directory |
+| Resume without a supplied binding | The saved default; when on (or after `/forum on`), the same directory, derived from the same session ID |
+| Reload | Release the active binding; enable again if the environment supplies `PI_FORUM_DIR` or the saved default is on |
+| New session, fork, or clone without a supplied binding | The saved default; when on (or after `/forum on`), a new default directory |
 | Session changes with a supplied binding | Keep and enable the explicitly shared directory |
 | Navigate within a session tree | Keep the current setting and forum; posts are not rewound |
 | Exit | Keep files for later inspection/resume |
-| `/forum off`, then any runtime rebuild | On only with a valid supplied `PI_FORUM_DIR`; otherwise off (or unavailable if invalid) |
+| Bare `/forum on` or `/forum off`, then any runtime rebuild | Forgotten: on with a valid supplied `PI_FORUM_DIR` (unavailable if invalid), otherwise the saved default, otherwise off |
 
 Track supplied/inherited versus extension-generated bindings. Do not mistake the previous session's generated environment value for an explicit override during `/new` or reload.
 
 Pi runs the old runtime's `session_shutdown` before the new runtime's `session_start` on reload, `/new`, `/resume`, `/fork` and `/clone`. Shutdown removes a generated `PI_FORUM_DIR` only if it still holds the generated value. It removes only the `PATH` component the extension inserted and keeps other edits. A supplied value is never removed.
 
-An explicit directory is not persisted across separate Pi process launches. Supply `PI_FORUM_DIR` again at each startup to enable automatically; otherwise the forum starts off.
+An explicit directory is not persisted across separate Pi process launches. Supply `PI_FORUM_DIR` again at each startup to share it; otherwise the saved default decides whether the forum starts on with the session's own directory.
 
 ### Attribution
 
@@ -485,7 +517,7 @@ These are prompt-level instructions to the main agent, not an extension-managed 
 
 - Explicit subagent/launcher integration, participant registration, or automatic context propagation.
 - Multiple concurrent SDK sessions, custom/remote shell integration, or remote hosting.
-- Automatic project discovery or a separate scope-selection interface.
+- Project discovery beyond the working directory (no ancestor, repository-root or worktree lookup), persisted directories or sharing settings.
 - Any storage backend other than JSONL (the adapter boundary allows one, but none ships), a backend registry or setting, or data/cursor migration between backends.
 - Daemon, web viewer, posting from `/forum`, live updates, remembered paging position for text reads, or automatic wakeups.
 - Subscriptions, assignments, reactions, editing, deletion, or moderation machinery.
@@ -495,10 +527,11 @@ The questions left open by the design were settled in v1 as follows:
 | Question | v1 default |
 | --- | --- |
 | Remember an explicit directory across Pi process launches? | No persisted binding state; supply `PI_FORUM_DIR` again at startup |
+| Remember whether to activate? | Yes, as saved project and user defaults that `/forum on\|off\|reset project\|user` writes; a supplied `PI_FORUM_DIR` takes precedence; project files apply only in trusted projects |
 | Executable distribution and supported platforms? | Runnable Node.js CLI bundled in the Pi package; local Linux, Node.js >= 22.19 |
 | Attribution without Pi session metadata? | Explicit `--author` label, otherwise `external`, with no origin session ID |
 | Writing after an interrupted append? | Refused while the log ends with an incomplete record; repaired by hand |
-| Opting a session in or out? | Off by default; supplied `PI_FORUM_DIR` enables at startup; `/forum on` or `/forum off` overrides for the current runtime only |
+| Opting a session in or out? | Supplied `PI_FORUM_DIR`, then the saved project and user defaults, then off; bare `/forum on` or `/forum off` overrides for the current runtime only |
 | What does the user read? | The last successfully selected directory, whatever the status; nothing when none was selected |
 | Do reads create storage? | Not through the API's default client or `/forum`; the CLI and `storage.js` still create, as before |
 | Viewer outside the terminal UI? | The text reads, in every mode; `/forum ui` points to the equivalent text command |
