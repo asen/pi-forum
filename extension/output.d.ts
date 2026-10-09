@@ -1,0 +1,13 @@
+import type { ForumBinding, ForumTarget, ForumView, MessageListRequest, MessageRequest, TopicListRequest, VisibleWidth } from './types.js';
+export declare const LIST_PAGE_SIZE = 20;
+export declare const EXCERPT_CHARS = 80;
+export declare function printable(text: string): string;
+export declare function expandTabs(text: string, visibleWidth?: VisibleWidth): string;
+export declare function bodyLines(body: string, visibleWidth?: VisibleWidth): string[];
+export declare function excerpt(body: string): string;
+export declare function bindingOrigin({ generated, project }: Pick<ForumBinding, 'generated' | 'project'>): string;
+export declare function formatTarget({ forumDir, generated, project, resolved, status, warning }: ForumTarget): string;
+export declare function formatTopicList({ target, page, after, warnings }: TopicListRequest): string;
+export declare function formatMessageList({ target, topicId, page, after, warnings }: MessageListRequest): string;
+export declare function formatMessage({ target, message, warnings, visibleWidth }: MessageRequest): string;
+export declare function textCommand({ kind, topicId, messageId, after }: ForumView): string | null;

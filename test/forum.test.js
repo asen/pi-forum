@@ -487,6 +487,66 @@ describe('client identity', () => {
   })
 })
 
+describe('a custom adapter append that throws a non-Error', () => {
+  // An adapter that appends a topic and then throws thrown, as a custom adapter may.
+  function throwingAdapter(thrown) {
+    return {
+      async open({ forumDir }) {
+        return {
+          identity: forumDir,
+          async read() {
+            return 'cursor'
+          },
+          write: (options, fn) =>
+            fn({
+              read() {},
+              async append(event) {
+                if (event.type === 'message_posted') throw thrown
+              },
+            }),
+        }
+      },
+    }
+  }
+  const createWith = (thrown) =>
+    createForum({ forumDir: '/forum', adapter: throwingAdapter(thrown) }).createTopic({ title: 'T', author: 'a', body: 'b' })
+
+  // The partial write's message reads thrown.message as JavaScript does, so null and undefined fail
+  // while it is built.
+  for (const [name, thrown] of [
+    ['null', null],
+    ['undefined', undefined],
+  ]) {
+    test(`${name} fails reading its message`, async () => {
+      await assert.rejects(createWith(thrown), (err) => {
+        assert.ok(err instanceof TypeError)
+        assert.equal(err.message, `Cannot read properties of ${name} (reading 'message')`)
+        return true
+      })
+    })
+  }
+
+  for (const [name, thrown, message] of [
+    ['a function with a message', Object.assign(() => {}, { message: 'function failed' }), 'function failed'],
+    ['an object with a message', { message: 'object failed' }, 'object failed'],
+    ['an object with an inherited message', Object.create({ message: 'inherited failed' }), 'inherited failed'],
+    ['an object without a message', {}, 'undefined'],
+    ['a boxed string with a message', Object.assign(new String('boxed'), { message: 'boxed failed' }), 'boxed failed'],
+    ['a string', 'plain', 'undefined'],
+    ['a number', 42, 'undefined'],
+  ]) {
+    test(`${name} is a partial write with its message`, async () => {
+      await assert.rejects(createWith(thrown), (err) => {
+        assert.ok(err instanceof ForumError)
+        assert.equal(err.code, 'PARTIAL_WRITE')
+        assert.equal(err.cause, thrown)
+        assert.equal(err.message, `topic ${err.topic.id} was created but its initial message was not appended: ${message}`)
+        return true
+      })
+    })
+  }
+})
+
 describe('read cancellation', () => {
   // An adapter whose single event is read by a store that records its options and can abort the
   // caller's controller once it has visited the event.

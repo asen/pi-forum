@@ -552,3 +552,36 @@ test('the entry renderer shows every line of a text result unstyled at any width
   )
   assert.equal(render({ data: {} }, { expanded: true }, {}), undefined)
 })
+
+// Stored data is read as entry.data?.text, so a primitive's text comes from its prototype like any
+// other property read; only a nonempty string is drawn.
+test('the entry renderer reads text from any stored data as JavaScript does', () => {
+  class Text {
+    constructor(shown, paddingX, paddingY) {
+      Object.assign(this, { shown, paddingX, paddingY })
+    }
+  }
+  const render = (data) => createEntryRenderer({ Text })({ type: 'custom', customType: ENTRY_TYPE, data }, { expanded: false }, {})
+  const drawn = (shown) => ({ shown, paddingX: 1, paddingY: 0 })
+  for (const data of [undefined, null, 'abc', 5, true, {}, { text: '' }, { text: 7 }, []]) assert.equal(render(data), undefined)
+  assert.deepEqual({ ...render(Object.create({ text: 'inherited\x1b' })) }, drawn('inherited␛'))
+  assert.deepEqual({ ...render(Object.assign(() => {}, { text: 'function' })) }, drawn('function'))
+  try {
+    Object.defineProperty(String.prototype, 'text', { value: 'from String\x07', configurable: true, writable: true })
+    Object.defineProperty(Number.prototype, 'text', {
+      get() {
+        return `from ${typeof this} ${this}`
+      },
+      configurable: true,
+    })
+    assert.deepEqual({ ...render('abc') }, drawn('from String␇'))
+    // The getter runs with the primitive itself as this, as a property read on it does.
+    assert.deepEqual({ ...render(5) }, drawn('from number 5'))
+    assert.equal(render(null), undefined)
+  } finally {
+    delete String.prototype.text
+    delete Number.prototype.text
+  }
+  assert.equal(render('abc'), undefined)
+  assert.equal(render(5), undefined)
+})

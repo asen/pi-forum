@@ -717,4 +717,31 @@ describe('dispatch through the shared API', () => {
         `"pi-forum message post ${id} ..." instead of creating the topic again.\n`,
     )
   })
+
+  test('a partial write reads its cause once', async () => {
+    let reads = 0
+    const thrown = {
+      code: 'PARTIAL_WRITE',
+      topic: { id: 'T1' },
+      message: 'outer',
+      // A cause that is there only on its first read.
+      get cause() {
+        reads++
+        return reads === 1 ? new Error('inner') : undefined
+      },
+    }
+    const factory = () => {
+      throw thrown
+    }
+    const result = await invoke(['topic', 'list'], { PI_FORUM_DIR: FORUM_DIR }, factory)
+    assert.equal(reads, 1)
+    assert.deepEqual(result, {
+      code: 1,
+      stdout: '',
+      stderr:
+        'pi-forum: error: topic T1 was created, but its initial message may be missing (inner).\n' +
+        'Check with "pi-forum message list --topic T1" and, if needed, post the body with ' +
+        '"pi-forum message post T1 ..." instead of creating the topic again.\n',
+    })
+  })
 })

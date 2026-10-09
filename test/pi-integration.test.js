@@ -19,6 +19,7 @@ import { after, before, describe, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { createForum } from '../src/forum.js'
+import { copyCheckout, listFiles } from './checkout.js'
 import {
   FILE_SYNTHETIC_PROVIDER,
   SYNTHETIC_PROVIDER,
@@ -47,6 +48,7 @@ let piTui
 let piTheme
 let piManifest
 let temp
+let tarball
 let savedEnv
 let probes
 let calls = 0
@@ -134,9 +136,12 @@ async function setUp() {
   probes.fileSynthetic = path.join(temp, 'probes', 'synthetic-file.js')
   await fs.writeFile(probes.fileSynthetic, FILE_SYNTHETIC_PROVIDER)
 
-  const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', temp], { cwd: ROOT })
+  // Packs the tracked files without running prepack, so the working tree is never rebuilt
+  // (build.test.js covers prepack in a scratch copy).
+  const { stdout } = await exec('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temp], { cwd: ROOT })
   const [{ filename }] = JSON.parse(stdout)
-  await exec('tar', ['-xzf', path.join(temp, filename), '-C', path.join(temp, 'extracted')])
+  tarball = path.join(temp, filename)
+  await exec('tar', ['-xzf', tarball, '-C', path.join(temp, 'extracted')])
   packages.push({ label: 'source checkout', dir: ROOT.replace(/\/$/, '') })
   packages.push({ label: 'packed tarball', dir: path.join(temp, 'extracted', 'package') })
 }
@@ -204,7 +209,8 @@ export default function (pi) {
 
 // Starts a Pi session runtime like the CLI does, with its own agent dir, sessions and project.
 // agentDir, project (the working directory) and sessions reuse existing directories instead.
-// mode "extension" loads the package as `pi -e DIR` does; "settings" relies on `pi install`.
+// mode "extension" loads the package as `pi -e DIR` does; "settings" relies on `pi install`;
+// "installed" relies on an installation already recorded in the given agentDir.
 // With ui, notifications are recorded in host.notices; without it, Pi's extensions have no UI.
 // uiContext and uiMode bind another UI and mode instead; abortHandler receives extension aborts;
 // synthetic also loads the synthetic provider. The SDK trusts the project, as Pi does for one
@@ -2670,6 +2676,130 @@ else describe('real Pi host', () => {
         }
       })
     }
+  })
+
+  // Pi's own installers, as users install the package: `pi install git:...` clones the repository
+  // and runs Pi's npm install for Git packages in the clone; `pi install npm:...` installs into Pi's
+  // npm root. A Git URL rewrite points the GitHub URL at a local repository holding a commit of this
+  // checkout (tracked and new files, as they would be committed), npm runs offline with an empty
+  // cache, and a shim ahead of npm on PATH records every npm call Pi makes. Each installation then
+  // loads in Pi from its settings and runs its bundled CLI: no dev dependencies, compiler or build.
+  describe('consumer installs through pi install', () => {
+    const GIT_SOURCE = 'git:github.com/pi-forum-test/pi-forum'
+    let routes
+    let committed
+    let gitEnv
+
+    before(async () => {
+      routes = path.join(temp, 'routes')
+      const repo = path.join(routes, 'repo')
+      committed = await copyCheckout(repo)
+      const gitConfig = path.join(routes, 'gitconfig')
+      await fs.writeFile(
+        gitConfig,
+        `[url "file://${repo}"]\n\tinsteadOf = https://github.com/pi-forum-test/pi-forum\n[protocol "file"]\n\tallow = always\n`,
+      )
+      gitEnv = { GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: '1' }
+      const git = (args) => exec('git', args, { cwd: repo, env: { ...process.env, ...gitEnv } })
+      await git(['init', '-q', '-b', 'main'])
+      await git(['add', '-A'])
+      await git(['-c', 'user.name=pi-forum test', '-c', 'user.email=test@example.invalid', 'commit', '-q', '-m', 'snapshot'])
+
+      let npm
+      for (const dir of BASE_PATH.split(path.delimiter)) {
+        if (await fs.access(path.join(dir, 'npm'), fs.constants.X_OK).then(() => true, () => false)) {
+          npm = path.join(dir, 'npm')
+          break
+        }
+      }
+      assert.ok(npm, 'npm is not on PATH')
+      await fs.mkdir(path.join(routes, 'shim'))
+      await fs.writeFile(
+        path.join(routes, 'shim', 'npm'),
+        `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const { spawnSync } = require('node:child_process')
+appendFileSync(process.env.PI_FORUM_TEST_NPM_LOG, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }) + '\\n')
+const result = spawnSync(${JSON.stringify(npm)}, process.argv.slice(2), { stdio: 'inherit' })
+process.exitCode = result.status ?? 1
+`,
+        { mode: 0o755 },
+      )
+    })
+
+    // Runs `pi install source` with a new agent dir and project; returns those and the npm calls.
+    async function piInstall(source) {
+      const run = await fs.mkdtemp(path.join(routes, 'install-'))
+      const [agentDir, project] = [path.join(run, 'agent'), path.join(run, 'project')]
+      for (const dir of [agentDir, project]) await fs.mkdir(dir)
+      const log = path.join(run, 'npm.jsonl')
+      await piCli(['install', source], {
+        cwd: project,
+        env: {
+          ...process.env,
+          ...gitEnv,
+          PATH: [path.join(routes, 'shim'), BASE_PATH].join(path.delimiter),
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_FORUM_TEST_NPM_LOG: log,
+          npm_config_cache: path.join(run, 'npm-cache'),
+          npm_config_offline: 'true',
+        },
+      })
+      const calls = (await fs.readFile(log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      return { agentDir, project, calls }
+    }
+
+    // Pi loads the installed package from its settings; enabled, its bundled CLI posts through bash.
+    async function assertInstalledLoads(installed, { agentDir, project }, source) {
+      const settings = JSON.parse(await fs.readFile(path.join(agentDir, 'settings.json'), 'utf8'))
+      assert.deepEqual(settings.packages, [source])
+      const host = await openHost(installed, { mode: 'installed', ui: true, agentDir, project })
+      try {
+        loadedExtension(host, installed)
+        assertUnbound()
+        const on = `Forum is on: ${host.defaultDir(host.sessionId)} (session default)`
+        assert.deepEqual(await slash(host, '/forum on'), [info(on)])
+        assertBound(host, host.defaultDir(host.sessionId), installed)
+        assert.ok((await startRun(host)).sections.forum.includes(`Your author identity: ${host.sessionId} `))
+        const { output } = await bash(host, 'command -v pi-forum')
+        assert.equal(output.trim(), path.join(installed, 'bin', 'pi-forum'))
+        const created = await forum(host, ['topic', 'create', 'Installed', '--body', source])
+        assert.equal(created.topic.created_by, host.sessionId)
+        assert.deepEqual((await forum(host, ['message', 'list'])).items.map((m) => m.body), [source])
+        // The installed extension's text reader shows the post as a session entry.
+        await host.runtime.session.prompt('/forum topics')
+        assert.deepEqual(outputs(host.runtime.session).map((entry) => entry.data.text.split('\n').includes('1. Installed')), [true])
+      } finally {
+        await host.runtime.dispose()
+      }
+      assertUnbound()
+      assert.deepEqual(host.errors, [])
+    }
+
+    test('pi install git: clones a commit of this checkout, runs only npm install --omit=dev --legacy-peer-deps, and loads it', async () => {
+      const { agentDir, project, calls } = await piInstall(GIT_SOURCE)
+      const installed = path.join(agentDir, 'git', 'github.com', 'pi-forum-test', 'pi-forum')
+      assert.deepEqual(calls, [{ cwd: installed, args: ['install', '--omit=dev', '--legacy-peer-deps'] }])
+      // The clone is exactly the commit: nothing installed, built, rewritten or added (not even ignored files).
+      assert.equal((await exec('git', ['status', '--porcelain', '--ignored'], { cwd: installed })).stdout, '')
+      assert.deepEqual(await listFiles(installed, { skip: ['.git'] }), committed)
+      await assertInstalledLoads(installed, { agentDir, project }, GIT_SOURCE)
+    })
+
+    test('pi install npm: installs the packed tarball with --legacy-peer-deps, without peers or a build, and loads it', async () => {
+      const source = `npm:pi-forum@file:${tarball}`
+      const { agentDir, project, calls } = await piInstall(source)
+      const root = path.join(agentDir, 'npm')
+      assert.deepEqual(calls, [{ cwd: project, args: ['install', `pi-forum@file:${tarball}`, '--prefix', root, '--legacy-peer-deps'] }])
+      assert.deepEqual((await fs.readdir(path.join(root, 'node_modules'))).sort(), ['.bin', '.package-lock.json', 'pi-forum'])
+      const installed = path.join(root, 'node_modules', 'pi-forum')
+      const packed = path.join(temp, 'extracted', 'package')
+      assert.deepEqual(await listFiles(installed), await listFiles(packed))
+      for (const file of await listFiles(packed)) {
+        assert.deepEqual(await fs.readFile(path.join(installed, file)), await fs.readFile(path.join(packed, file)), file)
+      }
+      await assertInstalledLoads(installed, { agentDir, project }, source)
+    })
   })
 
   test('nothing was written outside the isolated temp directory', async () => {

@@ -65,11 +65,11 @@ The CLI operates independently of the extension's in-memory state.
 
 | Package element | v1 |
 | --- | --- |
-| Format | ESM, no build step, no runtime `dependencies` |
+| Format | ESM JavaScript compiled from strict TypeScript and committed beside its sources; installing builds nothing; no runtime `dependencies` |
 | Executable | `bin/pi-forum` (Node.js, mode 0755), exposed through `bin` and the extension's `PATH` entry |
 | Extension | `pi.extensions: ["./extension/index.js"]`; imports `getAgentDir` from the host and the terminal helpers from `pi-tui` |
 | Host | `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` as `"*"` peer dependencies, supplied by Pi and never bundled |
-| Published files | `bin/`, `src/` (including `src/backends/`), `extension/`, `README.md`, this document, `LICENSE` |
+| Published files | `bin/`, the generated `.js` and `.d.ts` of `src/` (including `src/backends/`) and `extension/`, `README.md`, this document, `LICENSE`; not the `.ts` sources or build tooling |
 | Loading | `pi install <path>`, `pi -e <path>`, or any other Pi package source |
 
 ```text
@@ -120,6 +120,22 @@ session_shutdown
 - Do not replace the whole system prompt or edit shell startup files.
 - Do not intercept or parse bash command text to emulate an executable.
 - Do not start long-lived resources in the extension factory.
+
+### Source and distribution
+
+```text
+src/**/X.ts, extension/X.ts --tsc (scripts/build.mjs)--> X.js + X.d.ts beside it, committed
+                                                         |
+  local package (pi install <path>, pi -e) -- loaded in place, no install ------+
+  Git package (pi install git:...) -- clone + npm install --omit=dev ----------+--> runs the committed X.js
+                                      --legacy-peer-deps                        |
+  npm package / tarball -- the packed X.js and X.d.ts --------------------------+
+```
+
+- **TypeScript is the source of truth.** Each production module is a strict TypeScript file (`NodeNext`, `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`). The generated JavaScript and declarations are committed because neither a local load nor Pi's Git install builds anything, and the module paths (`bin/pi-forum` importing `src/cli.js`, `pi.extensions: ["./extension/index.js"]`, imports by path) are those of the earlier hand-written JavaScript.
+- **Generation.** `npm run build` compiles into a staging directory and rewrites only the generated files that differ, so a failed compile changes nothing; `npm run check-generated` is the read-only form that fails on missing, edited or orphaned output. The output is deterministic, without source maps. The build does not run on install: there is no `prepare` or install script, only `prepack` for contributors' `npm pack`.
+- **Tooling is for development only.** The compiler, Node types and Pi 1.1.0 (for its types and the tests) are exact `devDependencies`; consumers get none of them, and the host packages remain `"*"` peers that the running Pi supplies. `skipLibCheck` only covers Pi 1.1.0's own declarations, which do not check under `NodeNext` by themselves; the published declarations are checked without it.
+- **Runtime validation stays.** Types describe the contracts, but API and CLI input, records read from the log, saved defaults and Pi's trust check are still checked at run time, as JavaScript callers, hand-edited files and other Pi versions are not type-checked.
 
 ### `/forum` toggle
 

@@ -1,0 +1,34 @@
+{
+  // Production TypeScript under src/ and extension/. Each X.ts owns the tracked X.js and X.d.ts next
+  // to it; scripts/build.mjs emits them (npm run build) and checks them (npm run check-generated).
+  // Tests stay JavaScript and are not part of this project. This config never emits by itself:
+  // npm run typecheck only checks, and the build runner overrides noEmit and outDir to a staging
+  // directory.
+  "compilerOptions": {
+    "target": "ES2023",
+    // ES2024.String types String.prototype.isWellFormed, which records validation relies on and every
+    // supported Node (>=22.19) provides; nothing else beyond ES2023 is assumed.
+    "lib": ["ES2023", "ES2024.String"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    // Vendor-only workaround: Pi 1.1.0's declarations do not check under NodeNext on their own
+    // (@earendil-works/pi-ai imports JSON without a type attribute; @google/genai needs DOM types and
+    // an optional MCP SDK that is not installed). Our own sources are still fully checked against
+    // them, and generated declarations are excluded below rather than relied on.
+    "skipLibCheck": true,
+    "noEmit": true,
+    "noEmitOnError": true,
+    "declaration": true,
+    "sourceMap": false,
+    "newLine": "lf",
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "extension/**/*.ts"],
+  // Generated declarations sit next to their sources and must not be read back as inputs.
+  "exclude": ["**/*.d.ts"]
+}

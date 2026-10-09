@@ -10,8 +10,11 @@
   "files": [
     "bin/pi-forum",
     "src/*.js",
+    "src/*.d.ts",
     "src/backends/*.js",
+    "src/backends/*.d.ts",
     "extension/*.js",
+    "extension/*.d.ts",
     "README.md",
     "docs/architecture.md"
   ],
@@ -29,6 +32,16 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "smoke": "node --test test/smoke.test.js"
+    "smoke": "node --test test/smoke.test.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "check-generated": "node scripts/build.mjs --check",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "@types/node": "22.19.21",
+    "typescript": "7.0.2"
   }
 }

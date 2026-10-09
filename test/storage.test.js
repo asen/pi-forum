@@ -631,6 +631,28 @@ describe('locking', () => {
     await fs.rmdir(lockPath(dir))
   })
 
+  test('a lock release failure without a value is still warned about', async (t) => {
+    const dir = await tempForum()
+    const { topic } = await createTopic(dir, { title: 'T', author: 'a' })
+    const failure = Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    t.mock.method(fs, 'appendFile', async () => {
+      throw failure
+    })
+    t.mock.method(fs, 'rmdir', async () => {
+      throw null
+    })
+    const { warnings, onWarning } = collectWarnings()
+    await assert.rejects(postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }), (err) => {
+      assert.equal(err.code, 'WRITE_FAILED')
+      assert.equal(err.cause, failure)
+      return true
+    })
+    t.mock.restoreAll()
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /^could not remove .*\.write-lock after a failed write: undefined;/)
+    await fs.rmdir(lockPath(dir))
+  })
+
   test('a throwing warning callback does not replace a failed append error', async (t) => {
     const dir = await tempForum()
     const { topic } = await createTopic(dir, { title: 'T', author: 'a' })
