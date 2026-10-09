@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { createForum as sharedCreateForum } from '../src/forum.js'
 import { createBrowser } from './browser-state.js'
-import { formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.js'
+import { bindingOrigin, formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.js'
 import { createPreferenceStore } from './preferences.js'
 
 export const SECTION_NAME = 'forum'
@@ -29,14 +29,14 @@ const NESTED = new Map([
 // Each runtime starts from its default, by precedence: a supplied PI_FORUM_DIR (inherited or set at
 // launch, never the one this runtime generated) turns it on, then the saved project and user defaults
 // (preferences.js), then off. The saved defaults are read once at session start and again after each
-// successful /forum on|off|reset project|user; status reports what was last read. Saving only
-// records whether to activate: the directory is still the session default unless PI_FORUM_DIR is
-// supplied.
+// successful /forum on|off|reset project|user; status reports what was last read. An enabled project
+// default pins the forum to <cwd>/.pi/forum; user defaults only activate a session directory. A
+// supplied PI_FORUM_DIR still wins over either choice.
 //
-// Bare /forum on and off override the default in memory until the runtime ends. A successful scoped
+// Bare /forum on and off override activation in memory until the runtime ends. A successful scoped
 // command drops that override and applies the default again: off releases as /forum off does; on
-// activates a binding that is off, keeps a healthy one as it is, and leaves an unavailable one for
-// /forum on. A failed one changes nothing in the runtime.
+// activates from off or switches a healthy binding whose target changed, otherwise keeps it. An
+// unavailable binding is left for /forum on. A failed save changes nothing in the runtime.
 //
 // "unavailable" means the binding could not be selected, or the environment no longer carries it;
 // only /forum on retries.
@@ -103,6 +103,7 @@ export function createForumRuntime({
     sections[SECTION_NAME] = forumSection({
       forumDir: active.forumDir,
       generated: active.generated,
+      project: active.project,
       sessionId: ctx.sessionManager.getSessionId(),
     })
   }
@@ -168,8 +169,11 @@ export function createForumRuntime({
       if (status !== 'off') disable()
     } else if (status === 'off') {
       enable(ctx)
-    } else {
-      checkHealth()
+    } else if (checkHealth()) {
+      const next = chooseBinding(ctx)
+      if (next.error || next.forumDir !== active.forumDir || next.generated !== active.generated || next.project !== active.project) {
+        enable(ctx)
+      }
     }
     lines.push(statusText(), effectiveText())
     report(lines.map(printable).join('\n'), ctx, status === 'unavailable' || problems.length > 0 ? 'warning' : 'info')
@@ -228,10 +232,17 @@ export function createForumRuntime({
     return `\n${printable(`This lasts until the session is reloaded or replaced; the saved ${source} default (${onOff(enabled)}) applies then.`)}`
   }
 
-  // Selects from the current environment and session after releasing any previous exposure.
+  // An enabled, trusted project preference pins the target; user preferences never pin it.
+  // Derive from the cached preference path so the binding follows the project whose file was read.
+  function chooseBinding(ctx) {
+    const projectDir = saved?.project.enabled === true ? path.join(path.dirname(saved.project.path), 'forum') : undefined
+    return selectBinding(suppliedDir(), ctx, getAgentDir, projectDir)
+  }
+
+  // Selects from the current environment and defaults after releasing any previous exposure.
   function enable(ctx) {
     release()
-    const binding = selectBinding(env.PI_FORUM_DIR, ctx, getAgentDir)
+    const binding = chooseBinding(ctx)
     if (binding.error) {
       status = 'unavailable'
       reason = binding.error
@@ -249,7 +260,7 @@ export function createForumRuntime({
     const pathChange = prependPath(env, binDir)
     if (binding.generated) env.PI_FORUM_DIR = binding.forumDir
     active = { ...binding, pathChange }
-    selected = { forumDir: binding.forumDir, generated: binding.generated }
+    selected = { ...binding }
     discardReader()
     status = 'on'
     reason = null
@@ -307,8 +318,7 @@ export function createForumRuntime({
       return null
     }
     return {
-      forumDir: selected.forumDir,
-      generated: selected.generated,
+      ...selected,
       resolved: reader?.forum.resolved,
       status,
       warning: status === 'unavailable' ? reason : null,
@@ -410,7 +420,7 @@ export function createForumRuntime({
 
   return {
     get binding() {
-      return status === 'on' ? { forumDir: active.forumDir, generated: active.generated } : null
+      return status === 'on' ? { ...selected } : null
     },
     get state() {
       return { status, reason, selected: selected && { ...selected } }
@@ -480,8 +490,8 @@ export function forumCompletions(prefix) {
   return values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }))
 }
 
-function describe({ forumDir, generated }) {
-  return `${forumDir} (${generated ? 'session default' : 'supplied PI_FORUM_DIR'})`
+function describe(binding) {
+  return `${binding.forumDir} (${bindingOrigin(binding)})`
 }
 
 const onOff = (enabled) => (enabled ? 'on' : 'off')
@@ -514,14 +524,16 @@ function bindingDrift(env, binDir, forumDir) {
   return null
 }
 
-// A supplied PI_FORUM_DIR is used unchanged; otherwise the session ID selects a default directory.
-function selectBinding(supplied, ctx, getAgentDir) {
+// A supplied PI_FORUM_DIR wins, then an enabled project pin, otherwise the session default.
+// "generated" means the runtime owns the environment value, for either kind of default directory.
+function selectBinding(supplied, ctx, getAgentDir, projectDir) {
   if (supplied !== undefined) {
     if (!supplied || !path.isAbsolute(supplied)) {
       return { error: `PI_FORUM_DIR must be a nonempty absolute path, got ${JSON.stringify(supplied)}` }
     }
     return { forumDir: supplied, generated: false }
   }
+  if (projectDir !== undefined) return { forumDir: projectDir, generated: true, project: true }
   const sessionId = ctx.sessionManager.getSessionId()
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\\0]/.test(sessionId)) {
     return { error: `cannot derive a forum directory from session ID ${JSON.stringify(sessionId)}` }
@@ -560,10 +572,10 @@ function defaultReport(message, ctx, type = 'error') {
 }
 
 // Pi wraps the section in <forum> tags.
-export function forumSection({ forumDir, generated, sessionId }) {
-  const origin = generated
-    ? "this session's default forum"
-    : 'supplied at launch; other sessions may share it'
+export function forumSection({ forumDir, generated, project, sessionId }) {
+  const origin = project
+    ? 'project default; shared by sessions in this working directory'
+    : generated ? "this session's default forum" : 'supplied at launch; other sessions may share it'
   return `A local forum where agents share findings and coordinate work. Use it through bash with the \`pi-forum\` command, which is on PATH.
 
 Forum directory: ${forumDir} (PI_FORUM_DIR; ${origin})

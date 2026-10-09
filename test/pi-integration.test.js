@@ -192,7 +192,7 @@ export default function (pi) {
   pi.registerCommand('probe-env', {
     description: 'Record the environment for the test',
     handler: async (_args, ctx) => {
-      const dir = path.join(${JSON.stringify(forums)}, 'sessions', ctx.sessionManager.getSessionId())
+      const dir = process.env.PI_FORUM_DIR ?? path.join(${JSON.stringify(forums)}, 'sessions', ctx.sessionManager.getSessionId())
       const entries = fs.existsSync(dir) ? fs.readdirSync(dir) : null
       const record = { type: 'probe-env', forumDir: process.env.PI_FORUM_DIR ?? null, PATH: process.env.PATH, forums: fs.existsSync(${JSON.stringify(forums)}), entries }
       fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(record) + '\\n')
@@ -1212,6 +1212,55 @@ else describe('real Pi host', () => {
         assert.deepEqual(host.errors, [])
       })
 
+      test('project pins share one forum through reload, new, resume, fork and clone; reset restores session directories', async () => {
+        const { dir } = pkg()
+        const host = await openHost(dir, { ui: true })
+        try {
+          const pinned = path.join(host.project, '.pi', 'forum')
+          const first = host.sessionId
+          const firstFile = host.runtime.session.sessionManager.getSessionFile()
+          await slash(host, '/forum on user')
+          await createForum({ forumDir: host.defaultDir(first) }).createTopic({ title: 'Session only', author: first })
+          const original = await fs.readFile(path.join(host.defaultDir(first), 'events.jsonl'))
+          const notices = await slash(host, '/forum on project')
+          assert.match(notices[0].message, /\(project default\)/)
+          assertBound(host, pinned, dir)
+          assert.deepEqual(await fs.readdir(pinned), [])
+          assert.match((await startRun(host)).sections.forum, /project default; shared by sessions in this working directory/)
+          await createForum({ forumDir: pinned }).createTopic({ title: 'Shared project', author: first })
+          const bytes = await fs.readFile(path.join(pinned, 'events.jsonl'))
+          converse(host, 'First persisted exchange')
+          const forkAt = converse(host, 'Second persisted exchange')
+          takeEvents(host)
+          const replace = async (reason, operation) => {
+            const from = host.sessionId
+            await slash(host, '/forum off')
+            await operation()
+            assertReplacement(host, takeEvents(host), { reason, from, to: host.sessionId, forumDir: pinned, packageDir: dir })
+            assert.deepEqual(await fs.readFile(path.join(pinned, 'events.jsonl')), bytes)
+          }
+          await replace('reload', () => host.runtime.session.reload())
+          await replace('new', () => host.runtime.newSession())
+          await replace('resume', () => host.runtime.switchSession(firstFile))
+          await replace('fork', () => host.runtime.fork(forkAt))
+          await replace('fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' }))
+          const pinnedSession = host.sessionId
+          await slash(host, '/forum on user')
+          assertBound(host, pinned, dir)
+          await assert.rejects(fs.access(host.defaultDir(pinnedSession)), { code: 'ENOENT' })
+          await slash(host, '/forum reset project')
+          assertBound(host, host.defaultDir(pinnedSession), dir)
+          assert.deepEqual(await fs.readdir(host.defaultDir(pinnedSession)), [])
+          assert.deepEqual(await fs.readFile(path.join(pinned, 'events.jsonl')), bytes)
+          assert.deepEqual(await fs.readFile(path.join(host.defaultDir(first), 'events.jsonl')), original)
+          assert.deepEqual(outputs(host.runtime.session), [])
+          assert.deepEqual(host.errors, [])
+        } finally {
+          await host.runtime.dispose()
+        }
+        assertUnbound()
+      })
+
       // Browsing in the terminal UI while an agent run streams from the synthetic provider. The UI
       // host is Pi's real renderer on an in-memory terminal (see createTerminalUI).
       for (const [screen, renderer] of [['regular', 'TuiMainScreen'], ['fullscreen', 'TuiAltScreen']]) {
@@ -2096,6 +2145,9 @@ else describe('real Pi host', () => {
         const userFile = path.join(paths.agent, 'forum.json')
         const projectFile = (cwd) => path.join(cwd, '.pi', 'forum.json')
         const sessionDir = (id) => path.join(paths.agent, 'forums', 'sessions', id)
+        const projectDir = (cwd) => path.join(cwd, '.pi', 'forum')
+        const projectState = (cwd) => `Forum is on: ${projectDir(cwd)} (project default)`
+        const inactiveProject = (cwd) => `Forum is off. Last selected directory (inactive): ${projectDir(cwd)} (project default)`
         const dirs = {}
         for (const name of ['a', 'b', 'project', 'project/sub', 'custom', 'protected']) {
           dirs[name] = path.join(run, 'cwd', name)
@@ -2133,11 +2185,13 @@ else describe('real Pi host', () => {
         const refused = (cwd) =>
           `Could not save the project default: project ${cwd} is not trusted, so ${projectFile(cwd)} is ignored; run /trust and restart Pi, ` +
           'or start Pi with --approve, to use project defaults; the project default was not changed. This session is unchanged.'
-        // A generated binding at startup: the session's own directory, empty, and the bundled bin on PATH.
-        const startedOn = async ({ start, shutdown, id }) => {
-          assert.equal(start.forumDir, sessionDir(id))
+        // Both default directory kinds are runtime-owned and restored at shutdown.
+        const startedOn = async ({ start, shutdown, id }, project = false, entries = []) => {
+          const target = project ? projectDir(start.cwd) : sessionDir(id)
+          assert.equal(start.forumDir, target)
           assert.equal(start.PATH, `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`)
-          assert.deepEqual(await fs.readdir(sessionDir(id)), [])
+          assert.deepEqual(await fs.readdir(target), entries)
+          if (project) await assert.rejects(fs.access(sessionDir(id)), { code: 'ENOENT' })
           assert.equal(shutdown.forumDir, null)
           assert.equal(shutdown.PATH, BASE_PATH)
         }
@@ -2198,9 +2252,9 @@ else describe('real Pi host', () => {
         ids.push(result.id)
         const customOn = 'Effective default: on, from the project default, which takes precedence over the user default (off).'
         result = await launch(dirs.custom, ['/forum status'])
-        await startedOn(result)
+        await startedOn(result, true)
         assert.equal(result.start.trusted, true)
-        assert.equal(result.stderr, reply(statusText(where(dirs.custom), on(result.id), { user: false, project: true, effective: customOn })))
+        assert.equal(result.stderr, reply(statusText(where(dirs.custom), projectState(dirs.custom), { user: false, project: true, effective: customOn })))
         ids.push(result.id)
 
         // --no-approve ignores the project default and refuses to change it; --approve allows both.
@@ -2217,10 +2271,28 @@ else describe('real Pi host', () => {
         ids.push(result.id)
         result = await launch(dirs.custom, ['/forum off project'], { flags: ['--approve'] })
         assert.equal(result.start.trusted, true)
-        assert.equal(result.start.forumDir, sessionDir(result.id))
+        assert.equal(result.start.forumDir, projectDir(dirs.custom))
         const customOff = 'Effective default: off, from the project default, which takes precedence over the user default (off).'
-        assert.equal(result.stderr, reply(`Saved the project default: off (${projectFile(dirs.custom)}).`, inactive(result.id), customOff))
+        assert.equal(result.stderr, reply(`Saved the project default: off (${projectFile(dirs.custom)}).`, inactiveProject(dirs.custom), customOff))
         assert.deepEqual(JSON.parse(await fs.readFile(projectFile(dirs.custom), 'utf8')), { note: 'kept', enabled: false })
+        ids.push(result.id)
+
+        // Saving project on pins this run and later processes to the same project history.
+        result = await launch(dirs.custom, ['/forum on project'])
+        startedOff(result)
+        assert.equal(result.stderr, reply(`Saved the project default: on (${projectFile(dirs.custom)}).`, projectState(dirs.custom), customOn))
+        assert.deepEqual(await fs.readdir(projectDir(dirs.custom)), [])
+        await createForum({ forumDir: projectDir(dirs.custom) }).createTopic({ title: 'Shared across launches', author: result.id })
+        const pinnedBytes = await fs.readFile(path.join(projectDir(dirs.custom), 'events.jsonl'))
+        ids.push(result.id)
+        result = await launch(dirs.custom, ['/forum status'])
+        await startedOn(result, true, ['events.jsonl'])
+        assert.equal(result.stderr, reply(statusText(where(dirs.custom), projectState(dirs.custom), { user: false, project: true, effective: customOn })))
+        assert.deepEqual(await fs.readFile(path.join(projectDir(dirs.custom), 'events.jsonl')), pinnedBytes)
+        ids.push(result.id)
+        result = await launch(dirs.custom, ['/forum off project'])
+        assert.equal(result.stderr, reply(`Saved the project default: off (${projectFile(dirs.custom)}).`, inactiveProject(dirs.custom), customOff))
+        assert.deepEqual(await fs.readFile(path.join(projectDir(dirs.custom), 'events.jsonl')), pinnedBytes)
         ids.push(result.id)
 
         // Protected resources: without a saved decision headless Pi does not trust the project, so its
@@ -2243,14 +2315,14 @@ else describe('real Pi host', () => {
         const trust = new pi.ProjectTrustStore(paths.agent)
         trust.set(dirs.protected, true)
         result = await launch(dirs.protected, ['/forum status'])
-        await startedOn(result)
+        await startedOn(result, true)
         assert.equal(result.start.trusted, true)
-        assert.equal(result.stderr, reply(statusText(where(dirs.protected), on(result.id), { user: false, project: true, effective: protectedOn })))
+        assert.equal(result.stderr, reply(statusText(where(dirs.protected), projectState(dirs.protected), { user: false, project: true, effective: protectedOn })))
         ids.push(result.id)
         trust.set(dirs.protected, false)
         await deniedProtected('saved deny')
         result = await launch(dirs.protected, ['/forum status'], { flags: ['--approve'] })
-        await startedOn(result)
+        await startedOn(result, true)
         assert.equal(result.start.trusted, true)
         ids.push(result.id)
 
@@ -2285,7 +2357,8 @@ else describe('real Pi host', () => {
         assert.deepEqual(await fs.readdir(shared), ['events.jsonl'])
         await assert.rejects(fs.access(sessionDir(result.id)), { code: 'ENOENT' })
 
-        // Every process had its own session; none wrote a session file, posted or asked the model.
+        // Every process had its own session ID; project pins shared storage, user defaults did not.
+        // No process wrote a session file, posted or asked the model (the test seeded history itself).
         assert.equal(new Set(ids).size, ids.length)
         for (const id of ids) assert.deepEqual(await fs.readdir(sessionDir(id)).catch(() => []), [], id)
         assert.deepEqual(await fs.readdir(paths.sessions, { recursive: true }), [])
@@ -2317,10 +2390,10 @@ else describe('real Pi host', () => {
         await fs.mkdir(path.join(paths.project, '.pi'))
         await fs.writeFile(projectFile, '{"enabled":true}')
         let result = await headless.launch(['-p', '/forum status', '/forum off user'])
-        const [lines, id] = [result.stderr.split('\n'), (await starts()).at(-1).sessionId]
-        const forumDir = path.join(paths.agent, 'forums', 'sessions', id)
+        const lines = result.stderr.split('\n')
+        const forumDir = path.join(paths.project, '.pi', 'forum')
         assert.match(lines[0], new RegExp(`^pi-forum: ${escapeRegExp(userFile)} is not valid JSON: .+; this saved default is ignored\\. Run /forum status for details\\.$`))
-        assert.equal(lines[1], `Forum is on: ${forumDir} (session default)`)
+        assert.equal(lines[1], `Forum is on: ${forumDir} (project default)`)
         assert.match(lines[3], new RegExp(`^ {2}user: unusable, ${escapeRegExp(userFile)} is not valid JSON: `))
         assert.equal(lines[5], 'Effective default: on, from the project default.')
         assert.match(lines[6], new RegExp(`^Could not save the user default: ${escapeRegExp(userFile)} is not valid JSON: .+; refusing to replace it, fix or remove it first\\. This session is unchanged\\.$`))
@@ -2331,7 +2404,7 @@ else describe('real Pi host', () => {
         // unavailable.
         await fs.rm(userFile)
         await fs.rm(projectFile)
-        await fs.rm(forums, { recursive: true })
+        await fs.rm(forums, { recursive: true, force: true })
         await fs.writeFile(forums, 'not a directory')
         result = await headless.launch(['-p', '/forum on user', '/forum status'])
         let sessionId = (await starts()).at(-1).sessionId
@@ -2360,7 +2433,8 @@ else describe('real Pi host', () => {
         assert.ok(failed, out[0])
         const unavailable = `Forum is unavailable: ${failed[1]}. Run /forum on to retry.`
         const projectOn = 'Effective default: on, from the project default, which takes precedence over the user default (on).'
-        const on = `Forum is on: ${ownDir} (session default)`
+        const pinnedDir = path.join(paths.project, '.pi', 'forum')
+        const on = `Forum is on: ${pinnedDir} (project default)`
         assert.equal(
           result.stderr,
           [
@@ -2376,10 +2450,11 @@ else describe('real Pi host', () => {
         assert.equal(await fs.readFile(projectFile, 'utf8'), '{\n  "enabled": true\n}\n')
         // After the scoped command and status: obstruction gone, nothing exposed or created.
         assert.deepEqual(run[1], { type: 'probe-env', forumDir: null, PATH: BASE_PATH, forums: false, entries: null })
-        // After the bare /forum on: the session's own empty directory, exposed with the bundled bin.
-        assert.deepEqual(run[2], { type: 'probe-env', forumDir: ownDir, PATH: `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`, forums: true, entries: [] })
+        // After bare /forum on: the project pin, exposed with the bundled bin. No session directory.
+        assert.deepEqual(run[2], { type: 'probe-env', forumDir: pinnedDir, PATH: `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`, forums: false, entries: [] })
         assert.deepEqual([run[3].forumDir, run[3].PATH], [null, BASE_PATH])
-        assert.deepEqual(await fs.readdir(forums, { recursive: true }), ['sessions', `sessions/${sessionId}`])
+        await assert.rejects(fs.access(forums), { code: 'ENOENT' })
+        assert.deepEqual(await fs.readdir(pinnedDir), [])
         assert.deepEqual(await fs.readdir(paths.sessions, { recursive: true }), [])
       })
     })

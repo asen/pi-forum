@@ -27,7 +27,8 @@ export default function piForum(pi) {
   pi.on('session_shutdown', () => runtime.sessionShutdown())
   pi.registerCommand(COMMAND_NAME, {
     description:
-      'Turn the pi-forum binding for this session on or off, save or reset whether new sessions start with it for this project or user, ' +
+      'Turn the pi-forum binding for this session on or off, save or reset whether new sessions start with it for this project or user ' +
+      '(project on shares .pi/forum; user on only enables by default), ' +
       'show its status, read its topics and messages as text, or browse them with /forum ui',
     getArgumentCompletions: forumCompletions,
     handler: async (args, ctx) => runtime.command(args, ctx),

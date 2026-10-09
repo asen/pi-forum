@@ -43,6 +43,10 @@ describe('target', () => {
   test('names the directory, its origin, where it resolved and whether agents use it', () => {
     assert.equal(formatTarget(TARGET), 'Forum directory: /forums/shared (supplied PI_FORUM_DIR)\nForum is on for agents.')
     assert.equal(
+      formatTarget({ forumDir: '/project/.pi/forum', generated: true, project: true, status: 'on' }),
+      'Forum directory: /project/.pi/forum (project default)\nForum is on for agents.',
+    )
+    assert.equal(
       formatTarget({ forumDir: '/a/s-1', generated: true, resolved: '/real/s-1', status: 'off', warning: null }),
       'Forum directory: /a/s-1 (session default), resolved to /real/s-1\nForum is off for agents; reading does not turn it on.',
     )

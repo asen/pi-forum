@@ -1075,7 +1075,7 @@ describe('/forum saved defaults', () => {
       ...options,
     })
     const read = async (file) => JSON.parse(await fs.readFile(file, 'utf8'))
-    return { h, root, agentDir, cwd, userFile, projectFile, read, dir: (id) => defaultDir(id, agentDir) }
+    return { h, root, agentDir, cwd, userFile, projectFile, read, projectDir: path.join(cwd, '.pi', 'forum'), dir: (id) => defaultDir(id, agentDir) }
   }
 
   test('startup precedence: a supplied PI_FORUM_DIR, then the project default, then the user default, then off', async () => {
@@ -1090,7 +1090,9 @@ describe('/forum saved defaults', () => {
           const source = supplied !== undefined ? 'env' : project !== undefined ? 'project' : user !== undefined ? 'user' : null
           assert.deepEqual(t.h.runtime.defaults, { enabled, source, override: null }, label)
           assert.equal(t.h.runtime.state.status, enabled ? 'on' : 'off', label)
-          const binding = supplied !== undefined ? { forumDir: supplied, generated: false } : { forumDir: t.dir('s-1'), generated: true }
+          const binding = supplied !== undefined ? { forumDir: supplied, generated: false }
+            : project === true ? { forumDir: t.projectDir, generated: true, project: true }
+            : { forumDir: t.dir('s-1'), generated: true }
           assert.deepEqual(t.h.runtime.binding, enabled ? binding : null, label)
           assert.deepEqual(t.h.env, enabled ? { PATH: withBin(), PI_FORUM_DIR: binding.forumDir } : env, label)
           assert.equal(Boolean(t.h.prompt()[SECTION_NAME]), enabled, label)
@@ -1108,7 +1110,7 @@ describe('/forum saved defaults', () => {
     assert.equal(
       t.h.forum('status'),
       [
-        `Forum is on: ${t.dir('s-1')} (session default)`,
+        `Forum is on: ${t.projectDir} (project default)`,
         'Saved defaults, as last read:',
         `  user: off (${t.userFile})`,
         `  project: on (${t.projectFile})`,
@@ -1229,7 +1231,8 @@ describe('/forum saved defaults', () => {
     const binding = t.h.runtime.binding
     assert.deepEqual(binding, { forumDir: t.dir('s-1'), generated: true })
     t.h.forum('on project')
-    assert.deepEqual(t.h.runtime.binding, binding)
+    assert.deepEqual(t.h.runtime.binding, { forumDir: t.projectDir, generated: true, project: true })
+    assert.notDeepEqual(t.h.runtime.binding, binding)
     assert.deepEqual(t.h.runtime.defaults, { enabled: true, source: 'project', override: null })
     assert.match(t.h.forum('status'), /\nEffective default: on, from the project default, which takes precedence over the user default \(on\)\.$/)
     t.h.forum('off project')
@@ -1309,6 +1312,108 @@ describe('/forum saved defaults', () => {
     )
     assert.deepEqual(t.h.runtime.defaults, { enabled: false, source: 'project', override: null })
     assert.doesNotMatch(t.h.forum('status'), /Temporary override/)
+  })
+
+  test('project on switches to a shared project directory, reset unpins it, and user on stays session-based', async () => {
+    const t = await saved({ user: true, mkdir: mkdirSync })
+    t.h.start('s-1')
+    await createForum({ forumDir: t.dir('s-1') }).createTopic({ title: 'Session history', author: 'a' })
+    const sessionBytes = await fs.readFile(path.join(t.dir('s-1'), 'events.jsonl'))
+
+    const reply = t.h.forum('on project')
+    assert.ok(reply.includes(`Forum is on: ${t.projectDir} (project default)`))
+    assert.deepEqual(t.h.runtime.binding, { forumDir: t.projectDir, generated: true, project: true })
+    assert.deepEqual(await fs.readdir(t.projectDir), [])
+    assert.match(t.h.prompt()[SECTION_NAME], /project default; shared by sessions in this working directory/)
+    assert.match(await t.h.text('topics'), /\(project default\)/)
+    await createForum({ forumDir: t.projectDir }).createTopic({ title: 'Project history', author: 'b' })
+    const projectBytes = await fs.readFile(path.join(t.projectDir, 'events.jsonl'))
+
+    // Saving the user default neither removes the project pin nor turns it into a global binding.
+    t.h.forum('on user')
+    assert.equal(t.h.env.PI_FORUM_DIR, t.projectDir)
+    t.h.forum('off')
+    assert.deepEqual(t.h.env, { PATH: BASE_PATH })
+    assert.match(t.h.forum('on'), /\(project default\)$/)
+    for (const id of ['s-1', 's-2', 's-3', 's-1']) {
+      t.h.start(id)
+      assert.equal(t.h.env.PI_FORUM_DIR, t.projectDir)
+      assert.equal((await createForum({ forumDir: t.projectDir }).listTopics()).items[0].title, 'Project history')
+    }
+    t.h.start('s-2')
+    t.h.forum('reset project')
+    assert.deepEqual(t.h.runtime.binding, { forumDir: t.dir('s-2'), generated: true })
+    assert.deepEqual(await fs.readdir(t.dir('s-2')), [])
+    assert.deepEqual(await t.read(t.projectFile), {})
+    assert.deepEqual(await fs.readFile(path.join(t.projectDir, 'events.jsonl')), projectBytes)
+    assert.deepEqual(await fs.readFile(path.join(t.dir('s-1'), 'events.jsonl')), sessionBytes)
+    t.h.quit()
+    assert.deepEqual(t.h.env, { PATH: BASE_PATH })
+  })
+
+  test('changing a healthy target discards its browser and late read, but saving the same target keeps them', async () => {
+    const clients = []
+    const opened = []
+    const t = await saved({
+      user: true,
+      createForum: () => {
+        const calls = []
+        clients.push(calls)
+        return { resolved: undefined, listTopics: (options) => new Promise((resolve) => calls.push({ options, resolve })) }
+      },
+      openBrowser: async (request) => {
+        opened.push(request)
+        request.browser.start()
+        await request.browser.done
+      },
+    })
+    t.h.start('s-1')
+    const tui = ctx('s-1', { notify: () => {} }, 'tui', { cwd: t.cwd })
+    const browsing = t.h.runtime.command('ui', tui)
+    await new Promise(setImmediate)
+    const reading = t.h.runtime.command('topics', tui)
+    await new Promise(setImmediate)
+    t.h.forum('on project')
+    assert.equal(opened[0].browser.closeReason, 'discarded')
+    assert.equal(opened[0].signal.aborted, true)
+    assert.equal(clients[0][1].options.signal.aborted, true)
+    clients[0][1].resolve({ items: [], next_cursor: 'c' })
+    await Promise.all([browsing, reading])
+    assert.deepEqual(t.h.texts, [])
+
+    const projectBrowser = t.h.runtime.command('ui', tui)
+    await new Promise(setImmediate)
+    assert.equal(opened[1].target.project, true)
+    for (const command of ['on project', 'on user']) {
+      t.h.forum(command)
+      assert.equal(opened[1].signal.aborted, false)
+    }
+    t.h.forum('reset project')
+    assert.equal(opened[1].signal.aborted, true)
+    assert.equal(t.h.env.PI_FORUM_DIR, t.dir('s-1'))
+    await projectBrowser
+    t.h.quit()
+  })
+
+  test('a project pin save stands when switching directories fails, without exposing or recreating a binding', async () => {
+    let blocked = true
+    const t = await saved({ user: true, mkdir: (dir) => {
+      if (blocked && dir.endsWith('/.pi/forum')) throw new Error('project directory blocked')
+    } })
+    t.h.start('s-1')
+    const reply = t.h.forum('on project')
+    assert.match(reply, /^Saved the project default: on .*\nForum is unavailable: cannot initialize forum directory .*project directory blocked/)
+    assert.equal(t.h.types.at(-1), 'warning')
+    assert.deepEqual(await t.read(t.projectFile), { enabled: true })
+    assert.deepEqual(t.h.env, { PATH: BASE_PATH })
+    assert.deepEqual(t.h.runtime.state.selected, { forumDir: t.dir('s-1'), generated: true })
+    blocked = false
+    t.h.forum('on user')
+    assert.equal(t.h.runtime.state.status, 'unavailable')
+    t.h.forum('on')
+    assert.equal(t.h.env.PI_FORUM_DIR, t.projectDir)
+    t.h.quit()
+    assert.deepEqual(t.h.env, { PATH: BASE_PATH })
   })
 
   test('a failed save changes nothing: override, status, environment, selection, client and browser are kept', async () => {
@@ -1433,7 +1538,7 @@ describe('/forum saved defaults', () => {
       [
         `Cleared the project default (${u.projectFile}).`,
         `Warning: cannot read ${u.userFile}: EACCES: permission denied, open '${u.userFile}'; this saved default is ignored. Run /forum status for details.`,
-        `Forum is off. Last selected directory (inactive): ${u.dir('s-1')} (session default)`,
+        `Forum is off. Last selected directory (inactive): ${u.projectDir} (project default)`,
         'Effective default: off (nothing saved applies).',
       ].join('\n'),
     )
@@ -1455,6 +1560,8 @@ describe('/forum saved defaults', () => {
     assert.doesNotMatch(untrusted.h.forum('on user'), /Warning/)
     assert.equal(untrusted.h.types.at(-1), 'info')
     assert.equal(untrusted.h.runtime.state.status, 'on')
+    assert.equal(untrusted.h.env.PI_FORUM_DIR, untrusted.dir('s-1'))
+    assert.equal(untrusted.h.runtime.binding.project, undefined)
   })
 
   test('status, prompts and reads use the defaults as last read and never touch the files', async () => {
@@ -1506,7 +1613,7 @@ describe('/forum saved defaults', () => {
     const [{ browser, signal }] = opened
     const binding = t.h.runtime.binding
     const env = { ...t.h.env }
-    for (const args of ['on user', 'on project', 'reset project']) {
+    for (const args of ['on user', 'reset project']) {
       t.h.forum(args)
       assert.deepEqual(t.h.runtime.binding, binding, args)
       assert.deepEqual(t.h.env, env, args)

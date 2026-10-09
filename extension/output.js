@@ -5,7 +5,7 @@
 // wherever it is shown and no terminal escape is ever interpreted.
 //
 // The formatters take what the caller read and never read more. A target is the browsed directory as
-// the runtime describes it: { forumDir, generated, resolved?, status, warning? }. Warnings are the
+// the runtime describes it: { forumDir, generated, project?, resolved?, status, warning? }. Warnings are the
 // messages the read reported through onWarning, one per damaged record skipped: an array, or
 // { items, omitted } when the caller kept only the first items and counted the rest.
 
@@ -59,9 +59,14 @@ export function excerpt(body) {
   return printable(all.slice(0, cut ? EXCERPT_CHARS - 1 : all.length).join('') + (more ? '…' : ''))
 }
 
+// Directory origin is independent of environment ownership: both defaults are generated bindings.
+export function bindingOrigin({ generated, project }) {
+  return project ? 'project default' : generated ? 'session default' : 'supplied PI_FORUM_DIR'
+}
+
 // The browsed directory, where it resolved once known, and whether agents use it.
-export function formatTarget({ forumDir, generated, resolved, status, warning }) {
-  const origin = generated ? 'session default' : 'supplied PI_FORUM_DIR'
+export function formatTarget({ forumDir, generated, project, resolved, status, warning }) {
+  const origin = bindingOrigin({ generated, project })
   const real = resolved && resolved !== forumDir ? `, resolved to ${resolved}` : ''
   const lines = [`Forum directory: ${forumDir} (${origin})${real}`]
   if (warning) lines.push(`Warning: the forum is unavailable (${warning}); reading the last selected directory.`)
