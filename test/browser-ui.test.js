@@ -7,11 +7,17 @@ import { describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { createBrowserOpener, overlayHeight, printable } from '../extension/browser.js'
 import { createBrowser } from '../extension/browser-state.js'
+import { createEntryRenderer, ENTRY_TYPE } from '../extension/entry-renderer.js'
 import { createForumRuntime } from '../extension/runtime.js'
 import { createForum } from '../src/forum.js'
 import { fakeAdapter } from './fake-adapter.js'
 
 const PI_ROOT = process.env.PI_FORUM_TEST_PI_ROOT
+// Every Bidi_Control character, by code point: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI.
+const BIDI_CONTROLS = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
+const BIDI = BIDI_CONTROLS.map((code) => String.fromCodePoint(code)).join('')
+const BIDI_SHOWN = BIDI_CONTROLS.map((code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`).join('')
+const RAW = new RegExp(`[\\u0000-\\u001f\\u007f-\\u009f${BIDI}]`, 'u')
 const settle = () => new Promise(setImmediate)
 
 // Waits until the browser's current load has settled; the fake adapter yields between records.
@@ -174,7 +180,7 @@ function assertFits(lib, host, width) {
   assert.ok(lines.length <= overlayHeight(host.tui), `${lines.length} lines for ${host.tui.terminal.rows} rows`)
   for (const line of lines) {
     assert.ok(lib.visibleWidth(line) <= width, `${JSON.stringify(line)} is wider than ${width}`)
-    assert.doesNotMatch(line.replace(ANSI, ''), /[\u0000-\u001f\u007f-\u009f]/, JSON.stringify(line))
+    assert.doesNotMatch(line.replace(ANSI, ''), RAW, JSON.stringify(line))
   }
   return lines
 }
@@ -358,6 +364,29 @@ for (const lib of libraries) {
       browser.close()
     })
 
+    test('every bidirectional control is shown as its code point in lists, headers and the reader', async () => {
+      const { forum } = await seededForum({ topics: 0 })
+      const { topic } = await forum.createTopic({ title: `title ${BIDI}`, author: `by ${BIDI}` })
+      await forum.postMessage({ topicId: topic.id, author: `from ${BIDI}`, body: `first ${BIDI}\n\t${BIDI} indented` })
+      const host = piHost({ columns: 400 })
+      const target = { ...TARGET, forumDir: `/forums/${BIDI}`, status: 'unavailable', warning: `drift ${BIDI}` }
+      const { browser } = await open(lib, forum, { kind: 'topics' }, { host, target })
+      assertFits(lib, host, 360)
+      let shown = host.text()
+      assert.ok(shown.includes(`title ${BIDI_SHOWN} · by ${BIDI_SHOWN}`), shown)
+      assert.ok(shown.includes(`Directory: /forums/${BIDI_SHOWN}`), shown)
+      assert.ok(shown.includes(`Unavailable: drift ${BIDI_SHOWN}`), shown)
+      await host.press(KEY.enter)
+      assertFits(lib, host, 360)
+      assert.ok(host.text().includes(`from ${BIDI_SHOWN} · `), host.text())
+      await host.press(KEY.enter)
+      assertFits(lib, host, 360)
+      shown = host.text()
+      assert.ok(shown.includes(`From from ${BIDI_SHOWN} · `), shown)
+      assert.ok(shown.includes(`\nfirst ${BIDI_SHOWN}\n    ${BIDI_SHOWN} indented`), shown)
+      browser.close()
+    })
+
     test('theme changes and invalidation restyle without stale colors', async () => {
       const { forum } = await seededForum({ topics: 1, messages: 1 })
       const { host, browser } = await open(lib, forum)
@@ -412,7 +441,7 @@ for (const lib of libraries) {
           openBrowser: createBrowserOpener(lib),
         })
         runtime.sessionStart({ sessionManager: { getSessionId: () => 's-1' } })
-        const browsing = runtime.command('topics', host.ctx)
+        const browsing = runtime.command(end === 'shutdown' ? 'ui' : 'ui topics', host.ctx)
         await settle()
         assert.equal(host.focus, 'overlay')
         const read = calls.at(-1)
@@ -447,8 +476,45 @@ for (const lib of libraries) {
       runtime.sessionStart({ sessionManager: { getSessionId: () => 's-1' } })
       const ui = { notify: () => {}, custom: () => assert.fail('only the terminal UI has custom components') }
       for (const mode of ['rpc', 'json', 'print']) {
-        await runtime.command('topics', { mode, hasUI: mode === 'rpc', ui, sessionManager: { getSessionId: () => 's-1' } })
+        await runtime.command('ui topics', { mode, hasUI: mode === 'rpc', ui, sessionManager: { getSessionId: () => 's-1' } })
       }
+      runtime.sessionShutdown()
+    })
+
+    test('text reads run beside the open overlay, on the same client, and never draw in it', async () => {
+      const { forum, created } = await seededForum({ topics: 2, messages: 1 })
+      const host = piHost()
+      const texts = []
+      const reports = []
+      const runtime = createForumRuntime({
+        binDir: '/pkg/bin',
+        getAgentDir: () => '/agent',
+        env: { PATH: '/usr/bin', PI_FORUM_DIR: '/forums/shared' },
+        report: (message) => reports.push(message),
+        mkdir: () => {},
+        createForum: () => forum,
+        openBrowser: createBrowserOpener(lib),
+        onText: (text) => texts.push(text),
+        visibleWidth: lib.visibleWidth,
+      })
+      runtime.sessionStart({ sessionManager: { getSessionId: () => 's-1' } })
+      const browsing = runtime.command('ui', host.ctx)
+      await settle()
+      await idle(host.component.browser)
+      const before = host.text()
+      const renders = host.renders
+      await runtime.command(`read ${created[1].messages[0].id}`, host.ctx)
+      assert.equal(texts.length, 1)
+      assert.match(texts[0], /\nBody \(2 lines\):\nT1 message 0\nsecond line$/)
+      assert.deepEqual(reports, [])
+      assert.equal(host.focus, 'overlay')
+      assert.equal(host.renders, renders)
+      assert.equal(host.text(), before)
+      await host.press(KEY.escape)
+      assert.equal(await browsing, undefined)
+      await runtime.command('topics', host.ctx)
+      assert.equal(texts.length, 2)
+      assert.equal(host.disposals, 1)
       runtime.sessionShutdown()
     })
   })
@@ -456,5 +522,33 @@ for (const lib of libraries) {
 
 test('printable shows control characters as visible text and leaves other text alone', () => {
   assert.equal(printable('a\x00b\x1b[0m\x7f\x9b\u200f'), 'a␀b␛[0m␡⟨U+009B⟩⟨U+200F⟩')
+  assert.equal(printable(BIDI), BIDI_SHOWN)
   assert.equal(printable('日本 👩‍💻 e\u0301  two  spaces'), '日本 👩‍💻 e\u0301  two  spaces')
+})
+
+test('the entry renderer shows every line of a text result unstyled at any width', { skip: !PI_ROOT && 'needs PI_FORUM_TEST_PI_ROOT' }, () => {
+  const lib = libraries.at(-1)
+  const render = createEntryRenderer(lib)
+  const body = Array.from({ length: 60 }, (_, i) => `line ${i} ${'日本'.repeat(i % 7)} **not bold**`)
+  const text = ['Forum message', '', ...body].join('\n')
+  for (const width of [12, 40, 120]) {
+    const lines = render({ type: 'custom', customType: ENTRY_TYPE, data: { text } }, { expanded: false }, {}).render(width)
+    assert.ok(lines.length >= body.length + 2)
+    for (const line of lines) {
+      assert.ok(lib.visibleWidth(line) <= width, JSON.stringify(line))
+      assert.doesNotMatch(line, /\x1b/)
+    }
+    // Wrapping only moves words between rows: every line is there, Markdown included.
+    const shown = lines.join('').replaceAll(' ', '')
+    for (const line of body) assert.ok(shown.includes(line.replaceAll(' ', '')), line)
+  }
+  const controls = render({ data: { text: 'a\x1b[31mb\tc‮' } }, { expanded: true }, {}).render(40)
+  assert.deepEqual(controls.map((line) => line.trimEnd()), [' a␛[31mb␉c⟨U+202E⟩'])
+  // A stored entry holding every bidirectional control raw draws each as its code point.
+  const bidi = render({ data: { text: [...BIDI].map((char) => `x${char}y`).join('\n') } }, { expanded: false }, {}).render(40)
+  assert.deepEqual(
+    bidi.map((line) => line.trimEnd()),
+    BIDI_CONTROLS.map((code) => ` x⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩y`),
+  )
+  assert.equal(render({ data: {} }, { expanded: true }, {}), undefined)
 })

@@ -8,7 +8,8 @@
 // directory, sessions, working directory, HOME, TMPDIR and npm cache under one temp directory, and
 // makes no network requests: the session lifecycle and before_agent_start are driven directly, and
 // /forum is submitted through session.prompt(), which runs extension commands before any model check.
-// Agent runs, where needed, stream from a synthetic provider extension the test controls.
+// Agent runs, where needed, stream from a synthetic provider extension the test controls. The pi
+// executable itself also runs, headless in print, JSON and RPC mode and in tmux as a terminal.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -24,6 +25,8 @@ import {
   createTerminalUI,
   hasTmux,
   installSyntheticProvider,
+  jsonRecords,
+  rpcProcess,
   tmuxSession,
   until,
 } from './pi-fixtures.js'
@@ -293,7 +296,11 @@ async function slash(host, text) {
 
 const info = (message) => ({ type: 'info', message })
 const warning = (message) => ({ type: 'warning', message })
-const USAGE = 'Usage: /forum [on|off|status] | /forum topics | /forum messages [TOPIC_ID] | /forum read MESSAGE_ID'
+const USAGE =
+  'Usage: /forum [on|off|status] | /forum topics [--after CURSOR] | /forum messages [TOPIC_ID] [--after CURSOR] | ' +
+  '/forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
+// The session entry type of /forum text results, which Pi renders with pi-forum's entry renderer.
+const ENTRY_TYPE = 'pi-forum.output'
 
 // Takes the lifecycle events recorded since the last call.
 function takeEvents(host) {
@@ -347,6 +354,88 @@ async function seedForum(forumDir) {
   return { topic, kickoff, long, reply }
 }
 
+// Every Bidi_Control character, by code point as Unicode's PropList.txt lists them (ALM, LRM, RLM,
+// LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI), and how pi-forum must show each.
+const BIDI_CONTROLS = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
+const BIDI = BIDI_CONTROLS.map((code) => String.fromCodePoint(code)).join('')
+const shownCode = (code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`
+const BIDI_SHOWN = BIDI_CONTROLS.map(shownCode).join('')
+const RAW_TEXT = new RegExp(`[\\u0000-\\u0009\\u000b-\\u001f\\u007f-\\u009f${BIDI}]`, 'u')
+
+// Appends canonical records to a forum's log, as an import would: IDs the API accepts but never
+// generates, such as ones starting with "-".
+async function importRecords(forumDir, records) {
+  await fs.mkdir(forumDir, { recursive: true })
+  await fs.appendFile(path.join(forumDir, 'events.jsonl'), records.map((record) => `${JSON.stringify(record)}\n`).join(''))
+}
+
+// A message body with literal Markdown, terminal controls, a tab and many lines, and the lines
+// /forum read prints for it: controls shown as visible symbols, the tab expanded, nothing styled.
+const LONG_BODY = [
+  '# Heading **not bold**',
+  '- [link](https://example.com) `code`',
+  '\x1b[31mred\x1b[0m and ‮reversed‬',
+  `bidi ${BIDI} end`,
+  '\tindented',
+  ...Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(4, '0')}`),
+  'LAST LINE ✓',
+].join('\n')
+const LONG_LINES = [
+  '# Heading **not bold**',
+  '- [link](https://example.com) `code`',
+  '␛[31mred␛[0m and ⟨U+202E⟩reversed⟨U+202C⟩',
+  `bidi ${BIDI_SHOWN} end`,
+  '    indented',
+  ...Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(4, '0')}`),
+  'LAST LINE ✓',
+]
+
+// A forum that pages: 23 topics, the first with 22 messages, the last of which is LONG_BODY; the
+// last topic has a terminal control and every bidirectional control in its title, and no messages. The expected pages are read
+// back through src/forum.js with the text page size.
+async function seedPages(forumDir) {
+  const forum = createForum({ forumDir })
+  const { topic, message: kickoff } = await forum.createTopic({ title: 'Release plan', author: 'ralph', body: 'Kickoff' })
+  for (let i = 2; i <= 22; i++) await forum.createTopic({ title: `Topic ${String(i).padStart(2, '0')}`, author: 'sam' })
+  const { topic: quiet } = await forum.createTopic({ title: `Quiet\x1b[2J ${BIDI}`, author: 'sam' })
+  for (let i = 1; i <= 20; i++) await forum.postMessage({ topicId: topic.id, author: 'sam', body: `Update ${i}\nmore` })
+  const long = await forum.postMessage({ topicId: topic.id, author: 'ralph', body: LONG_BODY, replyTo: kickoff.id })
+  const topics = [await forum.listTopics({ limit: 20 })]
+  topics.push(await forum.listTopics({ after: topics[0].next_cursor, limit: 20 }))
+  const messages = [await forum.listMessages({ topicId: topic.id, limit: 20 })]
+  messages.push(await forum.listMessages({ topicId: topic.id, after: messages[0].next_cursor, limit: 20 }))
+  const all = [await forum.listMessages({ limit: 20 })]
+  all.push(await forum.listMessages({ after: all[0].next_cursor, limit: 20 }))
+  return { topic, kickoff, quiet, long, topics, messages, all }
+}
+
+// The /forum text results expected for those pages, line by line: a heading, the directory and
+// whether agents use it, the rows, then a copyable next-page command or the end of the list.
+const shownText = (text) => BIDI_CONTROLS.reduce((shown, code) => shown.replaceAll(String.fromCodePoint(code), shownCode(code)), text.replaceAll('\x1b', '␛'))
+const targetLines = (forumDir, { origin = 'supplied PI_FORUM_DIR', on = true } = {}) => [
+  `Forum directory: ${forumDir} (${origin})`,
+  on ? 'Forum is on for agents.' : 'Forum is off for agents; reading does not turn it on.',
+]
+const topicRows = (items) => items.flatMap((t, i) => [`${i + 1}. ${shownText(t.title)}`, `   Topic ${t.id} · by ${t.created_by} · ${t.created_at}`])
+const messageRows = (items) =>
+  items.flatMap((m, i) => [
+    `${i + 1}. ${m.author} · ${m.created_at}`,
+    `   Message ${m.id} · topic ${m.topic_id}${m.reply_to ? ` · reply to ${m.reply_to}` : ''}`,
+    `   ${m.body.includes('\n') ? `${m.body.split('\n')[0]}…` : m.body}`,
+  ])
+function listText({ heading, after, target, rows, empty, next }) {
+  const paging = next ? `20 shown; there may be more. Next page: ${next}` : 'You are caught up.'
+  return [`${heading} · ${after ? `after cursor ${after}` : 'from the start'}`, ...target, '', ...(rows.length ? rows : [empty]), '', paging].join('\n')
+}
+function messageText({ target, message, lines }) {
+  const fields = [`Message: ${message.id}`, `Topic: ${message.topic_id}`, `Author: ${message.author}`, `Created: ${message.created_at}`]
+  if (message.reply_to) fields.push(`Reply to: ${message.reply_to}`)
+  return ['Forum message', ...target, '', ...fields, '', `Body (${lines.length} line${lines.length === 1 ? '' : 's'}):`, ...lines].join('\n')
+}
+
+// The entries pi-forum appended for text results.
+const outputs = (session) => session.sessionManager.getEntries().filter((entry) => entry.type === 'custom' && entry.customType === ENTRY_TYPE)
+
 // Complete records of another topic, about size bytes, so a full scan takes many chunk reads.
 function filler(size) {
   const line = `${JSON.stringify({ type: 'message_posted', id: 'filler', topic_id: 'filler-topic', author: 'f', body: 'x'.repeat(900), created_at: '2026-01-01T00:00:00.000Z' })}\n`
@@ -398,13 +487,19 @@ else describe('real Pi host', () => {
           assert.deepEqual([...extension.handlers.keys()].sort(), ['before_agent_start', 'session_shutdown', 'session_start'])
           assert.equal(extension.tools.size, 0)
           assert.deepEqual([...extension.commands.keys()], ['forum'])
+          assert.deepEqual([...extension.entryRenderers.keys()], [ENTRY_TYPE])
+          assert.equal(typeof host.runtime.session.extensionRunner.getEntryRenderer(ENTRY_TYPE), 'function')
           const command = host.runtime.session.extensionRunner.getCommand('forum')
           assert.ok(command, 'Pi resolves /forum')
           assert.match(command.description, /on or off/)
+          assert.match(command.description, /as text, or browse them with \/forum ui$/)
           const complete = (prefix) => command.getArgumentCompletions(prefix).map((item) => item.value)
-          assert.deepEqual(complete(''), ['on', 'off', 'status', 'topics', 'messages', 'read'])
+          assert.deepEqual(complete(''), ['on', 'off', 'status', 'topics', 'messages', 'read', 'ui'])
           assert.deepEqual(complete('o'), ['on', 'off'])
           assert.deepEqual(complete('st'), ['status'])
+          assert.deepEqual(complete('u'), ['ui'])
+          assert.deepEqual(complete('ui '), ['ui topics', 'ui messages', 'ui read'])
+          assert.deepEqual(complete('ui m'), ['ui messages'])
           assert.deepEqual(complete('x'), [])
           assert.deepEqual(host.errors, [])
         } finally {
@@ -620,10 +715,16 @@ else describe('real Pi host', () => {
         const leaf = host.runtime.session.sessionManager.getLeafId()
         const secondUser = host.runtime.session.sessionManager.getEntry(leaf).parentId
 
-        // Invalid arguments are case-sensitive and only produce the usage warning.
-        for (const text of ['/forum ON', '/forum Off', '/forum bogus', '/forum on now', '/forum --help']) {
+        // Invalid arguments are case-sensitive and only produce the usage warning, for text reads and
+        // the browser too.
+        const invalid = ['/forum ON', '/forum Off', '/forum bogus', '/forum on now', '/forum --help', '/forum UI', '/forum ui bogus']
+        invalid.push('/forum ui topics extra', '/forum ui read', '/forum ui topics --after x', '/forum read', '/forum read a b')
+        invalid.push('/forum read a --after x', '/forum topics extra', '/forum topics --after', '/forum topics --after=', '/forum topics --limit 5')
+        invalid.push('/forum messages a b', '/forum messages --after x --after y')
+        for (const text of invalid) {
           assert.deepEqual(await slash(host, text), [warning(USAGE)], text)
         }
+        assert.deepEqual(outputs(host.runtime.session), [])
         assert.deepEqual({ ...process.env }, env)
 
         // Off removes the generated binding and the PATH entry, and the forum section from later prompts.
@@ -782,6 +883,12 @@ else describe('real Pi host', () => {
           assert.deepEqual(await command('/forum off'), ['Forum is off.'])
           assert.deepEqual(await command('/forum on'), [unavailable])
           assert.deepEqual(await command('/forum bad'), [USAGE])
+          // Nothing was ever selected, so there is nothing to read, as text or in the browser.
+          const unselected = 'No forum is selected in this session. The forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative/forum". Run /forum on to select one, then read it.'
+          for (const text of ['/forum topics', '/forum messages', '/forum read some-id', '/forum ui', '/forum ui read some-id']) {
+            assert.deepEqual(await command(text), [unselected], text)
+          }
+          assert.deepEqual(outputs(host.runtime.session), [])
           assert.deepEqual({ ...process.env }, env)
         } finally {
           await host.runtime.dispose()
@@ -934,7 +1041,7 @@ else describe('real Pi host', () => {
 
             // Topics -> messages -> complete body and back, while the run keeps streaming and
             // the renderer keeps drawing it behind the focused overlay.
-            let { pending } = await browse('/forum topics', 'Forum · Topics · page 1')
+            let { pending } = await browse('/forum ui', 'Forum · Topics · page 1')
             assert.match(ui.screen(), /Forum is on for agents/)
             ui.setMark()
             calls[0].delta(' second')
@@ -962,7 +1069,7 @@ else describe('real Pi host', () => {
             // Off: the selected forum stays browsable and the forum stays off.
             await session.prompt('/forum off')
             const offEnv = { ...process.env }
-            pending = (await browse(`/forum messages ${topic.id}`, `Forum · Messages in topic ${topic.id} · page 1`)).pending
+            pending = (await browse(`/forum ui messages ${topic.id}`, `Forum · Messages in topic ${topic.id} · page 1`)).pending
             assert.match(ui.screen(), /Forum is off for agents; browsing only/)
             ui.setMark()
             calls[0].delta(' third')
@@ -979,7 +1086,7 @@ else describe('real Pi host', () => {
             // Esc during a slow first read cancels only that read: the log is closed early.
             const trace = slowReads(t, path.join(shared, 'events.jsonl'))
             await fs.appendFile(path.join(shared, 'events.jsonl'), filler(4 * 1024 * 1024))
-            pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+            pending = (await browse('/forum ui messages no-such-topic', 'loading…')).pending
             await until(() => trace.reads.length > 0, 'the scan to start')
             await close(pending)
             await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close')
@@ -996,11 +1103,11 @@ else describe('real Pi host', () => {
             process.env.PI_FORUM_DIR = elsewhere
             const driftEnv = { ...process.env }
             ui.notices.length = 0
-            pending = (await browse(`/forum read ${long.id}`, 'From sam')).pending
+            pending = (await browse(`/forum ui read ${long.id}`, 'From sam')).pending
             assert.deepEqual(ui.notices, [
               {
                 type: 'warning',
-                message: `Warning: the forum is unavailable (PI_FORUM_DIR changed from ${JSON.stringify(shared)} to ${JSON.stringify(elsewhere)}); browsing the last selected directory. Forum directory: ${shared} (supplied PI_FORUM_DIR).`,
+                message: `Forum directory: ${shared} (supplied PI_FORUM_DIR)\nWarning: the forum is unavailable (PI_FORUM_DIR changed from ${JSON.stringify(shared)} to ${JSON.stringify(elsewhere)}); reading the last selected directory.`,
               },
             ])
             assert.match(ui.screen(), /Unavailable: PI_FORUM_DIR changed/)
@@ -1041,11 +1148,225 @@ else describe('real Pi host', () => {
         })
       }
 
-      test('the terminal browser reads only the selected target: none, missing storage, a pinned symlink, a fresh reselection', { timeout: 60000 }, async (t) => {
+      // Text reads in the terminal UI while an agent run streams. Each success is one custom entry
+      // that Pi draws through pi-forum's entry renderer (see createTerminalUI) and nothing else:
+      // no notification, message, model change, turn or queued input.
+      test('text reads during a streaming agent run add one rendered entry each and leave the run alone', { timeout: 60000 }, async (t) => {
         const { dir } = pkg()
-        const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, {})
+        const shared = path.join(temp, `text forum ${variant}`)
+        const seeded = await seedPages(shared)
+        const { topic, quiet, long, topics, messages, all } = seeded
+        const target = targetLines(shared)
+        let extensionAborts = 0
+        const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, {
+          columns: 300,
+          onEditorEscape: () => assert.fail('Esc reached the editor, where it would abort the agent'),
+        })
+        const host = await openHost(dir, { supplied: shared, uiContext: ui.ui, uiMode: 'tui', abortHandler: () => extensionAborts++, synthetic: true })
+        const { session } = host.runtime
+        const sessionAborts = t.mock.method(session, 'abort')
+        const calls = installSyntheticProvider(piAi.createAssistantMessageEventStream)
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') ui.showStreamed(event.assistantMessageEvent.delta)
+        })
+        const unfollow = ui.follow(session)
+        const events = []
+        const unrecord = session.subscribe((event) => events.push(event.type))
+        try {
+          await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held'))
+          let settled = false
+          const run = session.prompt('Plan the release.').finally(() => {
+            settled = true
+          })
+          await until(() => calls.length === 1 && session.isStreaming, 'the synthetic run to start')
+          calls[0].delta('first')
+          await until(() => ui.screen().includes('assistant: first'), 'the first delta to render')
+          const state = () => ({
+            messages: session.messages.length,
+            steering: session.getSteeringMessages().length,
+            followUp: session.getFollowUpMessages().length,
+            pending: session.pendingMessageCount,
+            systemPrompt: session.systemPrompt,
+            model: `${session.model?.provider}/${session.model?.id}`,
+            thinking: session.thinkingLevel,
+            starts: host.probe.starts,
+            requests: calls.length,
+            env: { ...process.env },
+          })
+          const baseline = state()
+          const entriesBefore = session.sessionManager.getEntries().length
+          const stillRunning = () => {
+            assert.deepEqual(state(), baseline)
+            assert.equal(settled, false)
+            assert.equal(session.isStreaming, true)
+            assert.equal(calls[0].aborted, false)
+          }
+          // A successful read: exactly one entry, its data only the text, drawn whole and unstyled
+          // although collapsed, and no notification.
+          const read = async (command, expected) => {
+            ui.notices.length = 0
+            events.length = 0
+            const before = session.sessionManager.getEntries().length
+            const shown = ui.entries.length
+            await session.prompt(command)
+            const added = session.sessionManager.getEntries().slice(before)
+            assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
+            assert.deepEqual(added[0].data, { text: expected }, command)
+            assert.deepEqual(events, ['entry_appended'], command)
+            assert.deepEqual(ui.notices, [], command)
+            assert.equal(ui.entries.length, shown + 1)
+            assert.equal(ui.entries.at(-1).entry.id, added[0].id)
+            const raw = ui.entries.at(-1).component.render(300)
+            for (const line of raw) assert.doesNotMatch(line, /\x1b/)
+            assert.deepEqual(ui.entryLines(), expected.split('\n').map((line) => ` ${line}`.trimEnd()), command)
+            await until(() => ui.shows(expected.split('\n').at(-1)) && ui.screen().includes('assistant: first'), `${command} to show its last line above the streamed text`, { detail: ui.screen })
+            stillRunning()
+            return expected
+          }
+          // A read that fails: one notification, nothing appended.
+          const fails = async (command, notice) => {
+            ui.notices.length = 0
+            const before = session.sessionManager.getEntries().length
+            await session.prompt(command)
+            assert.deepEqual(ui.notices, [notice], command)
+            assert.equal(session.sessionManager.getEntries().length, before, command)
+            stillRunning()
+          }
+
+          // Topics: a full first page ends with the command for the next page, which reads only the
+          // rest; repeating the first command reads the first page again, not the next one.
+          assert.equal(topics[0].items.length, 20)
+          const nextTopics = `/forum topics --after ${topics[0].next_cursor}`
+          const first = await read('/forum topics', listText({ heading: 'Forum topics', target, rows: topicRows(topics[0].items), next: nextTopics }))
+          assert.equal(first.split('\n').at(-1).match(/Next page: (.+)$/)[1], nextTopics)
+          await read(nextTopics, listText({ heading: 'Forum topics', after: topics[0].next_cursor, target, rows: topicRows(topics[1].items) }))
+          assert.equal(topics[1].items.at(-1).id, quiet.id)
+          assert.equal(await read('/forum topics', first), first)
+          await read(`/forum topics --after=${topics[1].next_cursor}`, listText({ heading: 'Forum topics', after: topics[1].next_cursor, target, rows: [], empty: 'No newer topics.' }))
+          calls[0].delta(' second')
+          await until(() => ui.screen().includes('assistant: first second'), 'a delta to render after text reads')
+
+          // Messages in a topic and across the forum, paged the same way; --after=CURSOR works too.
+          const inTopic = `Forum messages in topic ${topic.id}`
+          const nextMessages = `/forum messages ${topic.id} --after ${messages[0].next_cursor}`
+          await read(`/forum messages ${topic.id}`, listText({ heading: inTopic, target, rows: messageRows(messages[0].items), next: nextMessages }))
+          await read(`/forum messages ${topic.id} --after=${messages[0].next_cursor}`, listText({ heading: inTopic, after: messages[0].next_cursor, target, rows: messageRows(messages[1].items) }))
+          const nextAll = `/forum messages --after ${all[0].next_cursor}`
+          await read('/forum messages', listText({ heading: 'Forum messages across all topics', target, rows: messageRows(all[0].items), next: nextAll }))
+          await read(nextAll, listText({ heading: 'Forum messages across all topics', after: all[0].next_cursor, target, rows: messageRows(all[1].items) }))
+          await read(`/forum messages ${quiet.id}`, listText({ heading: `Forum messages in topic ${quiet.id}`, target, rows: [], empty: 'No messages yet.' }))
+
+          // A message: all of its metadata and its complete body, Markdown literal, controls visible.
+          await read(`/forum read ${long.id}`, messageText({ target, message: long, lines: LONG_LINES }))
+
+          // Unusable cursors and IDs are explained, with the command that starts over.
+          const other = path.join(temp, `other forum ${variant}`)
+          await createForum({ forumDir: other }).createTopic({ title: 'Elsewhere', author: 'x' })
+          const foreign = (await createForum({ forumDir: other }).listTopics({})).next_cursor
+          await fails('/forum topics --after not-a-cursor', { type: 'error', message: `Could not read ${shared}: cursor is not valid. Run /forum topics to start from the first page.` })
+          await fails(`/forum messages ${topic.id} --after ${foreign}`, {
+            type: 'error',
+            message: `Could not read ${shared}: cursor belongs to a different forum. Run /forum messages ${topic.id} to start from the first page.`,
+          })
+          await fails(`/forum messages --after=${foreign}`, { type: 'error', message: `Could not read ${shared}: cursor belongs to a different forum. Run /forum messages to start from the first page.` })
+          await fails('/forum read no-such-message', { type: 'error', message: `Could not read ${shared}: message no-such-message not found.` })
+
+          // The browser and a text read at once: the read lands behind the focused overlay, which
+          // keeps its view and focus.
+          ui.notices.length = 0
+          const browsing = session.prompt('/forum ui')
+          await until(() => ui.overlayFocused() && ui.shows('› Release plan'), 'the browser to open', { detail: ui.screen })
+          const entries = session.sessionManager.getEntries().length
+          await session.prompt(`/forum read ${long.id}`)
+          assert.deepEqual(outputs(session).at(-1).data, { text: messageText({ target, message: long, lines: LONG_LINES }) })
+          assert.equal(session.sessionManager.getEntries().length, entries + 1)
+          assert.ok(ui.overlayFocused())
+          await until(() => ui.shows('Forum · Topics · page 1') && ui.shows('› Release plan'), 'the browser to keep its view', { detail: ui.screen })
+          ui.type('\x1b')
+          assert.equal(await browsing, undefined)
+          assert.equal(ui.tui.getFocusedComponent(), ui.editor)
+          assert.deepEqual(ui.notices, [])
+          stillRunning()
+
+          // One text read at a time; a reselection drops a slow read's late result or error.
+          const log = path.join(shared, 'events.jsonl')
+          await fs.appendFile(log, filler(4 * 1024 * 1024))
+          let trace = slowReads(t, log)
+          // Both scan the whole log: one would succeed with an empty page, the other fail.
+          for (const slow of ['/forum messages no-such-topic', '/forum read no-such-message']) {
+            ui.notices.length = 0
+            const before = session.sessionManager.getEntries().length
+            const pending = session.prompt(slow)
+            await until(() => trace.reads.length > 0, `${slow} to start reading`)
+            await session.prompt('/forum topics')
+            assert.deepEqual(ui.notices, [warning('A forum read is still running; wait for it to finish before starting another.')])
+            await session.prompt('/forum off')
+            await session.prompt('/forum on')
+            await pending
+            await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close after reselection')
+            await new Promise((resolve) => setTimeout(resolve, 100))
+            assert.deepEqual(ui.notices.map((notice) => [notice.type, notice.message.split(' ').slice(0, 3).join(' ')]).slice(1), [['info', 'Forum is off.'], ['info', 'Forum is on:']], slow)
+            assert.equal(session.sessionManager.getEntries().length, before, slow)
+            assert.ok(trace.reads.length < 64, `${trace.reads.length} reads of a 64-chunk log`)
+            trace.reads.length = 0
+            trace.handles.length = 0
+          }
+          trace.restore()
+          await read(`/forum messages ${quiet.id}`, listText({ heading: `Forum messages in topic ${quiet.id}`, target, rows: [], empty: 'No messages yet.' }))
+
+          // Released, the run completes with every delta from its one request; the forum added only
+          // its entries.
+          calls[0].delta(' done')
+          calls[0].finish()
+          await run
+          const reply = session.messages.at(-1)
+          assert.equal(reply.stopReason, 'stop')
+          assert.deepEqual(reply.content, [{ type: 'text', text: 'first second done' }])
+          const added = session.sessionManager.getEntries().slice(entriesBefore)
+          const texts = added.filter((entry) => entry.type === 'custom')
+          assert.deepEqual(added.map((entry) => entry.type), [...texts.map(() => 'custom'), 'message'])
+          assert.ok(texts.every((entry) => entry.customType === ENTRY_TYPE))
+          assert.equal(texts.length, 12)
+          assert.equal(session.sessionManager.getEntries().filter((entry) => entry.type === 'custom_message').length, 0)
+          assert.equal(session.messages.length, baseline.messages + 1)
+          assert.ok(session.messages.every((message) => !JSON.stringify(message).includes('Forum topics ·')))
+          assert.deepEqual([session.getSteeringMessages(), session.getFollowUpMessages()], [[], []])
+          assert.equal(host.probe.starts, baseline.starts)
+          assert.equal(calls.length, 1)
+          assert.equal(calls[0].aborted, false)
+          assert.equal(extensionAborts, 0)
+          assert.equal(sessionAborts.mock.callCount(), 0)
+          assert.equal(ui.editor.escapes, 0)
+          assert.equal(ui.customs.length, 1)
+        } finally {
+          for (const call of calls) if (!call.finished && !call.aborted) call.finish()
+          unrecord()
+          unfollow()
+          unsubscribe()
+          ui.stop()
+          await host.runtime.dispose()
+        }
+        assert.deepEqual(host.errors, [])
+      })
+
+      test('text reads and the browser read only the selected target: none, missing storage, a shared pinned symlink, a fresh reselection', { timeout: 60000 }, async (t) => {
+        const { dir } = pkg()
+        const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, { columns: 200 })
         const host = await openHost(dir, { uiContext: ui.ui, uiMode: 'tui' })
         const { session } = host.runtime
+        const unfollow = ui.follow(session)
+        // A text read: its one entry's text, or null after checking that it added nothing.
+        const text = async (command) => {
+          ui.notices.length = 0
+          const before = session.sessionManager.getEntries().length
+          await session.prompt(command)
+          const added = session.sessionManager.getEntries().slice(before)
+          if (added.length === 0) return null
+          assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
+          assert.deepEqual(ui.notices, [], command)
+          assert.equal(ui.entries.at(-1).entry.id, added[0].id)
+          return added[0].data.text
+        }
         const browse = async (text, shown) => {
           ui.setMark()
           const pending = session.prompt(text)
@@ -1060,31 +1381,55 @@ else describe('real Pi host', () => {
         }
         let disposed = false
         try {
-          // Startup without a selection: guidance only, no overlay, no default directory.
+          // Startup without a selection: guidance only, no overlay, no entry, no default directory.
           const env = { ...process.env }
-          await session.prompt('/forum topics')
-          assert.deepEqual(ui.notices, [{ type: 'warning', message: 'No forum is selected in this session. Run /forum on to select one, then browse it.' }])
+          const unselected = { type: 'warning', message: 'No forum is selected in this session. Run /forum on to select one, then read it.' }
+          await session.prompt('/forum ui topics')
+          assert.deepEqual(ui.notices, [unselected])
+          for (const command of ['/forum topics', '/forum messages', '/forum read some-id']) {
+            assert.equal(await text(command), null)
+            assert.deepEqual(ui.notices, [unselected], command)
+          }
           assert.deepEqual(ui.customs, [])
+          assert.deepEqual(outputs(session), [])
           assert.deepEqual({ ...process.env }, env)
           await assert.rejects(fs.access(path.join(host.agentDir, 'forums')), { code: 'ENOENT' })
 
-          // Activation initializes an empty forum; browsing still creates no files.
+          // Activation initializes an empty forum; reading it still creates no files.
           await session.prompt('/forum on')
           const generated = host.defaultDir(host.sessionId)
-          let { pending } = await browse('/forum topics', 'No topics yet.')
+          const target = targetLines(generated, { origin: 'session default' })
+          assert.equal(await text('/forum topics'), listText({ heading: 'Forum topics', target, rows: [], empty: 'No topics yet.' }))
+          assert.equal(await text('/forum messages'), listText({ heading: 'Forum messages across all topics', target, rows: [], empty: 'No messages yet.' }))
+          assert.equal(await text('/forum messages some-topic'), listText({ heading: 'Forum messages in topic some-topic', target, rows: [], empty: 'No messages yet.' }))
+          assert.equal(await text('/forum read some-id'), null)
+          assert.deepEqual(ui.notices, [{ type: 'error', message: `Could not read ${generated}: message some-id not found.` }])
+          let { pending } = await browse('/forum ui topics', 'No topics yet.')
           assert.doesNotMatch(ui.screen(), /FORUM_UNAVAILABLE/)
           await close(pending)
           assert.deepEqual(await fs.readdir(generated), [])
+          // Off keeps the selection readable, saying the forum is off.
+          await session.prompt('/forum off')
+          const off = targetLines(generated, { origin: 'session default', on: false })
+          assert.equal(await text('/forum topics'), listText({ heading: 'Forum topics', target: off, rows: [], empty: 'No topics yet.' }))
+          await session.prompt('/forum on')
 
-          // A directory removed after activation is reported, not recreated by browsing.
+          // A directory removed after activation is reported, not recreated by reading.
           await fs.rm(path.join(host.agentDir, 'forums'), { recursive: true })
-          pending = (await browse('/forum topics', 'FORUM_UNAVAILABLE')).pending
+          for (const command of ['/forum topics', '/forum messages', '/forum read some-id']) {
+            assert.equal(await text(command), null)
+            assert.equal(ui.notices.length, 1, command)
+            assert.equal(ui.notices[0].type, 'error')
+            assert.ok(ui.notices[0].message.startsWith(`Could not read ${generated}: forum directory ${generated} is unavailable: ENOENT`), ui.notices[0].message)
+          }
+          pending = (await browse('/forum ui topics', 'FORUM_UNAVAILABLE')).pending
           assert.match(ui.screen(), /ENOENT/)
           assert.match(ui.screen(), /r retry/)
           await close(pending)
           await assert.rejects(fs.access(path.join(host.agentDir, 'forums')), { code: 'ENOENT' })
 
-          // A supplied symlink: the browser pins where it first resolved until a fresh selection.
+          // A supplied symlink: text reads and the browser share one client, pinned where it first
+          // resolved until a fresh selection, whichever of them read first.
           const a = path.join(temp, `pinned a ${variant}`)
           const b = path.join(temp, `pinned b ${variant}`)
           const link = path.join(temp, `pinned link ${variant}`)
@@ -1093,23 +1438,40 @@ else describe('real Pi host', () => {
           await fs.symlink(a, link)
           process.env.PI_FORUM_DIR = link
           await session.prompt('/forum on')
-          pending = (await browse('/forum topics', 'In A')).pending
+          const resolvedTo = (real) => `Forum directory: ${link} (supplied PI_FORUM_DIR), resolved to ${real}`
+          let shown = await text('/forum topics')
+          assert.equal(shown.split('\n')[1], resolvedTo(a))
+          assert.match(shown, /\n1\. In A\n/)
+          pending = (await browse('/forum ui topics', 'In A')).pending
           await close(pending)
           await fs.rm(link)
           await fs.symlink(b, link)
-          pending = (await browse('/forum topics', 'now resolves to')).pending
+          pending = (await browse('/forum ui topics', 'now resolves to')).pending
           assert.doesNotMatch(ui.screen(), /In B/)
           await close(pending)
+          assert.equal(await text('/forum topics'), null)
+          assert.deepEqual(ui.notices, [{ type: 'error', message: `Could not read ${link}: forum directory ${link} now resolves to ${b}, not ${a}; select the forum again to use it.` }])
           await session.prompt('/forum off')
           await session.prompt('/forum on')
-          pending = (await browse('/forum topics', 'In B')).pending
+          pending = (await browse('/forum ui', 'In B')).pending
           await close(pending)
+          shown = await text('/forum topics')
+          assert.equal(shown.split('\n')[1], resolvedTo(b))
+          assert.match(shown, /\n1\. In B\n/)
+          await fs.rm(link)
+          await fs.symlink(a, link)
+          assert.equal(await text('/forum topics'), null)
+          assert.deepEqual(ui.notices, [{ type: 'error', message: `Could not read ${link}: forum directory ${link} now resolves to ${a}, not ${b}; select the forum again to use it.` }])
+          pending = (await browse('/forum ui', 'now resolves to')).pending
+          await close(pending)
+          await fs.rm(link)
+          await fs.symlink(b, link)
 
           // Reselection during a slow read closes the browser; off alone leaves it open.
           const log = path.join(b, 'events.jsonl')
           await fs.appendFile(log, filler(4 * 1024 * 1024))
           let trace = slowReads(t, log)
-          pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+          pending = (await browse('/forum ui messages no-such-topic', 'loading…')).pending
           const notices = ui.notices.length
           await session.prompt('/forum off')
           assert.notEqual(ui.component, null)
@@ -1121,31 +1483,64 @@ else describe('real Pi host', () => {
           assert.deepEqual(ui.notices.slice(notices).map((notice) => notice.message.split(' ').slice(0, 3).join(' ')), ['Forum is off.', 'Forum is on:'])
           trace.restore()
 
-          // Shutdown during a slow read closes it too, without later notifications.
+          // Shutdown during slow reads, in the browser and as text, closes both without a later
+          // notification or entry.
           trace = slowReads(t, log)
-          pending = (await browse('/forum messages no-such-topic', 'loading…')).pending
+          pending = (await browse('/forum ui messages no-such-topic', 'loading…')).pending
+          await until(() => trace.reads.length > 0, 'the browser to start reading')
+          const opened = trace.handles.length
+          const reading = session.prompt('/forum messages no-such-topic')
+          await until(() => trace.handles.length > opened, 'the text read to start too')
           const before = ui.notices.length
+          const entries = session.sessionManager.getEntries().length
+          const shownEntries = ui.entries.length
           disposed = true
           await host.runtime.dispose()
           assert.equal(await pending, undefined)
+          assert.equal(await reading, undefined)
           assert.equal(ui.component, null)
           await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close after shutdown')
           await new Promise((resolve) => setTimeout(resolve, 100))
           assert.equal(ui.notices.length, before)
+          assert.equal(session.sessionManager.getEntries().length, entries)
+          assert.equal(ui.entries.length, shownEntries)
+          assert.ok(trace.reads.length < 64, `${trace.reads.length} reads of a 64-chunk log`)
           trace.restore()
         } finally {
+          unfollow()
           ui.stop()
           if (!disposed) await host.runtime.dispose()
         }
         assert.deepEqual(host.errors, [])
       })
 
-      test('RPC and JSON modes report the target and command, never open custom UI and write nothing to stdout', { timeout: 60000 }, async (t) => {
+      test('RPC, print and JSON modes report each text result once and record it as one entry; /forum ui points to the text command', { timeout: 60000 }, async (t) => {
         const { dir } = pkg()
         const shared = path.join(temp, `text mode forum ${variant}`)
-        const { long } = await seedForum(shared)
-        const command = `PI_FORUM_DIR='${shared}' ${path.join(dir, 'bin', 'pi-forum')} topic list`
-        const expected = `Forum directory: ${shared} (supplied PI_FORUM_DIR). The forum browser needs the terminal UI; run: ${command}`
+        const { topic, long } = await seedForum(shared)
+        const other = (await createForum({ forumDir: shared }).listTopics({})).items[1]
+        const reader = createForum({ forumDir: shared })
+        const target = targetLines(shared)
+        const results = {
+          topics: listText({ heading: 'Forum topics', target, rows: topicRows((await reader.listTopics({})).items) }),
+          messages: listText({ heading: `Forum messages in topic ${topic.id}`, target, rows: messageRows((await reader.listMessages({ topicId: topic.id })).items) }),
+          empty: listText({ heading: `Forum messages in topic ${other.id}`, target, rows: [], empty: 'No messages yet.' }),
+          read: messageText({ target, message: long, lines: long.body.split('\n') }),
+        }
+        const reads = [
+          ['/forum topics', results.topics],
+          [`/forum messages ${topic.id}`, results.messages],
+          [`/forum messages ${other.id}`, results.empty],
+          [`/forum read ${long.id}`, results.read],
+        ]
+        const browserNeeded = (command) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
+        const guided = [
+          ['/forum ui', browserNeeded('/forum topics')],
+          ['/forum ui topics', browserNeeded('/forum topics')],
+          [`/forum ui messages ${topic.id}`, browserNeeded(`/forum messages ${topic.id}`)],
+          ['/forum ui messages', browserNeeded('/forum messages')],
+          [`/forum ui read ${long.id}`, browserNeeded(`/forum read ${long.id}`)],
+        ]
         // Records what anyone writes to stdout as text; the test runner's own binary frames pass.
         const captureStdout = async (fn) => {
           const written = []
@@ -1161,34 +1556,305 @@ else describe('real Pi host', () => {
           }
           return written
         }
+        const stderr = t.mock.method(console, 'error', () => {})
 
+        for (const mode of ['rpc', 'print', 'json']) {
+          const notices = []
+          const rpcUI = new Proxy(
+            { notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') },
+            { get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined) },
+          )
+          const host = await openHost(dir, { supplied: shared, uiMode: mode, ...(mode === 'rpc' && { uiContext: rpcUI }) })
+          const { session } = host.runtime
+          // RPC has a UI, so feedback is notified; print and JSON have none and write it to stderr.
+          const feedback = () => {
+            if (mode === 'rpc') return notices.splice(0)
+            const written = stderr.mock.calls.map((call) => ({ type: 'info', message: call.arguments.join(' ') }))
+            stderr.mock.resetCalls()
+            return written
+          }
+          try {
+            stderr.mock.resetCalls()
+            const messages = session.messages.length
+            const written = await captureStdout(async () => {
+              for (const [command, expected] of reads) {
+                const before = session.sessionManager.getEntries().length
+                const appended = []
+                const unsubscribe = session.subscribe((event) => appended.push(event))
+                await session.prompt(command)
+                unsubscribe()
+                const added = session.sessionManager.getEntries().slice(before)
+                assert.deepEqual(added.map((entry) => [entry.type, entry.customType, entry.data]), [['custom', ENTRY_TYPE, { text: expected }]], `${mode} ${command}`)
+                assert.deepEqual(appended, [{ type: 'entry_appended', entry: added[0] }], `${mode} ${command}`)
+                assert.deepEqual(feedback(), [info(expected)], `${mode} ${command}`)
+              }
+              for (const [command, expected] of guided) {
+                const before = session.sessionManager.getEntries().length
+                await session.prompt(command)
+                assert.equal(session.sessionManager.getEntries().length, before, `${mode} ${command}`)
+                assert.deepEqual(feedback(), [info(expected)], `${mode} ${command}`)
+              }
+            })
+            assert.deepEqual(written, [], mode)
+            assert.equal(session.messages.length, messages)
+            assert.equal(session.sessionManager.getEntries().filter((entry) => entry.type === 'custom_message').length, 0)
+            assert.equal(outputs(session).length, reads.length)
+          } finally {
+            await host.runtime.dispose()
+          }
+          assert.deepEqual(host.errors, [])
+        }
+      })
+
+      test('emitted guidance, next-page and restart commands reach imported IDs starting with "-" exactly', { timeout: 60000 }, async () => {
+        const { dir } = pkg()
+        const shared = path.join(temp, `imported forum ${variant}`)
+        // Three imported topics of 21 messages each; some message IDs start with "-" too.
+        const special = { '-odd': ['--after=y', '--', '-m'], '--after=x': [], '--': [] }
+        const posted = {}
+        const records = []
+        let clock = 0
+        const at = () => new Date(Date.UTC(2026, 0, 1, 0, 0, clock++)).toISOString()
+        for (const [topicId, ids] of Object.entries(special)) {
+          records.push({ type: 'topic_created', id: topicId, title: `Topic ${topicId} ${BIDI}`, created_by: 'imp', created_at: at() })
+          posted[topicId] = Array.from({ length: 21 }, (_, i) => ids[i] ?? `${topicId}#${i}`)
+          for (const id of posted[topicId]) records.push({ type: 'message_posted', id, topic_id: topicId, author: 'imp', body: `${id} ${BIDI}`, created_at: at() })
+        }
+        await importRecords(shared, records)
         const notices = []
         const rpcUI = new Proxy(
           { notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') },
           { get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined) },
         )
-        let host = await openHost(dir, { supplied: shared, uiContext: rpcUI, uiMode: 'rpc' })
+        const host = await openHost(dir, { supplied: shared, uiMode: 'rpc', uiContext: rpcUI })
+        const { session } = host.runtime
+        const messages = session.messages.length
+        // A successful read: exactly one entry holding the text, and the same text notified.
+        const read = async (command) => {
+          notices.length = 0
+          const before = session.sessionManager.getEntries().length
+          await session.prompt(command)
+          const added = session.sessionManager.getEntries().slice(before)
+          assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
+          assert.deepEqual(notices, [info(added[0].data.text)], command)
+          assert.doesNotMatch(added[0].data.text, RAW_TEXT, command)
+          return added[0].data.text
+        }
+        const feedback = async (command) => {
+          notices.length = 0
+          const before = session.sessionManager.getEntries().length
+          await session.prompt(command)
+          assert.equal(session.sessionManager.getEntries().length, before, command)
+          assert.equal(notices.length, 1, command)
+          return notices[0]
+        }
+        const guidance = async (command) => (await feedback(command)).message.match(/read it as text with: (.+)$/)[1]
+        const ids = (text) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
         try {
-          const written = await captureStdout(async () => {
-            await host.runtime.session.prompt('/forum topics')
-            await host.runtime.session.prompt(`/forum read ${long.id}`)
-          })
-          assert.deepEqual(written, [])
-          assert.deepEqual(notices[0], { type: 'info', message: expected })
-          assert.match(notices[1].message, new RegExp(`message get -- ${long.id}$`))
+          let entries = 0
+          for (const topicId of Object.keys(special)) {
+            const command = await guidance(`/forum ui messages ${topicId}`)
+            assert.equal(command, `/forum messages -- ${topicId}`)
+            const first = await read(command)
+            assert.ok(first.startsWith(`Forum messages in topic ${topicId} · from the start\n`), first)
+            assert.deepEqual(ids(first), posted[topicId].slice(0, 20))
+            assert.ok(first.includes(`   ${posted[topicId][0]} ${BIDI_SHOWN}\n`), first)
+            const cursor = (await createForum({ forumDir: shared }).listMessages({ topicId, limit: 20 })).next_cursor
+            const next = first.match(/Next page: (.+)$/)[1]
+            assert.equal(next, `/forum messages --after ${cursor} -- ${topicId}`)
+            const rest = await read(next)
+            assert.deepEqual(ids(rest), posted[topicId].slice(20))
+            assert.match(rest, /\nYou are caught up\.$/)
+            const error = await feedback(`/forum messages --after ${cursor.slice(0, -2)} -- ${topicId}`)
+            assert.equal(error.type, 'error')
+            const restart = error.message.match(/Run (.+) to start from the first page\.$/)[1]
+            assert.equal(restart, command)
+            assert.equal(await read(restart), first)
+            entries += 3
+          }
+          for (const id of special['-odd']) {
+            const command = await guidance(`/forum ui read ${id}`)
+            assert.equal(command, `/forum read -- ${id}`)
+            const text = await read(command)
+            assert.ok(text.split('\n').includes(`Message: ${id}`), text)
+            assert.ok(text.endsWith(`\nBody (1 line):\n${id} ${BIDI_SHOWN}`), text)
+            entries++
+          }
+          const topics = await read('/forum topics')
+          assert.ok(topics.includes(`1. Topic -odd ${BIDI_SHOWN}\n   Topic -odd · by imp`), topics)
+          assert.equal(outputs(session).length, entries + 1)
+          assert.equal(session.sessionManager.getEntries().filter((entry) => entry.type === 'custom_message').length, 0)
+          assert.equal(session.messages.length, messages)
         } finally {
           await host.runtime.dispose()
         }
+        assert.deepEqual(host.errors, [])
+      })
 
-        const stderr = t.mock.method(console, 'error', () => {})
-        host = await openHost(dir, { supplied: shared, uiMode: 'json' })
+      test('text results replay after reload and resume once the conversation is persisted, and never create the session file', async () => {
+        const { dir } = pkg()
+        const shared = path.join(temp, `replayed forum ${variant}`)
+        const { long } = await seedForum(shared)
+        const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, { columns: 200 })
+        const host = await openHost(dir, { supplied: shared, uiContext: ui.ui, uiMode: 'tui' })
+        const unfollow = ui.follow(host.runtime.session)
+        const records = async (file) => (await fs.readFile(file, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+        // What a replay must show: the same entries, drawn the same way, through the current runtime.
+        const drawn = () => ui.entries.map(({ entry, component }) => [entry.id, component.render(200).join('\n')])
+        // The roles of the messages Pi would send the model from this session.
+        const context = () => host.runtime.session.sessionManager.buildSessionContext().messages.map((message) => message.role)
         try {
-          const written = await captureStdout(() => host.runtime.session.prompt('/forum topics'))
-          assert.deepEqual(written, [])
-          assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[expected]])
+          const file = host.runtime.session.sessionFile
+          // Before any conversation Pi keeps the session in memory; a text read does not change that.
+          await host.runtime.session.prompt('/forum topics')
+          assert.equal(outputs(host.runtime.session).length, 1)
+          await assert.rejects(fs.access(file), { code: 'ENOENT' })
+          assert.deepEqual(context(), [])
+
+          // The first exchange writes the session with the earlier entry; later ones are appended.
+          converse(host, 'question')
+          await host.runtime.session.prompt(`/forum read ${long.id}`)
+          const persisted = outputs(host.runtime.session)
+          assert.equal(persisted.length, 2)
+          assert.deepEqual((await records(file)).filter((entry) => entry.type === 'custom'), persisted)
+          assert.deepEqual(persisted.map((entry) => entry.data.text.split('\n')[0]), ['Forum topics · from the start', 'Forum message'])
+          const shown = drawn()
+          assert.deepEqual(shown.map(([id]) => id), persisted.map((entry) => entry.id))
+          assert.ok(shown[1][1].trimEnd().endsWith(' LAST LINE ✓'))
+
+          // /reload: the new runtime's renderer draws the persisted entries again; none reach the model.
+          await host.runtime.session.reload()
+          ui.replay(host.runtime.session)
+          assert.deepEqual(drawn(), shown)
+          assert.deepEqual(outputs(host.runtime.session), persisted)
+          assert.deepEqual(context(), ['user', 'assistant'])
+          assert.doesNotMatch(JSON.stringify(host.runtime.session.sessionManager.buildSessionContext()), /Forum message|Forum topics/)
+
+          // /new shows none of them; resuming the session replays them.
+          await host.runtime.newSession()
+          ui.replay(host.runtime.session)
+          assert.deepEqual(ui.entries, [])
+          await host.runtime.switchSession(file)
+          ui.replay(host.runtime.session)
+          assert.deepEqual(drawn(), shown)
+          assert.deepEqual(context(), ['user', 'assistant'])
+          assert.deepEqual((await records(file)).filter((entry) => entry.type === 'custom'), persisted)
         } finally {
+          unfollow()
+          ui.stop()
           await host.runtime.dispose()
         }
+        assert.deepEqual(host.errors, [])
+      })
+
+      // The pi executable itself, headless: the protocol Pi writes for text results in print,
+      // JSON and RPC mode. Sessions are kept, so Pi's delayed session file creation is checked too.
+      test('the pi executable in print, JSON and RPC modes writes text results to stderr or as notifications and appends one entry each', { timeout: 60000 }, async () => {
+        const { dir } = pkg()
+        const run = await fs.mkdtemp(path.join(temp, 'headless-'))
+        const paths = Object.fromEntries(['home', 'agent', 'project', 'tmp', 'sessions'].map((name) => [name, path.join(run, name)]))
+        for (const target of Object.values(paths)) await fs.mkdir(target)
+        const forumDir = path.join(run, 'forum')
+        const { topic, long } = await seedForum(forumDir)
+        // An imported topic and message whose IDs start with "-", holding every bidirectional control.
+        const imported = { id: '--after=x', topic_id: '-odd', author: 'imp', body: `${BIDI}\nsecond`, created_at: '2026-01-02T00:00:01.000Z' }
+        await importRecords(forumDir, [
+          { type: 'topic_created', id: '-odd', title: `Odd ${BIDI}`, created_by: 'imp', created_at: '2026-01-02T00:00:00.000Z' },
+          { type: 'message_posted', ...imported },
+        ])
+        const target = targetLines(forumDir)
+        const reader = createForum({ forumDir })
+        const topicsText = listText({ heading: 'Forum topics', target, rows: topicRows((await reader.listTopics({})).items) })
+        const messagesText = listText({ heading: `Forum messages in topic ${topic.id}`, target, rows: messageRows((await reader.listMessages({ topicId: topic.id })).items) })
+        const readText = messageText({ target, message: long, lines: long.body.split('\n') })
+        const oddText = listText({
+          heading: 'Forum messages in topic -odd',
+          target,
+          rows: [`1. imp · ${imported.created_at}`, '   Message --after=x · topic -odd', `   ${BIDI_SHOWN}…`],
+        })
+        const importedText = messageText({ target, message: imported, lines: [BIDI_SHOWN, 'second'] })
+        const commands = [
+          '/forum topics',
+          `/forum messages ${topic.id}`,
+          `/forum read ${long.id}`,
+          '/forum messages -- -odd',
+          '/forum read -- --after=x',
+          '/forum ui',
+          '/forum ui messages -odd',
+          '/forum',
+        ]
+        const texts = [topicsText, messagesText, readText, oddText, importedText]
+        assert.ok(topicsText.includes(`. Odd ${BIDI_SHOWN}\n   Topic -odd · by imp`))
+        for (const text of texts) assert.doesNotMatch(text, RAW_TEXT)
+        const browserNeeded = (command) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
+        const feedback = [
+          ...texts,
+          browserNeeded('/forum topics'),
+          browserNeeded('/forum messages -- -odd'),
+          `Forum is on: ${forumDir} (supplied PI_FORUM_DIR)`,
+        ]
+        const env = {
+          PATH: BASE_PATH,
+          HOME: paths.home,
+          TMPDIR: paths.tmp,
+          PI_CODING_AGENT_DIR: paths.agent,
+          PI_OFFLINE: '1',
+          PI_TELEMETRY: '0',
+          PI_SKIP_VERSION_CHECK: '1',
+          PI_FORUM_DIR: forumDir,
+        }
+        const args = [
+          path.join(PI_ROOT, piManifest.bin.pi),
+          ...['--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'],
+          ...['--session-dir', paths.sessions, '-e', dir],
+        ]
+        const options = { cwd: paths.project, env, timeout: 30000 }
+        // Pi reads piped stdin into the prompt, so a scripted run closes it.
+        const piRun = (extra) => {
+          const running = exec(process.execPath, [...args, ...extra], options)
+          running.child.stdin.end()
+          return running
+        }
+        const entryOf = (record) => [record.type, record.entry?.type, record.entry?.customType, record.entry?.data]
+
+        // Print: nothing on stdout, each result once on stderr.
+        const print = await piRun(['-p', ...commands])
+        assert.equal(print.stdout, '')
+        assert.equal(print.stderr, feedback.map((text) => `${text}\n`).join(''))
+
+        // JSON: stdout is only Pi's records, the session header and one entry_appended per result.
+        const json = await piRun(['--mode', 'json', ...commands])
+        const records = jsonRecords(json.stdout)
+        assert.equal(records[0].type, 'session')
+        assert.deepEqual(records.slice(1).map(entryOf), texts.map((text) => ['entry_appended', 'custom', ENTRY_TYPE, { text }]))
+        assert.equal(json.stderr, feedback.map((text) => `${text}\n`).join(''))
+
+        // RPC: each result is an info notification after its entry_appended event.
+        const rpc = rpcProcess(process.execPath, [...args, '--mode', 'rpc'], options)
+        try {
+          for (const command of commands) {
+            const from = rpc.records.length
+            const response = await rpc.request({ type: 'prompt', message: command })
+            assert.deepEqual([response.success, response.data], [true, { disposition: 'handled' }], command)
+            const read = texts[commands.indexOf(command)]
+            const shown = rpc.records.slice(from, -1).map((record) => (record.type === 'extension_ui_request' ? [record.type, record.method, record.notifyType, record.message] : entryOf(record)))
+            const notified = ['extension_ui_request', 'notify', 'info', feedback[commands.indexOf(command)]]
+            assert.deepEqual(shown, read ? [['entry_appended', 'custom', ENTRY_TYPE, { text: read }], notified] : [notified], command)
+          }
+          const { data } = await rpc.request({ type: 'get_entries' })
+          assert.deepEqual(data.entries.filter((entry) => entry.type === 'custom').map((entry) => [entry.customType, entry.data]), texts.map((text) => [ENTRY_TYPE, { text }]))
+          assert.deepEqual(data.entries.filter((entry) => entry.type === 'custom_message' || entry.type === 'message'), [])
+          assert.deepEqual((await rpc.request({ type: 'get_messages' })).data.messages, [])
+          assert.equal(await rpc.close(), 0)
+        } finally {
+          await rpc.kill()
+        }
+        assert.doesNotThrow(() => jsonRecords(rpc.stdout))
+        assert.equal(rpc.stderr, '')
+
+        // Without a conversation, none of these runs wrote a session file.
+        assert.deepEqual(await fs.readdir(paths.sessions, { recursive: true }), [])
+        assert.deepEqual(await fs.readdir(forumDir), ['events.jsonl'])
       })
     })
   }
@@ -1260,7 +1926,8 @@ else describe('real Pi host', () => {
             await stream('\nD1')
             await waitFor('D1')
 
-            await submit('/forum topics')
+            // After "ui " Pi offers the browser views, so the view is typed out to submit it.
+            await submit('/forum ui topics')
             await waitFor('Forum · Topics · page 1', 'Forum is on for agents', '› Release plan')
             await stream('\nD2')
             await waitFor('Forum · Topics · page 1', 'D2')
@@ -1287,18 +1954,26 @@ else describe('real Pi host', () => {
             await terminal.keys(...Array(19).fill('BSpace'))
             await gone('typed after closing')
 
-            await submit(`/forum messages ${topic.id}`)
+            // A text read during the run: Pi draws its entry in the transcript, the run streams on.
+            await submit('/forum topics')
+            await waitFor('Forum topics · from the start', 'Forum is on for agents.', '1. Release plan', '2. Other', 'You are caught up.')
+
+            await submit(`/forum ui messages ${topic.id}`)
             await waitFor(`Forum · Messages in topic ${topic.id}`)
             await stream('\nD3')
             await waitFor(`Forum · Messages in topic ${topic.id}`, 'D3')
             await terminal.keys('Escape')
             await gone('Forum · Messages')
-            await submit(`/forum read ${long.id}`)
+            await submit(`/forum ui read ${long.id}`)
             await waitFor(`Forum · Message ${long.id}`, 'From sam', 'line 0000')
             await terminal.keys('End')
             await waitFor('LAST LINE ✓')
             await terminal.keys('Escape')
             await gone(`Forum · Message ${long.id}`)
+            await gone('LAST LINE ✓')
+            // The whole message as text, down to the last line of its body.
+            await submit(`/forum read ${long.id}`)
+            await waitFor('line 0398', 'line 0399', 'LAST LINE ✓')
 
             // Released, the run ends normally after the one request, never aborted.
             await fs.writeFile(path.join(paths.control, 'finish'), '')
@@ -1317,6 +1992,82 @@ else describe('real Pi host', () => {
           assert.deepEqual(await fs.readdir(forumDir), ['events.jsonl'])
         })
       }
+
+      test(`${['source checkout', 'packed tarball'][variant]}: text results stay in the transcript of a continued session`, { skip, timeout: 120000 }, async () => {
+        const { dir } = packages[variant]
+        const run = await fs.mkdtemp(path.join(temp, 'continued-'))
+        const paths = Object.fromEntries(['home', 'agent', 'project', 'control', 'tmp', 'sessions'].map((name) => [name, path.join(run, name)]))
+        for (const target of Object.values(paths)) await fs.mkdir(target)
+        const forumDir = path.join(run, 'forum')
+        await seedForum(forumDir)
+        // The synthetic provider answers the one prompt at once.
+        await fs.writeFile(path.join(paths.control, 'delta-1'), 'Answered.')
+        await fs.writeFile(path.join(paths.control, 'finish'), '')
+        const env = {
+          PATH: BASE_PATH,
+          HOME: paths.home,
+          TMPDIR: paths.tmp,
+          TERM: 'xterm-256color',
+          PI_CODING_AGENT_DIR: paths.agent,
+          PI_OFFLINE: '1',
+          PI_TELEMETRY: '0',
+          PI_SKIP_VERSION_CHECK: '1',
+          PI_FORUM_DIR: forumDir,
+          PI_FORUM_SYNTHETIC_DIR: paths.control,
+        }
+        const command = (...extra) =>
+          ['exec', 'env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), process.execPath, path.join(PI_ROOT, piManifest.bin.pi)]
+            .concat(['--session-dir', paths.sessions, '--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'])
+            .concat(['-e', probes.fileSynthetic, '-e', dir, '--model', 'forum-synthetic/held', ...extra])
+            .map(quote)
+            .join(' ')
+        const terminal = tmuxSession('pi-forum', path.join(run, 'tmux.sock'))
+        const shows = async (...texts) => {
+          const screen = (await terminal.screen()).replace(/\s+/g, ' ')
+          return texts.every((text) => screen.includes(text))
+        }
+        const waitFor = (...texts) => until(() => shows(...texts), texts.join(' and ')).catch(async (err) => {
+          err.message += `\n${await terminal.screen()}`
+          throw err
+        })
+        const submit = async (text) => {
+          await terminal.text(`${text} `)
+          await waitFor(text)
+          await terminal.keys('Enter')
+        }
+        // Ctrl+D on the empty editor quits Pi, which ends its pane and the tmux server.
+        const quit = async () => {
+          await terminal.keys('C-d')
+          await until(() => terminal.screen().then(() => false, () => true), 'pi to quit')
+        }
+        const shown = ['Forum topics · from the start', '1. Release plan', '2. Other', 'You are caught up.']
+        try {
+          await terminal.start(command(), { cwd: paths.project })
+          await waitFor('held')
+          await submit('Hello.')
+          await waitFor('Answered.')
+          await submit('/forum topics')
+          await waitFor(...shown)
+          await quit()
+
+          // The session file holds the conversation and the text result, which a continued session
+          // draws again through the extension's renderer; nothing is sent to the model.
+          const [file] = await fs.readdir(paths.sessions, { recursive: true }).then((names) => names.filter((name) => name.endsWith('.jsonl')))
+          const entries = (await fs.readFile(path.join(paths.sessions, file), 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+          const texts = entries.filter((entry) => entry.type === 'custom' && entry.customType === ENTRY_TYPE)
+          assert.equal(texts.length, 1)
+          assert.deepEqual(texts[0].data.text.split('\n').filter((line) => shown.includes(line)), shown)
+          const roles = entries.filter((entry) => entry.type === 'message').map((entry) => entry.message.role)
+          assert.deepEqual(roles.filter((role) => role !== 'system'), ['user', 'assistant'])
+          await terminal.start(command('--continue'), { cwd: paths.project })
+          await waitFor('Answered.', ...shown)
+          await quit()
+          const log = (await fs.readFile(path.join(paths.control, 'log.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+          assert.equal(log.filter((entry) => entry.event === 'request').length, 1)
+        } finally {
+          await terminal.kill()
+        }
+      })
     }
   })
 

@@ -1,6 +1,6 @@
 // Fixtures for the real-Pi tests: a synthetic model provider and terminal UI hosts. Only the
 // pieces named "fixture" here are stand-ins; everything they drive is Pi's own code.
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -138,6 +138,11 @@ export const visibleText = (output) =>
 // text; and an editor that, like Pi's, would abort the agent on Esc. custom() follows Pi 1.1.0's
 // InteractiveMode.showExtensionCustom for overlays: showOverlay with the given options, and on
 // done hideOverlay, resolve, then dispose. Focus and input routing are the TUI's own.
+//
+// Custom session entries are drawn as Pi 1.1.0's InteractiveMode draws them: follow(session)
+// shows each one the session appends (entry_appended), and replay(session) rebuilds them from the
+// session's context entries, as renderInitialMessages does after a reload, resume or /tree. Each
+// goes through the entry renderer its extension registered, collapsed, above the streamed text.
 export function createTerminalUI(tuiLib, Renderer, theme, { rows = 40, columns = 100, onEditorEscape }) {
   const terminal = {
     output: '',
@@ -189,6 +194,9 @@ export function createTerminalUI(tuiLib, Renderer, theme, { rows = 40, columns =
     transcript,
     notices: [],
     customs: [],
+    // The custom entries shown, in order: { entry, component }, component undefined when the
+    // renderer drew nothing (Pi then shows nothing).
+    entries: [],
     // The overlay component and handle of the open interaction, if any.
     component: null,
     handle: null,
@@ -239,6 +247,25 @@ export function createTerminalUI(tuiLib, Renderer, theme, { rows = 40, columns =
       transcript.text += text
       tui.requestRender()
     },
+    showEntry(session, entry) {
+      const renderer = session.extensionRunner.getEntryRenderer(entry.customType)
+      const component = renderer?.(entry, { expanded: false }, theme)
+      host.entries.push({ entry, component })
+      if (!component) return
+      tui.children.splice(tui.children.indexOf(transcript), 0, component)
+      tui.requestRender()
+    },
+    // Shows the custom entries the session appends from now on; returns the unsubscribe function.
+    follow: (session) =>
+      session.subscribe((event) => {
+        if (event.type === 'entry_appended' && event.entry.type === 'custom') host.showEntry(session, event.entry)
+      }),
+    replay(session) {
+      for (const { component } of host.entries.splice(0)) if (component) tui.removeChild(component)
+      for (const entry of session.sessionManager.buildContextEntries()) if (entry.type === 'custom') host.showEntry(session, entry)
+    },
+    // The rows an entry's component draws at the terminal width, as the terminal shows them.
+    entryLines: (index = -1) => host.entries.at(index).component.render(columns).map((line) => visibleText(line).trimEnd()),
     stop: () => tui.stop(),
   }
   // Any other ui method a mode with a UI might call.
@@ -258,6 +285,64 @@ export async function until(check, what, { timeoutMs = 10000, detail } = {}) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}${detail ? `:\n${detail()}` : ''}`)
     await new Promise((resolve) => setTimeout(resolve, 15))
   }
+}
+
+// Splits a JSONL stream as Pi's JSON and RPC modes frame it: on LF only, with an optional CR before
+// it. Every record must be a JSON object; anything else on stdout fails the parse.
+export function jsonRecords(stdout) {
+  const lines = stdout.split('\n')
+  if (lines.at(-1) === '') lines.pop()
+  return lines.map((line) => {
+    const record = JSON.parse(line.replace(/\r$/, ''))
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new Error(`not a JSON object record: ${line}`)
+    return record
+  })
+}
+
+// A Pi subprocess in RPC mode. request(command) writes one command record and resolves with its
+// response once Pi sends it; records holds every stdout record so far and stderr all of stderr.
+export function rpcProcess(command, args, options) {
+  const child = spawn(command, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] })
+  const rpc = { child, records: [], stdout: '', stderr: '' }
+  const waiting = new Map()
+  let buffered = ''
+  let ids = 0
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => {
+    rpc.stdout += chunk
+    buffered += chunk
+    let end
+    while ((end = buffered.indexOf('\n')) !== -1) {
+      const [record] = jsonRecords(buffered.slice(0, end + 1))
+      buffered = buffered.slice(end + 1)
+      rpc.records.push(record)
+      if (record.type === 'response' && waiting.has(record.id)) {
+        waiting.get(record.id)(record)
+        waiting.delete(record.id)
+      }
+    }
+  })
+  child.stderr.on('data', (chunk) => {
+    rpc.stderr += chunk
+  })
+  const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)))
+  rpc.request = (record) => {
+    const id = `req-${++ids}`
+    const response = new Promise((resolve) => waiting.set(id, resolve))
+    child.stdin.write(`${JSON.stringify({ id, ...record })}\n`)
+    return response
+  }
+  // Closes stdin, which ends RPC mode, and resolves with the exit code.
+  rpc.close = () => {
+    child.stdin.end()
+    return exited
+  }
+  rpc.kill = () => {
+    if (child.exitCode === null) child.kill()
+    return exited
+  }
+  return rpc
 }
 
 // tmux as the terminal for a real Pi subprocess: send keys and read the visible screen.

@@ -5,10 +5,13 @@
 // is peer data: control characters are shown as visible symbols before any styling, and it is only
 // drawn, never sent to the editor, the session or a model.
 
+import { expandTabs, printable } from './output.js'
+
+export { printable }
+
 // The overlay's share of the terminal; the component draws exactly the rows Pi gives the overlay.
 const WIDTH = '90%'
 const HEIGHT_PERCENT = 80
-const TAB_STOP = 4
 
 // Opener for createForumRuntime: shows the browser in one ctx.ui.custom overlay and resolves when
 // the interaction ends, whether by Esc, Back at the root or the browser closing from outside.
@@ -25,17 +28,6 @@ export function createBrowserOpener(tui) {
 export function overlayHeight(host) {
   const rows = host.terminal?.rows ?? 24
   return Math.max(1, Math.min(rows, Math.floor((rows * HEIGHT_PERCENT) / 100)))
-}
-
-// Shows control characters as visible text: C0 controls as control pictures (U+2400...), DEL as ␡,
-// and C1 and bidirectional formatting controls as ⟨U+XXXX⟩.
-export function printable(text) {
-  return text.replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, (char) => {
-    const code = char.charCodeAt(0)
-    if (code < 0x20) return String.fromCharCode(0x2400 + code)
-    if (code === 0x7f) return '␡'
-    return `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`
-  })
 }
 
 class ForumBrowserView {
@@ -199,7 +191,7 @@ class ForumBrowserView {
   body(message, width) {
     if (this.bodyCache?.id === message.id && this.bodyCache.width === width) return this.bodyCache.lines
     const lines = []
-    for (const raw of message.body.split('\n')) lines.push(...this.wrap(expandTabs(raw, this.tui), width))
+    for (const raw of message.body.split('\n')) lines.push(...this.wrap(expandTabs(raw, this.tui.visibleWidth), width))
     this.bodyCache = { id: message.id, width, lines }
     return lines
   }
@@ -266,17 +258,4 @@ function summary(item, view) {
   const topic = view.topicId === undefined ? ` · topic ${short(item.topic_id)}` : ''
   const [first] = item.body.split('\n')
   return printable(`${item.author} · ${day(item.created_at)}${topic} · ${first}`)
-}
-
-// Expands tabs to the next TAB_STOP column so indentation keeps its shape.
-function expandTabs(text, tui) {
-  if (!text.includes('\t')) return text
-  let out = ''
-  let column = 0
-  for (const part of text.split('\t').map((piece, i) => (i === 0 ? piece : ['\t', piece])).flat()) {
-    const shown = part === '\t' ? ' '.repeat(TAB_STOP - (column % TAB_STOP)) : part
-    out += shown
-    column += tui.visibleWidth(printable(shown))
-  }
-  return out
 }

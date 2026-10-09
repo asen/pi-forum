@@ -8,6 +8,7 @@ import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { formatMessage, formatMessageList, formatTarget, formatTopicList } from '../extension/output.js'
 import { createForumRuntime, forumCompletions, SECTION_NAME, USAGE } from '../extension/runtime.js'
 import { createForum } from '../src/forum.js'
 
@@ -32,9 +33,11 @@ function defaultDir(sessionId, agentDir = AGENT_DIR) {
 // Mimics Pi: every session start gets a fresh extension runtime, and the previous runtime's
 // session_shutdown completes before it. Cancelled switches and tree navigation emit neither.
 // Most unit tests use virtual paths; directory tests opt into node:fs with mkdir: mkdirSync.
+// Text results reach onText, recorded in texts; the host's report records everything else.
 function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, openBrowser } = {}) {
   const reports = []
   const types = []
+  const texts = []
   let runtime = null
   let sessionId = null
   const report = (message, _ctx, type = 'error') => {
@@ -45,12 +48,22 @@ function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, 
     env,
     reports,
     types,
+    texts,
     get runtime() {
       return runtime
     },
     start(id) {
       runtime?.sessionShutdown()
-      runtime = createForumRuntime({ binDir: BIN_DIR, getAgentDir: agentDir, env, report, mkdir, createForum, openBrowser })
+      runtime = createForumRuntime({
+        binDir: BIN_DIR,
+        getAgentDir: agentDir,
+        env,
+        report,
+        mkdir,
+        createForum,
+        openBrowser,
+        onText: (text) => texts.push(text),
+      })
       sessionId = id
       runtime.sessionStart(ctx(id))
     },
@@ -64,12 +77,19 @@ function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, 
       assert.equal(reports.length, count + 1)
       return reports.at(-1)
     },
-    // Runs a browsing /forum ARGS in the given mode; resolves to the [message, type] reports it made.
+    // Runs a reading /forum ARGS in the given mode; resolves to the [message, type] reports it made.
     async browse(args, mode = 'tui') {
       const count = reports.length
       const ui = mode === 'tui' || mode === 'rpc' ? { notify: () => assert.fail('reports go through report') } : undefined
       assert.equal(await runtime.command(args, ctx(sessionId, ui, mode)), undefined)
       return reports.slice(count).map((message, i) => [message, types[count + i]])
+    },
+    // Runs a text /forum ARGS in the terminal UI, which reports nothing on success; resolves to its text.
+    async text(args) {
+      const count = texts.length
+      assert.deepEqual(await this.browse(args), [])
+      assert.equal(texts.length, count + 1)
+      return texts.at(-1)
     },
     prompt(sections = { cwd: '<cwd>\n/project\n</cwd>' }) {
       const event = { type: 'before_agent_start', prompt: 'hi', systemPromptOptions: { sections } }
@@ -443,6 +463,60 @@ describe('/forum parsing, completion and feedback', () => {
     'READ m',
     'topic',
     'message m',
+    'topics --after',
+    'topics --after=',
+    'topics --after a --after b',
+    'topics --after=a --after=b',
+    'topics --after a --after=b',
+    'topics --after --after a',
+    'topics --after -a',
+    'topics --before a',
+    'topics --after-x a',
+    'topics --AFTER a',
+    'topics -a',
+    'topics a --after b',
+    'messages t --limit 5',
+    'messages a b --after c',
+    'messages -t',
+    'read m --after c',
+    'read --after c',
+    'read --after=c m',
+    'on --after c',
+    'UI',
+    'ui ui',
+    'ui Topics',
+    'ui on',
+    'ui status',
+    'ui topics x',
+    'ui topics --after c',
+    'ui messages --after c',
+    'ui messages a b',
+    'ui read',
+    'ui read a b',
+    'ui --after c',
+    'topics -- x',
+    'topics -- --',
+    'topics x --',
+    'messages -- a b',
+    'messages a -- b',
+    'messages -- -- --',
+    'messages --after -- x',
+    'messages -- x --after c',
+    'messages --after c -- --after d',
+    'messages --after=a -- t --after=b',
+    'messages -x -- t',
+    'messages --after a --after=b -- t',
+    'read --',
+    'read -- a b',
+    'read a -- b',
+    'read -- -- --',
+    'read --after=c -- m',
+    'read -- m --after c',
+    'read -x -- m',
+    'on --',
+    'status -- x',
+    'ui messages -- -odd',
+    'ui read -- m',
   ]) {
     test(`${JSON.stringify(args)} shows the usage and changes nothing`, () => {
       for (const supplied of [undefined, '/shared/forum', 'relative']) {
@@ -456,9 +530,86 @@ describe('/forum parsing, completion and feedback', () => {
         assert.equal(h.forum(args), USAGE)
         assert.equal(h.types.at(-1), 'warning')
         assert.deepEqual(snapshot(h), before)
+        assert.deepEqual(h.texts, [])
       }
     })
   }
+
+  test('the usage names every form, with nested browser views', () => {
+    assert.equal(
+      USAGE,
+      'Usage: /forum [on|off|status] | /forum topics [--after CURSOR] | /forum messages [TOPIC_ID] [--after CURSOR] | ' +
+        '/forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]',
+    )
+  })
+
+  test('text and browser forms route to their reads with exactly the given IDs and cursor', async () => {
+    const calls = []
+    const client = {
+      resolved: undefined,
+      listTopics: async ({ after, limit }) => (calls.push(['topics', after, limit]), { items: [], next_cursor: 'c' }),
+      listMessages: async ({ topicId, after, limit }) => (calls.push(['messages', topicId, after, limit]), { items: [], next_cursor: 'c' }),
+      getMessage: async (id) => (calls.push(['read', id]), { id, topic_id: 't', author: 'a', created_at: 'now', body: 'b' }),
+    }
+    const views = []
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      createForum: () => client,
+      openBrowser: async ({ view }) => views.push(view),
+    })
+    h.start('s-1')
+    const text = {
+      topics: ['topics', undefined, 20],
+      ' topics\t--after  c1 ': ['topics', 'c1', 20],
+      'topics --after=c=2': ['topics', 'c=2', 20],
+      'topics --after=-c3': ['topics', '-c3', 20],
+      messages: ['messages', undefined, undefined, 20],
+      'messages t-1': ['messages', 't-1', undefined, 20],
+      'messages --after c4': ['messages', undefined, 'c4', 20],
+      'messages t-1 --after c5': ['messages', 't-1', 'c5', 20],
+      'messages --after c6 t-1': ['messages', 't-1', 'c6', 20],
+      'messages --after=c7 t-1': ['messages', 't-1', 'c7', 20],
+      'read m-1': ['read', 'm-1'],
+      // The first "--" ends the options and is dropped; every later word is an ID, "--" included.
+      'topics --': ['topics', undefined, 20],
+      'topics --after c8 --': ['topics', 'c8', 20],
+      'messages --': ['messages', undefined, undefined, 20],
+      'messages -- -odd': ['messages', '-odd', undefined, 20],
+      'messages -- --': ['messages', '--', undefined, 20],
+      'messages -- --after=x': ['messages', '--after=x', undefined, 20],
+      'messages --after c9 -- --after=x': ['messages', '--after=x', 'c9', 20],
+      'messages --after=-c10 -- -odd': ['messages', '-odd', '-c10', 20],
+      'messages t-1 -- ': ['messages', 't-1', undefined, 20],
+      'messages t-1 --after c11 --': ['messages', 't-1', 'c11', 20],
+      'messages -- t-1': ['messages', 't-1', undefined, 20],
+      'messages on': ['messages', 'on', undefined, 20],
+      'read -- --after=x': ['read', '--after=x'],
+      'read -- --': ['read', '--'],
+      'read -- -m': ['read', '-m'],
+      'read m-1 --': ['read', 'm-1'],
+      'read -- m-1': ['read', 'm-1'],
+      'read ui': ['read', 'ui'],
+    }
+    for (const [args, call] of Object.entries(text)) {
+      await h.text(args)
+      assert.deepEqual(calls.at(-1), call, args)
+    }
+    assert.equal(calls.length, Object.keys(text).length)
+    const ui = {
+      ui: { kind: 'topics' },
+      'ui topics': { kind: 'topics' },
+      'ui messages': { kind: 'messages', topicId: undefined },
+      'ui messages t-1': { kind: 'messages', topicId: 't-1' },
+      'ui messages -odd': { kind: 'messages', topicId: '-odd' },
+      '  ui   read m-1 ': { kind: 'read', messageId: 'm-1' },
+    }
+    for (const [args, view] of Object.entries(ui)) {
+      assert.deepEqual(await h.browse(args), [])
+      assert.deepEqual(views.at(-1), view, args)
+    }
+    assert.equal(views.length, Object.keys(ui).length)
+    assert.equal(calls.length, Object.keys(text).length)
+  })
 
   test('surrounding whitespace is trimmed from on and off', () => {
     const h = host({ env: { PATH: BASE_PATH } })
@@ -468,9 +619,15 @@ describe('/forum parsing, completion and feedback', () => {
     assert.equal(h.forum('\ton '), `Forum is on: ${defaultDir('s-1')} (session default)`)
   })
 
-  test('completions are the actions starting with the typed prefix', () => {
+  test('completions are the actions, or the browser views after ui, starting with the typed prefix', () => {
     const items = (...values) => values.map((value) => ({ value, label: value }))
-    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'topics', 'messages', 'read'))
+    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'topics', 'messages', 'read', 'ui'))
+    assert.deepEqual(forumCompletions('u'), items('ui'))
+    assert.deepEqual(forumCompletions('ui'), items('ui'))
+    assert.deepEqual(forumCompletions('ui '), items('ui topics', 'ui messages', 'ui read'))
+    assert.deepEqual(forumCompletions('ui m'), items('ui messages'))
+    assert.deepEqual(forumCompletions('ui read'), items('ui read'))
+    for (const prefix of ['ui x', 'ui  t', 'ui on', 'ui read m', 'uix']) assert.deepEqual(forumCompletions(prefix), [])
     assert.deepEqual(forumCompletions('o'), items('on', 'off'))
     assert.deepEqual(forumCompletions('of'), items('off'))
     assert.deepEqual(forumCompletions('st'), items('status'))
@@ -819,8 +976,9 @@ describe('/forum across the session lifecycle', () => {
   })
 })
 
-describe('/forum browsing', () => {
-  const VIEWS = ['topics', 'messages', 'messages t-1', 'read m-1']
+describe('/forum reading', () => {
+  const TEXT = ['topics', 'messages', 'messages t-1', 'read m-1', 'topics --after c']
+  const UI = ['ui', 'ui topics', 'ui messages', 'ui messages t-1', 'ui read m-1']
 
   async function tempDir() {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-browse-test-')))
@@ -858,26 +1016,329 @@ describe('/forum browsing', () => {
     return { requests, open }
   }
 
-  test('without a selection, browsing explains /forum on and reads, derives and changes nothing', async () => {
+  test('without a selection, reading explains /forum on and reads, derives and changes nothing', async () => {
     for (const supplied of [undefined, 'relative']) {
       const h = host({
         env: supplied === undefined ? { PATH: BASE_PATH } : { PATH: BASE_PATH, PI_FORUM_DIR: supplied },
-        agentDir: () => assert.fail('browsing must not derive a default directory'),
-        createForum: () => assert.fail('browsing without a selection binds no client'),
-        openBrowser: () => assert.fail('browsing without a selection opens nothing'),
+        agentDir: () => assert.fail('reading must not derive a default directory'),
+        createForum: () => assert.fail('reading without a selection binds no client'),
+        openBrowser: () => assert.fail('reading without a selection opens nothing'),
       })
       h.start('s-1')
       const before = snapshot(h)
       const why = supplied === undefined ? '' : ' The forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative".'
-      for (const args of VIEWS) {
+      for (const args of [...TEXT, ...UI]) {
         for (const mode of ['tui', 'rpc', 'print', 'json']) {
           assert.deepEqual(await h.browse(args, mode), [
-            [`No forum is selected in this session.${why} Run /forum on to select one, then browse it.`, 'warning'],
+            [`No forum is selected in this session.${why} Run /forum on to select one, then read it.`, 'warning'],
           ])
           assert.deepEqual(snapshot(h), before)
         }
       }
+      assert.deepEqual(h.texts, [])
     }
+  })
+
+  test('text reads print the selected forum whether it is on, off or unavailable', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'shared')
+    const { topic, message } = await seededForum(forumDir)
+    const recorded = recordingFactory()
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir },
+      createForum: recorded.factory,
+      openBrowser: () => assert.fail('text reads open no browser'),
+    })
+    h.start('s-1')
+    const target = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
+    const page = (items) => ({ items, next_cursor: undefined })
+
+    // On: one page through the selection's read-only client.
+    let before = snapshot(h)
+    const topics = await h.text('topics')
+    assert.deepEqual(snapshot(h), before)
+    assert.equal(topics, formatTopicList({ target, page: page([topic]) }))
+    assert.match(topics, /^Forum topics · from the start\nForum directory: .*\nForum is on for agents\.\n\n1\. Seeded\n/)
+    assert.deepEqual(recorded.clients.map((client) => client.config), [{ forumDir, createOnRead: false }])
+
+    // Off: the same client; reading leaves the forum off and the prompt without it.
+    h.forum('off')
+    before = snapshot(h)
+    const messages = await h.text(`messages ${topic.id}`)
+    assert.deepEqual(snapshot(h), before)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    assert.equal(messages, formatMessageList({ target: { ...target, status: 'off' }, topicId: topic.id, page: page([message]) }))
+    assert.match(messages, /Forum is off for agents; reading does not turn it on\./)
+
+    // Unavailable after drift: the last selected directory, with a warning; the new value is neither
+    // read nor adopted.
+    h.forum('on')
+    h.env.PI_FORUM_DIR = '/elsewhere/forum'
+    const reason = `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere/forum"`
+    const drifted = { ...target, status: 'unavailable', warning: reason }
+    const count = h.texts.length
+    assert.deepEqual(await h.browse(`read ${message.id}`), [[formatTarget({ ...drifted, resolved: undefined }), 'warning']])
+    assert.equal(h.texts.length, count + 1)
+    assert.equal(h.texts.at(-1), formatMessage({ target: drifted, message }))
+    assert.match(h.texts.at(-1), /\nWarning: the forum is unavailable \(PI_FORUM_DIR changed .*\); reading the last selected directory\.\n/)
+    assert.equal(h.runtime.binding, null)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
+    assert.deepEqual(recorded.clients.map((client) => client.config.forumDir), [forumDir, forumDir])
+  })
+
+  test('lists show 20 results in creation order; full pages continue only with the copied cursor', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'paged')
+    const forum = createForum({ forumDir })
+    const topics = []
+    for (let i = 0; i < 21; i++) topics.push((await forum.createTopic({ title: `Topic ${i}`, author: 'a', body: `Body ${i}` })).topic)
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
+    h.start('s-1')
+
+    const first = await h.text('topics')
+    assert.deepEqual([...first.matchAll(/^\d+\. (.*)$/gm)].map((m) => m[1]), topics.slice(0, 20).map((t) => t.title))
+    const [, next] = first.match(/20 shown; there may be more\. Next page: (\/forum topics --after \S+)$/)
+    // Repeating the command starts over; only the copied cursor continues.
+    assert.equal(await h.text('topics'), first)
+    const second = await h.text(next.slice('/forum '.length))
+    assert.deepEqual([...second.matchAll(/^\d+\. (.*)$/gm)].map((m) => m[1]), ['Topic 20'])
+    assert.match(second, /^Forum topics · after cursor \S+\n/)
+    assert.match(second, /\nYou are caught up\.$/)
+
+    // Messages across topics page the same way, with --after=CURSOR accepted too.
+    const all = await h.text('messages')
+    const [, cursor] = all.match(/Next page: \/forum messages --after (\S+)$/)
+    const rest = await h.text(`messages --after=${cursor}`)
+    assert.match(rest, /\n1\. a · .*\n {3}Message \S+ · topic \S+\n {3}Body 20\n\nYou are caught up\.$/)
+    // Past the end, an empty page is caught up.
+    const { next_cursor: end } = await forum.listMessages({ limit: 21 })
+    assert.match(await h.text(`messages --after ${end}`), /\nNo newer messages\.\n\nYou are caught up\.$/)
+
+    // A topic's own messages carry its ID into the next-page command.
+    assert.match(await h.text(`messages ${topics[3].id}`), new RegExp(`^Forum messages in topic ${topics[3].id} · from the start\\n[^]*\\nYou are caught up\\.$`))
+  })
+
+  test('a fresh forum reads as empty, and reading never creates or recreates the directory', async () => {
+    const agentDir = await tempDir()
+    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => agentDir, mkdir: mkdirSync, openBrowser: recordingOpener().open })
+    h.start('s-1')
+    h.forum('on')
+    const forumDir = defaultDir('s-1', agentDir)
+    assert.match(await h.text('topics'), /\n\nNo topics yet\.\n\nYou are caught up\.$/)
+    assert.match(await h.text('messages'), /\n\nNo messages yet\.\n\nYou are caught up\.$/)
+    assert.match(await h.text('messages t-1'), /^Forum messages in topic t-1 · from the start\n[^]*\nNo messages yet\./)
+    assert.deepEqual(await fs.readdir(forumDir), [])
+    await fs.rm(path.join(agentDir, 'forums'), { recursive: true })
+    const count = h.texts.length
+    for (const args of [...TEXT, ...UI]) {
+      const [[message, type]] = await h.browse(args)
+      assert.equal(type, 'error')
+      const verb = args.startsWith('ui') ? 'browse' : 'read'
+      assert.ok(message.startsWith(`Could not ${verb} ${forumDir}: forum directory ${forumDir} is unavailable: ENOENT`), message)
+    }
+    h.forum('off')
+    const [[message]] = await h.browse('topics')
+    assert.match(message, /is unavailable: ENOENT/)
+    assert.equal(h.texts.length, count)
+    await assert.rejects(fs.stat(forumDir), { code: 'ENOENT' })
+    assert.deepEqual(await fs.readdir(agentDir), [])
+    assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('read prints all metadata and the complete body with controls made visible', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'forum')
+    const forum = createForum({ forumDir })
+    const { topic, message } = await forum.createTopic({ title: 'Plan \u001b[31mred', author: 'a', body: 'first' })
+    const body = ['# Heading', '', '\tindented\u001b[2J', `${'é'.repeat(200)}`, '* item **bold** ‮end', ...Array.from({ length: 300 }, (_, i) => `line ${i}`)].join('\n')
+    const reply = await forum.postMessage({ topicId: topic.id, author: 'b\u0007', body, replyTo: message.id, originSessionId: 'sess-9' })
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
+    h.start('s-1')
+    const text = await h.text(`read ${reply.id}`)
+    const target = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
+    assert.equal(text, formatMessage({ target, message: reply }))
+    for (const line of [
+      `Message: ${reply.id}`,
+      `Topic: ${topic.id}`,
+      'Author: b␇',
+      `Created: ${reply.created_at}`,
+      `Reply to: ${message.id}`,
+      'Origin session: sess-9',
+      'Body (305 lines):',
+      '# Heading',
+      '    indented␛[2J',
+      'é'.repeat(200),
+      '* item **bold** ⟨U+202E⟩end',
+      'line 299',
+    ]) {
+      assert.ok(text.split('\n').includes(line), line)
+    }
+    assert.ok(text.endsWith('\nline 298\nline 299'))
+    assert.doesNotMatch(text, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f‮]/)
+    assert.match(await h.text('topics'), /\n1\. Plan ␛\[31mred\n/)
+
+    const [[missing, type]] = await h.browse('read nope')
+    assert.equal(type, 'error')
+    assert.equal(missing, `Could not read ${forumDir}: message nope not found.`)
+  })
+
+  test('an unusable cursor is an error that names the first-page command and records nothing', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'forum')
+    const { topic } = await seededForum(forumDir)
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
+    h.start('s-1')
+    const before = snapshot(h)
+    assert.deepEqual(await h.browse('topics --after bogus'), [
+      [`Could not read ${forumDir}: cursor is not valid. Run /forum topics to start from the first page.`, 'error'],
+    ])
+    const [[error]] = await h.browse(`messages ${topic.id} --after=e30`, 'rpc')
+    assert.equal(error, `Could not read ${forumDir}: cursor version is not supported. Run /forum messages ${topic.id} to start from the first page.`)
+    assert.deepEqual(h.texts, [])
+    assert.deepEqual(snapshot(h), before)
+  })
+
+  test('emitted guidance, next-page and restart commands carry IDs starting with "-" back to the API exactly', async () => {
+    // Imported canonical records, whose IDs the API accepts although it never generates them.
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'imported')
+    await fs.mkdir(forumDir)
+    const lines = []
+    const posted = {}
+    let clock = 0
+    const at = () => `2026-01-01T00:00:${String(clock++).padStart(2, '0')}.000Z`
+    const special = { '-odd': ['--after=y', '--', '-m'], '--after=x': [], '--': [] }
+    for (const [topicId, ids] of Object.entries(special)) {
+      lines.push({ type: 'topic_created', id: topicId, title: `Topic ${topicId}`, created_by: 'a', created_at: at() })
+      posted[topicId] = Array.from({ length: 21 }, (_, i) => ids[i] ?? `${topicId}#${i}`)
+      for (const id of posted[topicId]) lines.push({ type: 'message_posted', id, topic_id: topicId, author: 'a', body: `body of ${id}`, created_at: at() })
+    }
+    await fs.writeFile(path.join(forumDir, 'events.jsonl'), lines.map((line) => `${JSON.stringify(line)}\n`).join(''))
+
+    const calls = []
+    const recording = (config) => {
+      const forum = createForum(config)
+      return {
+        get resolved() {
+          return forum.resolved
+        },
+        listTopics: (options) => (calls.push(['topics', options.after]), forum.listTopics(options)),
+        listMessages: (options) => (calls.push(['messages', options.topicId, options.after]), forum.listMessages(options)),
+        getMessage: (id, options) => (calls.push(['read', id]), forum.getMessage(id, options)),
+      }
+    }
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir }, createForum: recording, openBrowser: () => assert.fail('no browser') })
+    h.start('s-1')
+    const run = (command) => {
+      assert.ok(command.startsWith('/forum '), command)
+      return h.text(command.slice('/forum '.length))
+    }
+    const guidance = async (args) => {
+      const [[message]] = await h.browse(args, 'rpc')
+      return message.match(/read it as text with: (.+)$/)[1]
+    }
+    const ids = (text) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
+
+    for (const topicId of Object.keys(special)) {
+      // /forum ui outside the terminal points to a text command that lists exactly this topic.
+      const command = await guidance(`ui messages ${topicId}`)
+      assert.equal(command, `/forum messages -- ${topicId}`)
+      calls.length = 0
+      const first = await run(command)
+      assert.deepEqual(ids(first), posted[topicId].slice(0, 20))
+      const cursor = (await createForum({ forumDir }).listMessages({ topicId, limit: 20 })).next_cursor
+      const next = first.match(/Next page: (.+)$/)[1]
+      assert.equal(next, `/forum messages --after ${cursor} -- ${topicId}`)
+      const rest = await run(next)
+      assert.deepEqual(ids(rest), posted[topicId].slice(20))
+      assert.match(rest, /\nYou are caught up\.$/)
+      assert.deepEqual(calls, [
+        ['messages', topicId, undefined],
+        ['messages', topicId, cursor],
+      ])
+
+      // An unusable cursor names the first-page command, which still reaches the same topic.
+      const [[error, type]] = await h.browse(`messages --after not-a-cursor -- ${topicId}`)
+      assert.equal(type, 'error')
+      const restart = error.match(/Run (.+) to start from the first page\.$/)[1]
+      assert.equal(restart, command)
+      assert.equal(await run(restart), first)
+    }
+
+    // Messages with such IDs are read by the command the guidance names.
+    for (const id of special['-odd']) {
+      const command = await guidance(`ui read ${id}`)
+      assert.equal(command, `/forum read -- ${id}`)
+      calls.length = 0
+      const text = await run(command)
+      assert.deepEqual(calls, [['read', id]])
+      assert.ok(text.split('\n').includes(`Message: ${id}`))
+      assert.ok(text.endsWith(`\nbody of ${id}`))
+    }
+    // Command words stay ordinary IDs, with no "--".
+    assert.equal(await guidance('ui messages on'), '/forum messages on')
+    assert.equal(await guidance('ui read topics'), '/forum read topics')
+  })
+
+  test('a cursor starting with "-" continues and restarts through --after=CURSOR', async () => {
+    const calls = []
+    const items = Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, topic_id: '-odd', author: 'a', created_at: 'now', body: 'b' }))
+    const client = {
+      resolved: undefined,
+      async listMessages({ topicId, after }) {
+        calls.push([topicId, after])
+        if (after === '-bad') throw Object.assign(new Error('cursor is not valid'), { code: 'INVALID_CURSOR' })
+        return after === undefined ? { items, next_cursor: '-c1' } : { items: [], next_cursor: after }
+      },
+    }
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
+    h.start('s-1')
+    const first = await h.text('messages -- -odd')
+    const next = first.match(/Next page: (.+)$/)[1]
+    assert.equal(next, '/forum messages --after=-c1 -- -odd')
+    assert.match(await h.text(next.slice('/forum '.length)), /\nNo newer messages\.\n\nYou are caught up\.$/)
+    const [[error]] = await h.browse('messages --after=-bad -- -odd')
+    assert.equal(error, 'Could not read /shared/forum: cursor is not valid. Run /forum messages -- -odd to start from the first page.')
+    assert.deepEqual(calls, [
+      ['-odd', undefined],
+      ['-odd', '-c1'],
+      ['-odd', '-bad'],
+    ])
+  })
+
+  test('without a command to copy, guidance and restart say what to run instead', async () => {
+    const client = {
+      resolved: undefined,
+      listMessages: async () => {
+        throw Object.assign(new Error('cursor is not valid'), { code: 'INVALID_CURSOR' })
+      },
+    }
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
+    h.start('s-1')
+    const [[guided]] = await h.browse('ui read m؜1', 'rpc')
+    assert.ok(guided.endsWith('read it as text with /forum read; this ID cannot be typed back as shown'), guided)
+    assert.doesNotMatch(guided, /؜/)
+    const [[error]] = await h.browse('messages t\u001b1 --after c')
+    assert.equal(error, 'Could not read /shared/forum: cursor is not valid. Run it again without --after to start from the first page.')
+  })
+
+  test('damaged records are counted in full but only the first is kept', async () => {
+    let warned = 0
+    const client = {
+      resolved: '/shared/forum',
+      async listTopics({ onWarning }) {
+        for (let i = 0; i < 5000; i++) onWarning(`bad record ${i}\u001b`)
+        warned++
+        return { items: [], next_cursor: 'c' }
+      },
+    }
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
+    h.start('s-1')
+    const text = await h.text('topics')
+    assert.equal(warned, 1)
+    assert.match(text, /\n5000 damaged record\(s\) skipped; first: bad record 0␛\n/)
+    assert.doesNotMatch(text, /bad record 1/)
   })
 
   test('the terminal UI opens the selected forum whether it is on, off or unavailable', async () => {
@@ -888,11 +1349,10 @@ describe('/forum browsing', () => {
     const opener = recordingOpener()
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir }, createForum: recorded.factory, openBrowser: opener.open })
     h.start('s-1')
-    const supplied = `Forum directory: ${forumDir} (supplied PI_FORUM_DIR)`
 
     // On: the browser gets the selection's client, target, view, context and lifetime signal.
     let before = snapshot(h)
-    assert.deepEqual(await h.browse('topics'), [])
+    assert.deepEqual(await h.browse('ui'), [])
     assert.deepEqual(snapshot(h), before)
     const [first] = opener.requests
     assert.deepEqual(first.view, { kind: 'topics' })
@@ -904,10 +1364,11 @@ describe('/forum browsing', () => {
     assert.deepEqual(recorded.clients.map((client) => client.config), [{ forumDir, createOnRead: false }])
     assert.equal(first.forum, recorded.clients[0].forum)
 
-    // Off: the same client and pinned forum; browsing leaves the forum off and the prompt without it.
+    // Text reads share the client; off keeps it, and browsing leaves the forum off.
+    await h.text('topics')
     h.forum('off')
     before = snapshot(h)
-    assert.deepEqual(await h.browse('messages ' + topic.id), [])
+    assert.deepEqual(await h.browse('ui messages ' + topic.id), [])
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     const second = opener.requests[1]
@@ -916,22 +1377,19 @@ describe('/forum browsing', () => {
     assert.deepEqual(second.target, { forumDir, generated: false, resolved: forumDir, status: 'off', warning: null })
     assert.deepEqual(second.result.items, [message])
 
-    // Unavailable after drift: the last selected directory, with a visible warning; the new value is
-    // neither browsed nor adopted.
+    // Unavailable after drift: the last selected directory, with a visible warning.
     h.forum('on')
     h.env.PI_FORUM_DIR = '/elsewhere/forum'
     const reason = `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere/forum"`
-    assert.deepEqual(await h.browse('read ' + message.id), [
-      [`Warning: the forum is unavailable (${reason}); browsing the last selected directory. ${supplied}.`, 'warning'],
-    ])
+    const third = { forumDir, generated: false, resolved: undefined, status: 'unavailable', warning: reason }
+    assert.deepEqual(await h.browse('ui read ' + message.id), [[formatTarget(third), 'warning']])
     assert.equal(h.runtime.state.status, 'unavailable')
     assert.equal(h.runtime.binding, null)
-    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
-    const third = opener.requests[2]
-    assert.deepEqual(third.target, { forumDir, generated: false, resolved: undefined, status: 'unavailable', warning: reason })
-    assert.deepEqual(third.result, message)
+    assert.deepEqual(opener.requests[2].target, third)
+    assert.deepEqual(opener.requests[2].result, message)
     assert.deepEqual(recorded.clients.map((client) => client.config.forumDir), [forumDir, forumDir])
+    assert.equal(h.texts.length, 1)
   })
 
   test('the selection client is reused until a successful reselection or shutdown', async () => {
@@ -947,18 +1405,19 @@ describe('/forum browsing', () => {
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: link }, createForum: recorded.factory, openBrowser: opener.open })
     h.start('s-1')
 
-    await h.browse('topics')
-    await h.browse('topics')
+    await h.browse('ui topics')
+    assert.match(await h.text('topics'), new RegExp(`Forum directory: ${link} \\(supplied PI_FORUM_DIR\\), resolved to ${a}\\n[^]*\\n1\\. Seeded\\n`))
     assert.equal(recorded.clients.length, 1)
-    assert.equal(opener.requests[1].target.resolved, a)
-    assert.deepEqual(opener.requests[1].result.items.map((t) => t.title), ['Seeded'])
+    assert.equal(recorded.clients[0].forum.resolved, a)
 
     // A retargeted link is refused by the pinned client, and is not followed silently.
     await fs.rm(link)
     await fs.symlink(b, link)
-    const [[refused, type]] = await h.browse('topics')
+    const [[refused, type]] = await h.browse('ui topics')
     assert.equal(type, 'error')
     assert.match(refused, new RegExp(`^Could not browse ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
+    const [[text]] = await h.browse('topics')
+    assert.match(text, new RegExp(`^Could not read ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
     assert.equal(recorded.clients.length, 1)
 
     // Off keeps the client; a failed on keeps the selection and client too.
@@ -968,146 +1427,113 @@ describe('/forum browsing', () => {
     await h.browse('topics')
     assert.equal(recorded.clients.length, 1)
 
-    // A successful on discards the client and its browser signal; the new client follows the link.
+    // A successful on discards the client and its signal; the new client follows the link.
     const signal = opener.requests[0].signal
     h.env.PI_FORUM_DIR = link
     h.forum('on')
     assert.equal(signal.aborted, true)
-    await h.browse('topics')
+    assert.match(await h.text('topics'), /\n1\. In B\n/)
     assert.equal(recorded.clients.length, 2)
-    assert.deepEqual(opener.requests.at(-1).result.items.map((t) => t.title), ['In B'])
 
     // Shutdown discards it as well, and the next runtime binds its own.
-    const last = opener.requests.at(-1).signal
     h.start('s-2')
-    assert.equal(last.aborted, true)
-    await h.browse('topics')
+    await h.text('topics')
     assert.equal(recorded.clients.length, 3)
-  })
-
-  test('a fresh forum browses as empty; browsing does not recreate a directory removed afterward', async () => {
-    const agentDir = await tempDir()
-    const h = host({ env: { PATH: BASE_PATH }, agentDir: () => agentDir, mkdir: mkdirSync })
-    h.start('s-1')
-    h.forum('on')
-    const forumDir = defaultDir('s-1', agentDir)
-    assert.deepEqual(await h.browse('topics'), [['No topics yet.', 'info']])
-    assert.deepEqual(await h.browse('messages'), [['No messages yet.', 'info']])
-    assert.deepEqual(await fs.readdir(forumDir), [])
-    await fs.rm(path.join(agentDir, 'forums'), { recursive: true })
-    for (const view of VIEWS) {
-      const [[message, type]] = await h.browse(view)
-      assert.equal(type, 'error')
-      assert.ok(message.startsWith(`Could not browse ${forumDir}: forum directory ${forumDir} is unavailable: ENOENT`), message)
-    }
-    h.forum('off')
-    const [[message]] = await h.browse('topics')
-    assert.match(message, /is unavailable: ENOENT/)
-    await assert.rejects(fs.stat(forumDir), { code: 'ENOENT' })
-    assert.deepEqual(await fs.readdir(agentDir), [])
-    assert.deepEqual(h.env, { PATH: BASE_PATH })
   })
 
   test('opener failures are reported as errors without changing anything', async () => {
     const h = host({
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       openBrowser: async () => {
-        throw new Error('browser failed')
+        throw new Error('browser\u001b failed')
       },
     })
     h.start('s-1')
     const before = snapshot(h)
-    assert.deepEqual(await h.browse('topics'), [['Could not browse /shared/forum: browser failed', 'error']])
+    assert.deepEqual(await h.browse('ui'), [['Could not browse /shared/forum: browser␛ failed', 'error']])
     assert.deepEqual(snapshot(h), before)
   })
 
-  test('modes other than the terminal UI report the target and the equivalent command', async () => {
-    const dir = await tempDir()
-    const forumDir = path.join(dir, "it's a forum")
-    const { topic, message } = await seededForum(forumDir)
+  test('without the terminal UI, /forum ui points to the text command and reads nothing', async () => {
     const h = host({
-      env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir },
-      createForum: () => assert.fail('text modes read nothing'),
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      createForum: () => assert.fail('pointing to a command reads nothing'),
       openBrowser: () => assert.fail('only the terminal UI opens the browser'),
     })
     h.start('s-1')
-    const quoted = `'${forumDir.replaceAll("'", "'\\''")}'`
-    const bin = path.join(BIN_DIR, 'pi-forum')
-    const where = `Forum directory: ${forumDir} (supplied PI_FORUM_DIR).`
+    const target = formatTarget({ forumDir: '/shared/forum', generated: false, status: 'on', warning: null })
     const expected = {
-      topics: `PI_FORUM_DIR=${quoted} ${bin} topic list`,
-      [`messages ${topic.id}`]: `PI_FORUM_DIR=${quoted} ${bin} message list --topic=${topic.id}`,
-      'messages -odd': `PI_FORUM_DIR=${quoted} ${bin} message list --topic=-odd`,
-      [`read ${message.id}`]: `PI_FORUM_DIR=${quoted} ${bin} message get -- ${message.id}`,
+      ui: '/forum topics',
+      'ui topics': '/forum topics',
+      'ui messages': '/forum messages',
+      'ui messages t-1': '/forum messages t-1',
+      'ui read m-1': '/forum read m-1',
+      'ui messages -odd': '/forum messages -- -odd',
+      'ui read --after=x': '/forum read -- --after=x',
+      'ui read --': '/forum read -- --',
     }
     for (const mode of ['rpc', 'print', 'json']) {
       for (const [args, command] of Object.entries(expected)) {
         assert.deepEqual(await h.browse(args, mode), [
-          [`${where} The forum browser needs the terminal UI; run: ${command}`, 'info'],
+          [`${target}\nThe forum browser needs the terminal UI; read it as text with: ${command}`, 'info'],
         ])
       }
     }
-    // The commands run as shown and read the same forum.
-    const run = async (command) => JSON.parse((await exec('/bin/sh', ['-c', command], { env: { PATH: NODE_DIR } })).stdout)
-    assert.deepEqual((await run(expected.topics)).items, [topic])
-    assert.deepEqual((await run(expected[`messages ${topic.id}`])).items, [message])
-    assert.deepEqual(await run(expected[`read ${message.id}`]), { message })
-
     h.env.PI_FORUM_DIR = '/elsewhere'
-    const [[warned, type]] = await h.browse('topics', 'rpc')
+    const [[warned, type]] = await h.browse('ui', 'rpc')
     assert.equal(type, 'warning')
-    assert.ok(warned.startsWith(`Warning: the forum is unavailable (PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere"); browsing the last selected directory. ${where}`))
-    assert.ok(warned.endsWith(`run: ${expected.topics}`))
+    assert.ok(warned.startsWith('Forum directory: /shared/forum (supplied PI_FORUM_DIR)\nWarning: the forum is unavailable (PI_FORUM_DIR changed'))
+    assert.ok(warned.endsWith('read it as text with: /forum topics'))
+    assert.deepEqual(h.texts, [])
   })
 
-  test('text feedback goes to ui.notify in RPC and to stderr in print and JSON modes', async (t) => {
+  test('text results go to the entry callback in every mode, and also to notify in RPC and stderr in print and JSON', async (t) => {
     const stderr = t.mock.method(console, 'error', () => {})
     const stdout = [t.mock.method(console, 'log', () => {}), t.mock.method(console, 'info', () => {})]
     const notices = []
-    const ui = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('RPC has no custom UI') }
+    const texts = []
+    const ui = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('text reads open no UI') }
+    const client = { resolved: undefined, listTopics: async () => ({ items: [], next_cursor: 'c' }) }
     const runtime = createForumRuntime({
       binDir: BIN_DIR,
       getAgentDir: () => AGENT_DIR,
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       mkdir: () => {},
-      openBrowser: () => assert.fail('only the terminal UI opens the browser'),
+      createForum: () => client,
+      openBrowser: () => assert.fail('text reads open no browser'),
+      onText: (text, context) => texts.push([text, context.mode]),
     })
     runtime.sessionStart(ctx('s-1'))
-    const text = `Forum directory: /shared/forum (supplied PI_FORUM_DIR). The forum browser needs the terminal UI; run: PI_FORUM_DIR=/shared/forum ${path.join(BIN_DIR, 'pi-forum')} topic list`
-    await runtime.command('topics', { ...ctx('s-1', ui), mode: 'rpc' })
+    const text = formatTopicList({ target: { forumDir: '/shared/forum', generated: false, status: 'on', warning: null }, page: { items: [] } })
+    assert.equal(await runtime.command('topics', ctx('s-1', ui, 'tui')), undefined)
+    assert.deepEqual(texts, [[text, 'tui']])
+    assert.deepEqual(notices, [])
+    await runtime.command('topics', ctx('s-1', ui, 'rpc'))
+    assert.deepEqual(texts.at(-1), [text, 'rpc'])
     assert.deepEqual(notices, [[text, 'info']])
     assert.equal(stderr.mock.callCount(), 0)
     for (const mode of ['print', 'json']) await runtime.command('topics', ctx('s-1', undefined, mode))
+    assert.deepEqual(texts.map(([, mode]) => mode), ['tui', 'rpc', 'print', 'json'])
     assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[text], [text]])
     for (const spy of stdout) assert.equal(spy.mock.callCount(), 0)
-    runtime.sessionShutdown()
-  })
 
-  test('the transitional terminal browser reports reads as text with control characters replaced', async () => {
-    const dir = await tempDir()
-    const forumDir = path.join(dir, 'forum')
-    const forum = createForum({ forumDir })
-    const { topic, message } = await forum.createTopic({ title: 'Plan \u001b[31mred', author: 'a', body: 'first line\nsecond' })
-    const long = await forum.postMessage({ topicId: topic.id, author: 'b', body: `${'é'.repeat(100)}\nmore`, replyTo: message.id })
-    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
-    h.start('s-1')
-    assert.deepEqual(await h.browse('topics'), [
-      [`First 1 topic(s):\n${topic.id}  Plan �[31mred  (a, ${topic.created_at})`, 'info'],
-    ])
-    assert.deepEqual(await h.browse(`messages ${topic.id}`), [
-      [
-        `First 2 message(s):\n${message.id}  a, ${message.created_at}: first line\n` +
-          `${long.id}  b, ${long.created_at}: ${'é'.repeat(79)}…`,
-        'info',
-      ],
-    ])
-    assert.deepEqual(await h.browse(`read ${long.id}`), [
-      [`Message ${long.id} in topic ${topic.id} by b at ${long.created_at}, replying to ${message.id}:\n${long.body}`, 'info'],
-    ])
-    const [[missing, type]] = await h.browse('read nope')
-    assert.equal(type, 'error')
-    assert.equal(missing, `Could not browse ${forumDir}: message nope not found`)
-    assert.deepEqual(await h.browse('messages none'), [['No messages yet.', 'info']])
+    // A failing entry callback is reported; the result still reaches non-terminal modes.
+    const failing = createForumRuntime({
+      binDir: BIN_DIR,
+      getAgentDir: () => AGENT_DIR,
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      mkdir: () => {},
+      createForum: () => client,
+      onText: () => {
+        throw new Error('no session')
+      },
+    })
+    failing.sessionStart(ctx('s-1'))
+    notices.length = 0
+    await failing.command('topics', ctx('s-1', ui, 'rpc'))
+    assert.deepEqual(notices, [['Could not add the forum output to the session: no session', 'error'], [text, 'info']])
+    failing.sessionShutdown()
+    runtime.sessionShutdown()
   })
 })
 
@@ -1129,10 +1555,10 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     return { opened, open }
   }
 
-  // A client whose reads stay pending until the test settles them.
+  // A client whose reads stay pending until the test settles them, whatever their signal does.
   function pendingClient() {
     const calls = []
-    const read = (...args) => new Promise((resolve) => calls.push({ options: args.at(-1), resolve }))
+    const read = (...args) => new Promise((resolve, reject) => calls.push({ args, options: args.at(-1), resolve, reject }))
     return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } }
   }
 
@@ -1141,7 +1567,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => pendingClient().forum, openBrowser: opener.open })
     h.start('s-1')
     const before = snapshot(h)
-    const first = h.runtime.command('topics', tui())
+    const first = h.runtime.command('ui', tui())
     await settle()
     assert.equal(opener.opened.length, 1)
     const { browser, view, target, signal } = opener.opened[0]
@@ -1150,7 +1576,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     assert.equal(browser.state.target.forumDir, target.forumDir)
     assert.equal(signal.aborted, false)
 
-    assert.equal(await h.runtime.command('read m-1', tui()), undefined)
+    assert.equal(await h.runtime.command('ui read m-1', tui()), undefined)
     assert.deepEqual(h.reports, ['The forum browser is already open; close it with Esc before opening another view.'])
     assert.deepEqual(h.types, ['warning'])
     assert.equal(opener.opened.length, 1)
@@ -1159,7 +1585,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     browser.close()
     assert.equal(await first, undefined)
     assert.equal(h.reports.length, 1)
-    const second = h.runtime.command('messages', tui())
+    const second = h.runtime.command('ui messages', tui())
     await settle()
     assert.equal(opener.opened.length, 2)
     assert.notEqual(opener.opened[1].browser, browser)
@@ -1183,7 +1609,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
       openBrowser: opener.open,
     })
     h.start('s-1')
-    const pending = h.runtime.command('topics', tui())
+    const pending = h.runtime.command('ui', tui())
     await settle()
     const { browser } = opener.opened[0]
     const [load] = clients[0].calls
@@ -1194,7 +1620,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     h.forum('on')
     assert.equal(browser.closed, false)
     assert.equal(load.options.signal.aborted, false)
-    assert.equal(await h.runtime.command('topics', tui()), undefined)
+    assert.equal(await h.runtime.command('ui', tui()), undefined)
     assert.equal(h.reports.at(-1), 'The forum browser is already open; close it with Esc before opening another view.')
 
     h.env.PI_FORUM_DIR = '/other/forum'
@@ -1209,7 +1635,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     assert.deepEqual(browser.state.page.items, [])
 
     // The new selection opens a new browser on a new client.
-    const next = h.runtime.command('topics', tui())
+    const next = h.runtime.command('ui', tui())
     await settle()
     assert.equal(clients.length, 2)
     assert.equal(opener.opened[1].target.forumDir, '/other/forum')
@@ -1222,7 +1648,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     const client = pendingClient()
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client.forum, openBrowser: opener.open })
     h.start('s-1')
-    const pending = h.runtime.command('messages t-1', tui())
+    const pending = h.runtime.command('ui messages t-1', tui())
     await settle()
     const { browser } = opener.opened[0]
     h.quit()
@@ -1247,10 +1673,10 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     })
     h.start('s-1')
     fail = 'now'
-    await h.runtime.command('topics', tui())
+    await h.runtime.command('ui', tui())
     assert.deepEqual(h.reports, ['Could not browse /shared/forum: renderer failed'])
     fail = 'after discard'
-    const pending = h.runtime.command('topics', tui())
+    const pending = h.runtime.command('ui', tui())
     await settle()
     h.env.PI_FORUM_DIR = '/other/forum'
     h.forum('on')
@@ -1265,7 +1691,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     h.forum('on')
     h.forum('off')
     const before = snapshot(h)
-    const pending = h.runtime.command('topics', tui())
+    const pending = h.runtime.command('ui', tui())
     await settle()
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
@@ -1276,14 +1702,169 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
   })
 })
 
+describe('/forum text read lifecycle', { timeout: 10000 }, () => {
+  const tui = () => ctx('s-1', { notify: () => assert.fail('reports go through report') }, 'tui')
+  const settle = () => new Promise(setImmediate)
+  const BUSY = 'A forum read is still running; wait for it to finish before starting another.'
+
+  function pendingClient() {
+    const calls = []
+    const read = (...args) => new Promise((resolve, reject) => calls.push({ args, options: args.at(-1), resolve, reject }))
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } }
+  }
+
+  function setup() {
+    const clients = []
+    const opened = []
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
+      createForum: () => {
+        clients.push(pendingClient())
+        return clients.at(-1).forum
+      },
+      openBrowser: async (request) => {
+        opened.push(request)
+        request.browser.start()
+        await request.browser.done
+      },
+    })
+    h.start('s-1')
+    return { h, clients, opened }
+  }
+
+  test('one text read at a time; overlapping reads are refused, not queued', async () => {
+    const { h, clients } = setup()
+    const before = snapshot(h)
+    const first = h.runtime.command('topics', tui())
+    await settle()
+    for (const args of ['topics', 'messages', 'read m-1', 'topics --after c']) {
+      assert.deepEqual(await h.browse(args), [[BUSY, 'warning']])
+    }
+    assert.deepEqual(await h.browse('messages', 'rpc'), [[BUSY, 'warning']])
+    assert.equal(clients[0].calls.length, 1)
+    assert.deepEqual(snapshot(h), before)
+    clients[0].calls[0].resolve({ items: [], next_cursor: 'c' })
+    assert.equal(await first, undefined)
+    assert.equal(h.texts.length, 1)
+    // The slot is free again; a failed read frees it too.
+    const second = h.runtime.command('read m-1', tui())
+    await settle()
+    clients[0].calls[1].reject(Object.assign(new Error('boom'), { code: 'READ_FAILED' }))
+    await second
+    assert.deepEqual(h.reports.slice(-1), ['Could not read /shared/forum: boom.'])
+    const third = h.runtime.command('topics', tui())
+    await settle()
+    assert.equal(clients[0].calls.length, 3)
+    clients[0].calls[2].resolve({ items: [], next_cursor: 'c' })
+    await third
+    assert.equal(h.texts.length, 2)
+    assert.equal(clients.length, 1)
+  })
+
+  test('text reads run beside the browser on its client, and closing the browser leaves them running', async () => {
+    const { h, clients, opened } = setup()
+    const browsing = h.runtime.command('ui', tui())
+    await settle()
+    const reading = h.runtime.command('messages t-1', tui())
+    await settle()
+    const [load, read] = clients[0].calls
+    assert.deepEqual(read.args, [{ signal: opened[0].signal, onWarning: read.options.onWarning, after: undefined, limit: 20, topicId: 't-1' }])
+    // A browser may still open while the text read runs; it is the browser that is limited to one.
+    assert.deepEqual(await h.browse('ui read m-1'), [['The forum browser is already open; close it with Esc before opening another view.', 'warning']])
+    opened[0].browser.close()
+    await browsing
+    assert.equal(load.options.signal.aborted, true)
+    assert.equal(read.options.signal.aborted, false)
+    const again = h.runtime.command('ui messages', tui())
+    await settle()
+    assert.equal(opened.length, 2)
+    read.resolve({ items: [], next_cursor: 'c' })
+    await reading
+    assert.equal(h.texts.length, 1)
+    assert.match(h.texts[0], /^Forum messages in topic t-1 · from the start\n/)
+    assert.equal(opened[1].browser.closed, false)
+    opened[1].browser.close()
+    await again
+    assert.deepEqual(h.reports, ['The forum browser is already open; close it with Esc before opening another view.'])
+  })
+
+  test('off and a failed on keep a text read and its result', async () => {
+    const { h, clients } = setup()
+    const reading = h.runtime.command('read m-1', tui())
+    await settle()
+    h.forum('off')
+    h.env.PI_FORUM_DIR = 'relative'
+    h.forum('on')
+    const [read] = clients[0].calls
+    assert.equal(read.options.signal.aborted, false)
+    read.resolve({ id: 'm-1', topic_id: 't-1', author: 'a', created_at: 'now', body: 'kept' })
+    await reading
+    assert.equal(h.texts.length, 1)
+    // The target is as it was when the read started.
+    assert.match(h.texts[0], /\nForum is on for agents\.\n[^]*\nkept$/)
+  })
+
+  for (const end of ['reselect', 'shutdown']) {
+    for (const outcome of ['result', 'error']) {
+      test(`after ${end}, a late ${outcome} and its warnings are dropped and the slot is held until it settles`, async () => {
+        const { h, clients } = setup()
+        const reading = h.runtime.command('topics', tui())
+        await settle()
+        const [read] = clients[0].calls
+        const reports = h.reports.length
+        if (end === 'shutdown') h.quit()
+        else {
+          h.env.PI_FORUM_DIR = '/other/forum'
+          h.forum('on')
+        }
+        assert.equal(read.options.signal.aborted, true)
+        // This adapter ignores cancellation: until it settles, no other text read starts.
+        if (end === 'reselect') assert.deepEqual(await h.browse('topics'), [[BUSY, 'warning']])
+        read.options.onWarning('late warning')
+        if (outcome === 'result') read.resolve({ items: [{ id: 'late', title: 'Late', created_by: 'a', created_at: 'now' }], next_cursor: 'c' })
+        else read.reject(new Error('late failure'))
+        assert.equal(await reading, undefined)
+        await settle()
+        assert.deepEqual(h.texts, [])
+        const expected = end === 'reselect' ? ['Forum is on: /other/forum (supplied PI_FORUM_DIR)', BUSY] : []
+        assert.deepEqual(h.reports.slice(reports), expected)
+        if (end === 'reselect') {
+          const next = h.runtime.command('topics', tui())
+          await settle()
+          assert.equal(clients.length, 2)
+          clients[1].calls[0].resolve({ items: [], next_cursor: 'c' })
+          await next
+          assert.match(h.texts[0], /^Forum topics · from the start\nForum directory: \/other\/forum /)
+        }
+      })
+    }
+  }
+
+  test('a text read leaves activation, environment and the prompt as they were', async () => {
+    const { h, clients } = setup()
+    h.forum('off')
+    const before = snapshot(h)
+    const reading = h.runtime.command('topics', tui())
+    await settle()
+    assert.deepEqual(snapshot(h), before)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    clients[0].calls[0].resolve({ items: [], next_cursor: 'c' })
+    await reading
+    assert.deepEqual(snapshot(h), before)
+    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+  })
+})
+
 describe('extension entry', () => {
   // Stand in for the host packages, which are not installed in this repository. The terminal
   // helpers are never called here: the overlay itself is tested in browser-ui.test.js.
   const HOST_MODULES = {
     '@earendil-works/pi-coding-agent': 'export const getAgentDir = () => globalThis.piForumTestAgentDir',
-    '@earendil-works/pi-tui': ['matchesKey', 'truncateToWidth', 'visibleWidth', 'wrapTextWithAnsi']
-      .map((name) => `export const ${name} = () => { throw new Error('${name} is not stubbed') }`)
-      .join('\n'),
+    '@earendil-works/pi-tui': [
+      ...['matchesKey', 'truncateToWidth', 'wrapTextWithAnsi'].map((name) => `export const ${name} = () => { throw new Error('${name} is not stubbed') }`),
+      'export const visibleWidth = (text) => [...text].length * 2',
+      'export class Text { constructor(...args) { this.args = args } }',
+    ].join('\n'),
   }
   registerHooks({
     resolve(specifier, context, nextResolve) {
@@ -1309,11 +1890,17 @@ describe('extension entry', () => {
     const { default: factory } = await import('../extension/index.js')
     const handlers = new Map()
     const commands = new Map()
+    const renderers = new Map()
+    const entries = []
+    // Only these methods exist, so sending messages, triggering turns or any other call would throw.
     const result = factory({
       on: (name, handler) => handlers.set(name, handler),
       registerCommand: (name, options) => commands.set(name, options),
+      registerEntryRenderer: (type, renderer) => renderers.set(type, renderer),
+      appendEntry: (type, data) => entries.push([type, data]),
     })
     assert.equal(result, undefined)
+    assert.deepEqual([...renderers.keys()], ['pi-forum.output'])
     assert.deepEqual([...handlers.keys()], ['session_start', 'before_agent_start', 'session_shutdown'])
     assert.deepEqual([...commands.keys()], ['forum'])
     const forum = commands.get('forum')
@@ -1353,25 +1940,55 @@ describe('extension entry', () => {
     assert.deepEqual(notices.map(([, type]) => type), ['info', 'info', 'info'])
     assert.equal(notices[2][0], `Forum is on: ${defaultDir('s-9', agentDir)} (session default)`)
 
-    // Browsing is wired to the selected forum; RPC gets text and never the terminal browser.
-    const rpc = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
-    assert.equal(await forum.handler('topics', rpc), undefined)
+    // Text reads are wired to the selected forum: one session entry per result, even an empty one.
+    // The terminal UI shows only the entry; RPC also notifies, and print and JSON write stderr.
     const dir = defaultDir('s-9', agentDir)
-    assert.deepEqual(notices.at(-1), [
-      `Forum directory: ${dir} (session default). The forum browser needs the terminal UI; run: PI_FORUM_DIR=${dir} ${path.join(BIN_DIR, 'pi-forum')} topic list`,
-      'info',
-    ])
-    assert.equal(process.env.PI_FORUM_DIR, dir)
+    const empty = formatTopicList({ target: { forumDir: dir, generated: true, resolved: dir, status: 'on' }, page: { items: [] } })
+    const terminal = (ui) => ({ ...ctx('s-9', ui), mode: 'tui' })
+    const count = notices.length
+    assert.equal(await forum.handler('topics', terminal({ ...ui, custom: () => assert.fail('text reads open no UI') })), undefined)
+    assert.deepEqual(entries, [['pi-forum.output', { text: empty }]])
+    assert.equal(notices.length, count)
+    const rpc = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
+    await forum.handler('messages', rpc)
+    assert.equal(entries.length, 2)
+    assert.deepEqual(notices.slice(count), [[entries[1][1].text, 'info']])
+    const stderr = t.mock.method(console, 'error', () => {})
+    await forum.handler('topics', ctx('s-9', undefined, 'print'))
+    assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[empty]])
+    stderr.mock.restore()
+    assert.equal(entries.length, 3)
 
-    // The terminal UI opens one overlay; ending its interaction ends the command.
+    // The renderer draws a stored entry as plain text, whatever was stored.
+    const render = renderers.get('pi-forum.output')
+    const drawn = render({ type: 'custom', customType: 'pi-forum.output', data: { text: `${empty}\n\u001b[2Jx` } }, { expanded: false }, {})
+    assert.deepEqual(drawn.args, [`${empty}\n␛[2Jx`, 1, 0])
+    // Every Bidi_Control character (ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI).
+    const bidi = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
+    const stored = render({ data: { text: bidi.map((code) => String.fromCodePoint(code)).join('\n') } }, { expanded: true }, {})
+    assert.deepEqual(stored.args[0].split('\n'), bidi.map((code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`))
+    assert.equal(render({ type: 'custom', customType: 'pi-forum.output', data: null }, { expanded: true }, {}), undefined)
+
+    // /forum ui in RPC points to the text command; the terminal UI opens one overlay, and ending its
+    // interaction ends the command.
+    assert.equal(await forum.handler('ui', rpc), undefined)
+    assert.equal(notices.at(-1)[0], `${formatTarget({ forumDir: dir, generated: true, status: 'on' })}\nThe forum browser needs the terminal UI; read it as text with: /forum topics`)
+    assert.equal(process.env.PI_FORUM_DIR, dir)
     const shown = []
     const custom = (factory, options) => {
       shown.push(options)
       return Promise.resolve(undefined)
     }
-    const terminal = { ...ctx('s-9', { ...ui, custom }), mode: 'tui' }
-    assert.equal(await forum.handler('topics', terminal), undefined)
+    assert.equal(await forum.handler('ui topics', terminal({ ...ui, custom })), undefined)
     assert.deepEqual(shown, [{ overlay: true, overlayOptions: { anchor: 'center', width: '90%', maxHeight: '80%' } }])
+    assert.equal(entries.length, 3)
+
+    // Tab stops use the host's visibleWidth, here two columns per character: "ab" ends at column 4.
+    const { topic } = await createForum({ forumDir: dir }).createTopic({ title: 'T', author: 'a', body: 'ab\tc' })
+    const { items: [message] } = await createForum({ forumDir: dir }).listMessages()
+    await forum.handler(`read ${message.id}`, terminal(ui))
+    assert.ok(entries.at(-1)[1].text.endsWith('\nab    c'), entries.at(-1)[1].text)
+    assert.equal(message.topic_id, topic.id)
 
     await handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, ctx('s-9'))
     assert.equal(process.env.PATH, BASE_PATH)

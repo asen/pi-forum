@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -67,8 +67,31 @@ test('the tarball contains exactly the runtime files', async () => {
   assert.equal(manifest.dependencies, undefined)
   assert.deepEqual(manifest.pi, { extensions: ['./extension/index.js'] })
   assert.deepEqual(manifest.peerDependencies, { '@earendil-works/pi-coding-agent': '*', '@earendil-works/pi-tui': '*' })
-  assert.ok(files.includes('extension/index.js'))
-  assert.ok(files.includes('src/backends/jsonl.js'))
+  for (const file of ['extension/index.js', 'extension/runtime.js', 'extension/output.js', 'extension/entry-renderer.js', 'src/backends/jsonl.js']) {
+    assert.ok(files.includes(file), file)
+  }
+})
+
+// The text formatter and entry renderer have no host imports, so the packaged copies load here.
+test('the packaged text output and session entry renderer load from the tarball', async () => {
+  const load = (file) => import(pathToFileURL(path.join(pkg, 'extension', file)).href)
+  const { ENTRY_TYPE, createEntryRenderer, entryData } = await load('entry-renderer.js')
+  const { LIST_PAGE_SIZE, formatTopicList } = await load('output.js')
+  assert.equal(ENTRY_TYPE, 'pi-forum.output')
+  assert.deepEqual(entryData('text'), { text: 'text' })
+  assert.equal(LIST_PAGE_SIZE, 20)
+  const text = formatTopicList({
+    target: { forumDir: '/forum', generated: false, status: 'on' },
+    page: { items: [{ id: 't1', title: 'Plan', created_by: 'ralph', created_at: '2026-01-01T00:00:00.000Z' }], next_cursor: 'c1' },
+  })
+  assert.equal(text.split('\n').at(-1), 'You are caught up.')
+  class Text {
+    constructor(shown, paddingX, paddingY) {
+      Object.assign(this, { shown, paddingX, paddingY })
+    }
+  }
+  const drawn = createEntryRenderer({ Text })({ type: 'custom', customType: ENTRY_TYPE, data: entryData('a\x1b[31mb\nc') }, { expanded: false }, {})
+  assert.deepEqual({ ...drawn }, { shown: 'a␛[31mb\nc', paddingX: 1, paddingY: 0 })
 })
 
 test('the packaged executable has mode 0755 and a node shebang', async () => {
