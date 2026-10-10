@@ -4,15 +4,22 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { createPreferenceStore } from '../extension/preferences.js'
+import type {
+  PreferenceContext,
+  PreferenceErrorCode,
+  PreferenceFs,
+  PreferenceIgnoredCode,
+  PreferenceUpdate,
+} from '../extension/types.js'
 
-const roots = []
+const roots: string[] = []
 
 after(() => {
   for (const root of roots) nodeFs.rmSync(root, { recursive: true, force: true })
 })
 
 // A temporary tree with an agent directory and a project working directory, neither created yet.
-function setup({ fs } = {}) {
+function setup({ fs }: { fs?: PreferenceFs } = {}) {
   const root = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'pi-forum-preferences-'))
   roots.push(root)
   const agentDir = path.join(root, 'agent')
@@ -27,36 +34,52 @@ function setup({ fs } = {}) {
   }
 }
 
-function ctx(cwd, trusted = true) {
+function ctx(cwd: string, trusted = true): PreferenceContext {
   return { cwd, isProjectTrusted: () => trusted }
 }
 
-function write(file, value) {
+function write(file: string, value: unknown) {
   nodeFs.mkdirSync(path.dirname(file), { recursive: true })
   nodeFs.writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value))
 }
 
-const read = (file) => JSON.parse(nodeFs.readFileSync(file, 'utf8'))
-const exists = (file) => nodeFs.existsSync(file)
+const read = (file: string): unknown => JSON.parse(nodeFs.readFileSync(file, 'utf8'))
+const exists = (file: string) => nodeFs.existsSync(file)
 
 // Every file under dir, relative and sorted.
-function tree(dir) {
+function tree(dir: string) {
   if (!exists(dir)) return []
-  return nodeFs.readdirSync(dir, { recursive: true }).sort()
+  return nodeFs.readdirSync(dir, { recursive: true, encoding: 'utf8' }).sort()
 }
+
+// One recorded call: the method's name, then its arguments.
+type Call = { [K in keyof PreferenceFs]: [K, ...Parameters<PreferenceFs[K]>] }[keyof PreferenceFs]
+type CallOf<K extends keyof PreferenceFs> = Extract<Call, [K, ...unknown[]]>
 
 // node:fs with every call recorded by name.
 function spyFs() {
-  const calls = []
-  const fs = {}
-  for (const name of ['readFileSync', 'mkdirSync', 'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync', 'unlinkSync']) {
-    fs[name] = (...args) => {
-      calls.push([name, ...args])
-      return nodeFs[name](...args)
-    }
+  const calls: Call[] = []
+  const fs: PreferenceFs = {
+    readFileSync: (...args) => (calls.push(['readFileSync', ...args]), nodeFs.readFileSync(...args)),
+    mkdirSync: (...args) => (calls.push(['mkdirSync', ...args]), nodeFs.mkdirSync(...args)),
+    openSync: (...args) => (calls.push(['openSync', ...args]), nodeFs.openSync(...args)),
+    writeFileSync: (...args) => (calls.push(['writeFileSync', ...args]), nodeFs.writeFileSync(...args)),
+    fsyncSync: (...args) => (calls.push(['fsyncSync', ...args]), nodeFs.fsyncSync(...args)),
+    closeSync: (...args) => (calls.push(['closeSync', ...args]), nodeFs.closeSync(...args)),
+    renameSync: (...args) => (calls.push(['renameSync', ...args]), nodeFs.renameSync(...args)),
+    unlinkSync: (...args) => (calls.push(['unlinkSync', ...args]), nodeFs.unlinkSync(...args)),
   }
   return { fs, calls }
 }
+
+// Whether a save or reset rewrote its file; a failed update has no changed, as the untyped tests read it.
+const changed = (update: PreferenceUpdate) => (update.ok ? update.changed : undefined)
+
+// Matches the recorded calls of name.
+const isCall =
+  <K extends keyof PreferenceFs>(name: K) =>
+  (call: Call): call is CallOf<K> =>
+    call[0] === name
 
 describe('saved values', () => {
   test('the user default round-trips without a project context', () => {
@@ -68,9 +91,9 @@ describe('saved values', () => {
     assert.equal(loaded.enabled, true)
     assert.equal(loaded.source, 'user')
     assert.deepEqual(loaded.user, { scope: 'user', path: userFile, exists: true, enabled: true, ignored: null, error: null })
-    assert.equal(loaded.project.ignored.code, 'no-cwd')
+    assert.equal(loaded.project.ignored?.code, 'no-cwd')
 
-    assert.equal(store.set('user', false).changed, true)
+    assert.equal(changed(store.set('user', false)), true)
     assert.deepEqual(read(userFile), { enabled: false })
     assert.equal(store.load().enabled, false)
   })
@@ -83,7 +106,7 @@ describe('saved values', () => {
     assert.equal(loaded.enabled, false)
     assert.equal(loaded.source, 'project')
     assert.deepEqual(loaded.project, { scope: 'project', path: projectFile, exists: true, enabled: false, ignored: null, error: null })
-    assert.equal(store.set('project', true, ctx(cwd)).changed, true)
+    assert.equal(changed(store.set('project', true, ctx(cwd))), true)
     assert.equal(store.load(ctx(cwd)).enabled, true)
   })
 
@@ -125,10 +148,10 @@ describe('saved values', () => {
     assert.deepEqual(store.reset('project', ctx(cwd)), { ok: true, scope: 'project', path: projectFile, enabled: undefined, changed: true })
     assert.deepEqual(read(projectFile), {})
     assert.deepEqual([store.load(ctx(cwd)).enabled, store.load(ctx(cwd)).source], [true, 'user'])
-    assert.equal(store.reset('user').changed, true)
+    assert.equal(changed(store.reset('user')), true)
     assert.deepEqual(read(userFile), {})
     assert.equal(store.load(ctx(cwd)).enabled, undefined)
-    assert.equal(store.reset('user').changed, false)
+    assert.equal(changed(store.reset('user')), false)
   })
 
   test('resetting a missing file succeeds without creating directories', () => {
@@ -165,10 +188,15 @@ describe('saved values', () => {
 
   test('set rejects non-boolean values and unknown scopes', () => {
     const { store, root } = setup()
+    // @ts-expect-error -- a non-boolean value, rejected at run time
     assert.throws(() => store.set('user', 'true'), TypeError)
+    // @ts-expect-error -- a missing value, rejected at run time
     assert.throws(() => store.set('user', undefined), TypeError)
+    // @ts-expect-error -- an unknown scope, rejected at run time
     assert.throws(() => store.set('global', true), TypeError)
+    // @ts-expect-error -- an unknown scope, rejected at run time
     assert.throws(() => store.reset('global'), TypeError)
+    // @ts-expect-error -- an unknown scope, rejected at run time
     assert.throws(() => store.set('workspace', false, ctx(root)), TypeError)
     assert.deepEqual(tree(root), [])
   })
@@ -198,9 +226,16 @@ describe('project location', () => {
   test('a missing or relative working directory leaves the project unused', () => {
     const { store, root } = setup()
     store.set('user', false)
-    for (const context of [undefined, {}, { cwd: '', isProjectTrusted: () => true }, { cwd: 'project', isProjectTrusted: () => true }]) {
+    const contexts: (PreferenceContext | undefined)[] = [
+      undefined,
+      // @ts-expect-error -- a context without the cwd Pi always passes, checked at run time
+      {},
+      { cwd: '', isProjectTrusted: () => true },
+      { cwd: 'project', isProjectTrusted: () => true },
+    ]
+    for (const context of contexts) {
       const loaded = store.load(context)
-      assert.deepEqual(loaded.project.ignored.code, 'no-cwd')
+      assert.deepEqual(loaded.project.ignored?.code, 'no-cwd')
       assert.equal(loaded.project.path, null)
       assert.deepEqual([loaded.enabled, loaded.source], [false, 'user'])
       const saved = store.set('project', true, context)
@@ -212,7 +247,8 @@ describe('project location', () => {
 })
 
 describe('project trust', () => {
-  const contexts = {
+  // A trust check as a host may provide it: absent, throwing, or returning something other than a boolean.
+  const contexts: Record<string, { code: PreferenceIgnoredCode; isProjectTrusted?: PreferenceContext['isProjectTrusted'] }> = {
     denied: { code: 'untrusted', isProjectTrusted: () => false },
     missing: { code: 'trust-unavailable' },
     throwing: {
@@ -221,6 +257,7 @@ describe('project trust', () => {
         throw new Error('trust store offline')
       },
     },
+    // @ts-expect-error -- a non-boolean answer, checked at run time
     'non-boolean': { code: 'trust-unavailable', isProjectTrusted: () => 'yes' },
   }
 
@@ -236,7 +273,7 @@ describe('project trust', () => {
       const loaded = spied.load(context)
       assert.equal(loaded.enabled, undefined)
       assert.deepEqual([loaded.project.path, loaded.project.exists, loaded.project.enabled, loaded.project.error], [projectFile, false, undefined, null])
-      assert.equal(loaded.project.ignored.code, code)
+      assert.equal(loaded.project.ignored?.code, code)
       assert.match(loaded.project.ignored.message, /run \/trust and restart Pi, or start Pi with --approve/)
       if (name === 'throwing') assert.match(loaded.project.ignored.message, /trust store offline/)
 
@@ -258,7 +295,7 @@ describe('project trust', () => {
 })
 
 describe('damaged files', () => {
-  const cases = {
+  const cases: Record<string, [text: string, code: PreferenceErrorCode]> = {
     'invalid JSON': ['{"enabled": tru', 'malformed'],
     'empty file': ['', 'malformed'],
     array: ['[true]', 'invalid'],
@@ -279,7 +316,7 @@ describe('damaged files', () => {
       assert.equal(loaded.project.exists, true)
       assert.equal(loaded.project.enabled, undefined)
       assert.equal(loaded.project.ignored, null)
-      assert.equal(loaded.project.error.code, code)
+      assert.equal(loaded.project.error?.code, code)
       assert.ok(loaded.project.error.message.includes(projectFile))
       for (const result of [store.set('project', false, ctx(cwd)), store.reset('project', ctx(cwd))]) {
         assert.equal(result.ok, false)
@@ -297,7 +334,7 @@ describe('damaged files', () => {
     const loaded = store.load(ctx(cwd))
     assert.equal(loaded.enabled, undefined)
     assert.equal(loaded.user.exists, true)
-    assert.equal(loaded.user.error.code, 'unreadable')
+    assert.equal(loaded.user.error?.code, 'unreadable')
     assert.match(loaded.user.error.message, /cannot read .*forum\.json: .*EISDIR/)
     const result = store.set('user', true)
     assert.equal(result.ok, false)
@@ -333,27 +370,28 @@ describe('atomic updates', () => {
     assert.equal(store.set('project', true, ctx(cwd)).ok, true)
     const names = calls.map(([name]) => name)
     assert.deepEqual(names, ['readFileSync', 'mkdirSync', 'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync'])
-    const [, temp, flags] = calls.find(([name]) => name === 'openSync')
+    const [, temp, flags] = calls.find(isCall('openSync'))!
     assert.equal(flags, 'wx')
     assert.equal(path.dirname(temp), path.dirname(projectFile))
-    assert.deepEqual(calls.find(([name]) => name === 'renameSync').slice(1), [temp, projectFile])
+    assert.deepEqual(calls.find(isCall('renameSync'))!.slice(1), [temp, projectFile])
     assert.deepEqual(tree(path.dirname(projectFile)), ['forum.json'])
   })
 
-  const steps = ['mkdirSync', 'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync']
+  const steps = ['mkdirSync', 'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync'] as const satisfies readonly (keyof PreferenceFs)[]
   for (const step of steps) {
     for (const existing of [true, false]) {
       test(`a failing ${step} ${existing ? 'keeps the existing file' : 'creates no file'} and leaves no temporary file`, () => {
         const { cwd, agentDir, projectFile } = setup()
         const original = '{"other":"keep","enabled":true}'
         if (existing) write(projectFile, original)
-        const fs = {
+        const fs: PreferenceFs = {
           ...nodeFs,
-          [step]: (...args) => {
+          [step]: (...args: Parameters<PreferenceFs[typeof step]>) => {
             // A failed write leaves partial content behind, as a full disk would.
             if (step === 'writeFileSync') nodeFs.writeFileSync(args[0], '{"ena')
-            // A failed close still releases the descriptor, as on Linux.
-            if (step === 'closeSync') nodeFs.closeSync(args[0])
+            // A failed close still releases the descriptor, as on Linux. Checking step does not narrow
+            // args, so closeSync's descriptor is asserted.
+            if (step === 'closeSync') nodeFs.closeSync(args[0] as number)
             throw Object.assign(new Error(`${step} failed`), { code: 'EIO' })
           },
         }
@@ -407,7 +445,7 @@ describe('atomic updates', () => {
     const result = createPreferenceStore({ getAgentDir: () => agentDir, fs }).set('user', true)
     assert.equal(result.ok, false)
     assert.equal(result.error.code, 'write-failed')
-    const [temp] = tree(agentDir)
+    const temp = tree(agentDir)[0]!
     assert.match(temp, /^\.forum\.json\..+\.tmp$/)
     assert.equal(
       result.error.message,

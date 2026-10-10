@@ -31,14 +31,15 @@
     "node": ">=22.19"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "smoke": "node --test test/smoke.test.js",
-    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test \"test/*.test.ts\"",
+    "smoke": "node --test test/smoke.test.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.tooling.json",
     "build": "node scripts/build.mjs",
     "check-generated": "node scripts/build.mjs --check",
     "prepack": "npm run build"
   },
   "devDependencies": {
+    "@babel/parser": "7.29.7",
     "@earendil-works/pi-coding-agent": "1.1.0",
     "@earendil-works/pi-tui": "1.1.0",
     "@types/node": "22.19.21",

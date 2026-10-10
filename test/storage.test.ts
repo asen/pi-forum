@@ -4,11 +4,14 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { encodeCursor } from '../src/cursor.js'
+import type { CursorData } from '../src/cursor.js'
 import { createTopic, getTopic, listMessages, listTopics, postMessage } from '../src/storage.js'
+import type { ListMessagesOptions, Message, Page, Topic, WarningHandler } from '../src/types.js'
 
-const roots = []
+const roots: string[] = []
 
 after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
@@ -20,18 +23,25 @@ async function tempForum() {
   return path.join(root, 'forum')
 }
 
-const logPath = (dir) => path.join(dir, 'events.jsonl')
-const lockPath = (dir) => path.join(dir, '.write-lock')
+const logPath = (dir: string) => path.join(dir, 'events.jsonl')
+const lockPath = (dir: string) => path.join(dir, '.write-lock')
 
-async function readEvents(dir) {
+// One line of the log as stored: an event's type beside its record's fields.
+type StoredEvent = Record<string, unknown>
+
+async function readEvents(dir: string): Promise<StoredEvent[]> {
   const text = await fs.readFile(logPath(dir), 'utf8')
   assert.ok(text.endsWith('\n'))
   return text.slice(0, -1).split('\n').map((line) => JSON.parse(line))
 }
 
-async function readAll(fn, dir, options) {
-  const items = []
-  let cursor
+async function readAll<T>(
+  fn: (dir: string, options?: ListMessagesOptions) => Promise<Page<T>>,
+  dir: string,
+  options?: ListMessagesOptions,
+) {
+  const items: T[] = []
+  let cursor: string | undefined
   for (;;) {
     const page = await fn(dir, { ...options, after: cursor })
     items.push(...page.items)
@@ -42,13 +52,22 @@ async function readAll(fn, dir, options) {
 }
 
 function collectWarnings() {
-  const warnings = []
-  return { warnings, onWarning: (message) => warnings.push(message) }
+  const warnings: string[] = []
+  return { warnings, onWarning: (message: string) => warnings.push(message) }
 }
 
-const forumError = (code) => (err) => err.name === 'ForumError' && err.code === code
+// A rejection as the predicates below read it. Thrown values are unknown; reading their fields through
+// this type is the only unchecked step, and the predicates assert each field they use.
+interface Rejection extends Error {
+  code: string
+  cause: Rejection
+  topic: Topic
+}
+const rejection = (check: (err: Rejection) => boolean) => (thrown: unknown) => check(thrown as Rejection)
 
-async function assertUnchanged(dir, fn) {
+const forumError = (code: string) => rejection((err) => err.name === 'ForumError' && err.code === code)
+
+async function assertUnchanged(dir: string, fn: () => Promise<void>) {
   const before = await fs.readFile(logPath(dir))
   await fn()
   assert.deepEqual(await fs.readFile(logPath(dir)), before)
@@ -82,9 +101,10 @@ describe('writing', () => {
       originSessionId: 'sess-1',
     })
     assert.equal(topic.origin_session_id, 'sess-1')
-    assert.deepEqual(Object.keys(message), ['id', 'topic_id', 'author', 'body', 'created_at', 'origin_session_id'])
-    assert.equal(message.topic_id, topic.id)
-    assert.equal(message.body, body)
+    // createTopic returns a message whenever it is given a body.
+    assert.deepEqual(Object.keys(message!), ['id', 'topic_id', 'author', 'body', 'created_at', 'origin_session_id'])
+    assert.equal(message!.topic_id, topic.id)
+    assert.equal(message!.body, body)
     assert.deepEqual(await readEvents(dir), [
       { type: 'topic_created', ...topic },
       { type: 'message_posted', ...message },
@@ -122,7 +142,7 @@ describe('writing', () => {
         forumError('NOT_FOUND'),
       )
       await assert.rejects(
-        postMessage(dir, { topicId: other.id, author: 'a', body: 'x', replyTo: message.id }),
+        postMessage(dir, { topicId: other.id, author: 'a', body: 'x', replyTo: message!.id }),
         forumError('INVALID_INPUT'),
       )
       // A topic ID is not a message ID.
@@ -158,6 +178,7 @@ describe('writing', () => {
         { title: 'T', author: 'a', originSessionId: ' ' },
         { title: 'T\uD800', author: 'a' },
       ]) {
+        // @ts-expect-error -- deliberately invalid inputs, rejected at run time
         await assert.rejects(createTopic(dir, input), invalid, JSON.stringify(input))
       }
       for (const input of [
@@ -169,6 +190,7 @@ describe('writing', () => {
         // 21846 three-byte characters are 65538 bytes but fewer than 65536 characters.
         { topicId: topic.id, author: 'a', body: '€'.repeat(21846) },
       ]) {
+        // @ts-expect-error -- deliberately invalid inputs, rejected at run time
         await assert.rejects(postMessage(dir, input), invalid, JSON.stringify(input).slice(0, 80))
       }
       await assert.rejects(createTopic('relative/forum', { title: 'T', author: 'a' }), invalid)
@@ -216,6 +238,7 @@ describe('reading', () => {
     assert.equal((await listTopics(dir, { limit: 1 })).items.length, 1)
     assert.equal((await listMessages(dir, { limit: 100 })).items.length, 60)
     for (const limit of [0, 101, 1.5, '5', -1, Number.NaN]) {
+      // @ts-expect-error -- deliberately invalid limits, rejected at run time
       await assert.rejects(listTopics(dir, { limit }), forumError('INVALID_INPUT'), String(limit))
     }
   })
@@ -223,11 +246,11 @@ describe('reading', () => {
   test('paginates and filters multibyte records in append order', async () => {
     const dir = await tempForum()
     const titles = ['Ünïcödé', '日本語のトピック', '🧪 tests', 'plain', 'Ελληνικά']
-    const topics = []
+    const topics: Topic[] = []
     for (const title of titles) topics.push((await createTopic(dir, { title, author: 'ä', body: `${title} 🚀` })).topic)
-    const messages = []
+    const messages: Message[] = []
     for (let i = 0; i < 12; i++) {
-      const topic = topics[i % topics.length]
+      const topic = topics[i % topics.length]!
       messages.push(await postMessage(dir, { topicId: topic.id, author: 'β', body: `${i}: こんにちは 👋\n✓` }))
     }
 
@@ -238,7 +261,7 @@ describe('reading', () => {
     assert.equal(allMessages.items.length, topics.length + messages.length)
     assert.deepEqual(allMessages.items.slice(topics.length), messages)
 
-    const target = topics[2]
+    const target = topics[2]!
     const filtered = await readAll(listMessages, dir, { topicId: target.id, limit: 1 })
     assert.deepEqual(
       filtered.items,
@@ -267,12 +290,12 @@ describe('reading', () => {
   })
 })
 
-function decode(cursor) {
+function decode(cursor: string): CursorData {
   return JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
 }
 
 // Re-encodes a cursor with another offset, keeping its forum identity.
-function encodeCursorFor(cursor, offset) {
+function encodeCursorFor(cursor: string, offset: number) {
   return encodeCursor(decode(cursor).forum, offset)
 }
 
@@ -317,7 +340,7 @@ describe('cursors', () => {
     const { forum, offset } = decode(next_cursor)
     const bytes = await fs.readFile(logPath(dir))
     const size = bytes.length
-    const raw = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
+    const raw = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
     const bad = [
       '',
       'not a cursor!',
@@ -361,7 +384,7 @@ describe('damaged logs', () => {
       Buffer.concat([Buffer.from('{"type":"topic_created","id":"bad","title":"'), Buffer.from([0xff, 0xfe]), Buffer.from('","created_by":"a","created_at":"z"}\n')]),
     ]
     await fs.appendFile(logPath(dir), Buffer.concat(junk))
-    const offsets = []
+    const offsets: number[] = []
     let position = offset
     for (const line of junk) {
       offsets.push(position)
@@ -375,7 +398,7 @@ describe('damaged logs', () => {
     assert.deepEqual(all.items, [message])
     assert.equal(warnings.length, junk.length)
     warnings.forEach((warning, i) => assert.match(warning, new RegExp(`malformed record at byte offset ${offsets[i]}:`)))
-    assert.match(warnings[3], /unknown record type "topic_deleted"/)
+    assert.match(warnings[3]!, /unknown record type "topic_deleted"/)
 
     const topics = await listTopics(dir, { onWarning() {} })
     assert.deepEqual(topics.items, [topic])
@@ -409,7 +432,7 @@ describe('damaged logs', () => {
     await fs.appendFile(logPath(dir), junk.join(''))
     const after = await postMessage(dir, { topicId: topic.id, author: 'a', body: 'after' }, { onWarning() {} })
 
-    const expected = []
+    const expected: RegExp[] = []
     let position = offset
     for (const line of junk) {
       expected.push(new RegExp(`^skipping malformed record at byte offset ${position}: unknown record type`))
@@ -418,8 +441,8 @@ describe('damaged logs', () => {
     const topics = collectWarnings()
     assert.deepEqual((await listTopics(dir, { onWarning: topics.onWarning })).items, [topic])
     assert.equal(topics.warnings.length, junk.length)
-    topics.warnings.forEach((warning, i) => assert.match(warning, expected[i]))
-    assert.match(topics.warnings[0], /unknown record type \["topic_created"\]/)
+    topics.warnings.forEach((warning, i) => assert.match(warning, expected[i]!))
+    assert.match(topics.warnings[0]!, /unknown record type \["topic_created"\]/)
 
     const messages = collectWarnings()
     assert.deepEqual((await listMessages(dir, { onWarning: messages.onWarning })).items, [message, after])
@@ -480,20 +503,10 @@ describe('locking', () => {
   test('concurrent processes keep distinct complete records', async () => {
     const dir = await tempForum()
     const { topic } = await createTopic(dir, { title: 'T', author: 'a' })
-    const storage = new URL('../src/storage.js', import.meta.url).href
-    const script = `
-      import { createTopic, postMessage } from ${JSON.stringify(storage)}
-      const [dir, topicId, worker] = process.argv.slice(1)
-      for (let i = 0; i < 10; i++) {
-        await postMessage(dir, { topicId, author: worker, body: worker + ':' + i + ' ' + '🧵'.repeat(500) })
-        if (i % 5 === 0) await createTopic(dir, { title: worker + ':' + i, author: worker, body: 'é'.repeat(1000) })
-      }
-    `
+    const script = fileURLToPath(new URL('./fixtures/storage-worker.ts', import.meta.url))
     const run = promisify(execFile)
     await Promise.all(
-      Array.from({ length: 4 }, (_, worker) =>
-        run(process.execPath, ['--input-type=module', '-e', script, dir, topic.id, `w${worker}`]),
-      ),
+      Array.from({ length: 4 }, (_, worker) => run(process.execPath, [script, dir, topic.id, `w${worker}`])),
     )
     const events = await readEvents(dir)
     // 1 topic + 4 workers x (10 messages + 2 topics with initial messages).
@@ -533,12 +546,15 @@ describe('locking', () => {
       throw failure
     })
     await assertUnchanged(dir, async () => {
-      await assert.rejects(postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }), (err) => {
-        assert.equal(err.code, 'WRITE_FAILED')
-        assert.equal(err.cause, failure)
-        assert.match(err.message, /ENOSPC/)
-        return true
-      })
+      await assert.rejects(
+        postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }),
+        rejection((err) => {
+          assert.equal(err.code, 'WRITE_FAILED')
+          assert.equal(err.cause, failure)
+          assert.match(err.message, /ENOSPC/)
+          return true
+        }),
+      )
       await assert.rejects(createTopic(dir, { title: 'T2', author: 'a' }), forumError('WRITE_FAILED'))
     })
     t.mock.restoreAll()
@@ -549,19 +565,22 @@ describe('locking', () => {
     const dir = await tempForum()
     const appendFile = fs.appendFile
     const failure = new Error('EIO: i/o error')
-    t.mock.method(fs, 'appendFile', async (...args) => {
+    t.mock.method(fs, 'appendFile', async (...args: Parameters<typeof fs.appendFile>) => {
       if (String(args[1]).includes('"message_posted"')) throw failure
       return appendFile(...args)
     })
-    let created
-    await assert.rejects(createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }), (err) => {
-      assert.equal(err.code, 'PARTIAL_WRITE')
-      assert.equal(err.cause.code, 'WRITE_FAILED')
-      assert.equal(err.cause.cause, failure)
-      assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
-      created = err.topic
-      return true
-    })
+    let created!: Topic
+    await assert.rejects(
+      createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }),
+      rejection((err) => {
+        assert.equal(err.code, 'PARTIAL_WRITE')
+        assert.equal(err.cause.code, 'WRITE_FAILED')
+        assert.equal(err.cause.cause, failure)
+        assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
+        created = err.topic
+        return true
+      }),
+    )
     t.mock.restoreAll()
     await assert.rejects(fs.stat(lockPath(dir)), { code: 'ENOENT' })
     assert.deepEqual(await getTopic(dir, created.id), created)
@@ -574,7 +593,7 @@ describe('locking', () => {
     const appendFile = fs.appendFile
     const failure = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' })
     const lockFailure = Object.assign(new Error('EROFS: read-only file system'), { code: 'EROFS' })
-    t.mock.method(fs, 'appendFile', async (...args) => {
+    t.mock.method(fs, 'appendFile', async (...args: Parameters<typeof fs.appendFile>) => {
       if (String(args[1]).includes('"message_posted"')) throw failure
       return appendFile(...args)
     })
@@ -582,20 +601,23 @@ describe('locking', () => {
       throw lockFailure
     })
     const warn = t.mock.method(console, 'warn', () => {})
-    let created
-    await assert.rejects(createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }), (err) => {
-      assert.equal(err.name, 'ForumError')
-      assert.equal(err.code, 'PARTIAL_WRITE')
-      assert.equal(err.cause.code, 'WRITE_FAILED')
-      assert.equal(err.cause.cause, failure)
-      assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
-      created = err.topic
-      return true
-    })
+    let created!: Topic
+    await assert.rejects(
+      createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }),
+      rejection((err) => {
+        assert.equal(err.name, 'ForumError')
+        assert.equal(err.code, 'PARTIAL_WRITE')
+        assert.equal(err.cause.code, 'WRITE_FAILED')
+        assert.equal(err.cause.cause, failure)
+        assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
+        created = err.topic
+        return true
+      }),
+    )
     t.mock.restoreAll()
     assert.equal(warn.mock.callCount(), 1)
     assert.equal(
-      warn.mock.calls[0].arguments[0],
+      warn.mock.calls[0]?.arguments[0],
       `pi-forum: warning: could not remove ${lockPath(dir)} after a failed write: ${lockFailure.message}; ` +
         'if no pi-forum write is running, remove it manually',
     )
@@ -617,15 +639,18 @@ describe('locking', () => {
       throw Object.assign(new Error('EROFS: read-only file system'), { code: 'EROFS' })
     })
     const { warnings, onWarning } = collectWarnings()
-    await assert.rejects(postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }), (err) => {
-      assert.equal(err.name, 'ForumError')
-      assert.equal(err.code, 'WRITE_FAILED')
-      assert.equal(err.cause, failure)
-      return true
-    })
+    await assert.rejects(
+      postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }),
+      rejection((err) => {
+        assert.equal(err.name, 'ForumError')
+        assert.equal(err.code, 'WRITE_FAILED')
+        assert.equal(err.cause, failure)
+        return true
+      }),
+    )
     t.mock.restoreAll()
     assert.equal(warnings.length, 1)
-    assert.match(warnings[0], /^could not remove .*\.write-lock after a failed write: EROFS: read-only file system;/)
+    assert.match(warnings[0]!, /^could not remove .*\.write-lock after a failed write: EROFS: read-only file system;/)
     assert.deepEqual(await fs.readFile(logPath(dir)), before)
     assert.ok((await fs.stat(lockPath(dir))).isDirectory())
     await fs.rmdir(lockPath(dir))
@@ -642,14 +667,17 @@ describe('locking', () => {
       throw null
     })
     const { warnings, onWarning } = collectWarnings()
-    await assert.rejects(postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }), (err) => {
-      assert.equal(err.code, 'WRITE_FAILED')
-      assert.equal(err.cause, failure)
-      return true
-    })
+    await assert.rejects(
+      postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }),
+      rejection((err) => {
+        assert.equal(err.code, 'WRITE_FAILED')
+        assert.equal(err.cause, failure)
+        return true
+      }),
+    )
     t.mock.restoreAll()
     assert.equal(warnings.length, 1)
-    assert.match(warnings[0], /^could not remove .*\.write-lock after a failed write: undefined;/)
+    assert.match(warnings[0]!, /^could not remove .*\.write-lock after a failed write: undefined;/)
     await fs.rmdir(lockPath(dir))
   })
 
@@ -665,19 +693,22 @@ describe('locking', () => {
     t.mock.method(fs, 'rmdir', async () => {
       throw Object.assign(new Error('EROFS: read-only file system'), { code: 'EROFS' })
     })
-    const onWarning = t.mock.fn(() => {
+    const onWarning = t.mock.fn<WarningHandler>(() => {
       throw reporterFailure
     })
-    await assert.rejects(postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }), (err) => {
-      assert.notEqual(err, reporterFailure)
-      assert.equal(err.name, 'ForumError')
-      assert.equal(err.code, 'WRITE_FAILED')
-      assert.equal(err.cause, failure)
-      return true
-    })
+    await assert.rejects(
+      postMessage(dir, { topicId: topic.id, author: 'a', body: 'x' }, { onWarning }),
+      rejection((err) => {
+        assert.notEqual(err, reporterFailure)
+        assert.equal(err.name, 'ForumError')
+        assert.equal(err.code, 'WRITE_FAILED')
+        assert.equal(err.cause, failure)
+        return true
+      }),
+    )
     t.mock.restoreAll()
     assert.equal(onWarning.mock.callCount(), 1)
-    assert.match(onWarning.mock.calls[0].arguments[0], /^could not remove .*\.write-lock after a failed write: EROFS/)
+    assert.match(onWarning.mock.calls[0]!.arguments[0], /^could not remove .*\.write-lock after a failed write: EROFS/)
     assert.deepEqual(await fs.readFile(logPath(dir)), before)
     assert.ok((await fs.stat(lockPath(dir))).isDirectory())
     await fs.rmdir(lockPath(dir))
@@ -688,7 +719,7 @@ describe('locking', () => {
     const appendFile = fs.appendFile
     const failure = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' })
     const reporterFailure = new Error('stderr closed')
-    t.mock.method(fs, 'appendFile', async (...args) => {
+    t.mock.method(fs, 'appendFile', async (...args: Parameters<typeof fs.appendFile>) => {
       if (String(args[1]).includes('"message_posted"')) throw failure
       return appendFile(...args)
     })
@@ -698,17 +729,20 @@ describe('locking', () => {
     const warn = t.mock.method(console, 'warn', () => {
       throw reporterFailure
     })
-    let created
-    await assert.rejects(createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }), (err) => {
-      assert.notEqual(err, reporterFailure)
-      assert.equal(err.name, 'ForumError')
-      assert.equal(err.code, 'PARTIAL_WRITE')
-      assert.equal(err.cause.code, 'WRITE_FAILED')
-      assert.equal(err.cause.cause, failure)
-      assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
-      created = err.topic
-      return true
-    })
+    let created!: Topic
+    await assert.rejects(
+      createTopic(dir, { title: 'Partial', author: 'a', body: 'lost' }),
+      rejection((err) => {
+        assert.notEqual(err, reporterFailure)
+        assert.equal(err.name, 'ForumError')
+        assert.equal(err.code, 'PARTIAL_WRITE')
+        assert.equal(err.cause.code, 'WRITE_FAILED')
+        assert.equal(err.cause.cause, failure)
+        assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
+        created = err.topic
+        return true
+      }),
+    )
     t.mock.restoreAll()
     assert.equal(warn.mock.callCount(), 1)
     assert.ok((await fs.stat(lockPath(dir))).isDirectory())

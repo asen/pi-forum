@@ -1,21 +1,44 @@
-// Regression tests for scripts/build.mjs, behind npm run build, npm run check-generated and npm's
+// Regression tests for scripts/build.mjs (the bootstrap of scripts/build.ts), behind npm run build, npm run check-generated and npm's
 // prepack. Each test works in its own scratch copy of the checkout (as Git would clone it, with the
 // checkout's node_modules linked in for the compiler and the host types), so the working tree is
 // never built, packed or otherwise written. They need the dev dependencies installed (npm ci).
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import type { ExecFileException } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { promisify } from 'node:util'
-import { ROOT, copyCheckout, generatedInventory, listFiles, snapshot } from './checkout.js'
+import { ROOT, copyCheckout, generatedInventory, listFiles, snapshot } from './checkout.ts'
+import type { Inventory } from './checkout.ts'
 
 const exec = promisify(execFile)
 const SKIP = ['node_modules', '.git']
-let temp
-let inventory
+let temp: string
+let inventory: Inventory
 let copies = 0
+
+// A scratch copy of the checkout and the temp directory its build stages in.
+interface Copy {
+  dir: string
+  tmp: string
+}
+
+interface BuildResult {
+  code: number
+  stdout: string
+  lines: string[]
+}
+
+// What a promisified execFile rejects with when the command ran and failed.
+type ExecFailure = ExecFileException & { stdout: string; stderr: string }
+
+// The parts of npm pack --json's output the tests read: one entry per packed package.
+interface PackResult {
+  filename: string
+  files: { path: string }[]
+}
 
 before(async () => {
   temp = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-build-test-'))
@@ -28,7 +51,7 @@ after(async () => {
 })
 
 // A scratch copy of the checkout with its own temp directory, where the build stages its output.
-async function scratch() {
+async function scratch(): Promise<Copy> {
   const dir = path.join(temp, `copy-${++copies}`)
   await copyCheckout(dir)
   await fs.symlink(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'))
@@ -38,24 +61,24 @@ async function scratch() {
 }
 
 // Runs scripts/build.mjs of a copy; resolves to its exit code, stdout and stderr lines.
-async function build({ dir, tmp }, args = []) {
+async function build({ dir, tmp }: Copy, args: readonly string[] = []): Promise<BuildResult> {
   const options = { cwd: dir, env: { ...process.env, TMPDIR: tmp } }
   const result = await exec(process.execPath, [path.join(dir, 'scripts', 'build.mjs'), ...args], options).then(
     (done) => ({ code: 0, ...done }),
-    (err) => ({ code: err.code, stdout: err.stdout, stderr: err.stderr }),
+    (err: ExecFailure) => ({ code: err.code, stdout: err.stdout, stderr: err.stderr }),
   )
-  assert.equal(typeof result.code, 'number', `build did not run: ${result.stderr}`)
+  assert.ok(typeof result.code === 'number', `build did not run: ${result.stderr}`)
   // The staging directory is always removed.
   assert.deepEqual(await fs.readdir(tmp), [])
   return { code: result.code, stdout: result.stdout, lines: result.stderr.split('\n').filter(Boolean) }
 }
 
-const summary = (name, done) =>
+const summary = (name: string, done: string): string =>
   `${name}: ${inventory.generated.length} generated file(s) from ${inventory.sources.length} source(s) ${done}`
-const original = (file) => fs.readFile(path.join(ROOT, file))
+const original = (file: string): Promise<Buffer> => fs.readFile(path.join(ROOT, file))
 
 // Removes two generated files and edits two others, one of each kind.
-async function damage(dir) {
+async function damage(dir: string): Promise<void> {
   await fs.rm(path.join(dir, 'src/cursor.js'))
   await fs.rm(path.join(dir, 'extension/output.d.ts'))
   await fs.appendFile(path.join(dir, 'src/forum.js'), '// edited by hand\n')
@@ -132,7 +155,7 @@ test('a compile error fails build and check-generated without writing any file',
   await damage(copy.dir)
   await fs.appendFile(path.join(copy.dir, 'src/cursor.ts'), "\nexport const broken: number = 'not a number'\n")
   const before = await snapshot(copy.dir, { skip: SKIP })
-  for (const [args, name] of [[[], 'build'], [['--check'], 'check-generated']]) {
+  for (const [args, name] of [[[], 'build'], [['--check'], 'check-generated']] as const) {
     const result = await build(copy, args)
     assert.equal(result.code, 1)
     assert.equal(result.stdout, '')
@@ -145,7 +168,7 @@ test('a compile error fails build and check-generated without writing any file',
 
 test('build regenerates every output deterministically, identical to the tracked files', async () => {
   const copies = [await scratch(), await scratch()]
-  const outputs = []
+  const outputs: Buffer[][] = []
   for (const copy of copies) {
     for (const file of inventory.generated) await fs.rm(path.join(copy.dir, file))
     assert.deepEqual(await build(copy, ['--check']), {
@@ -158,8 +181,8 @@ test('build regenerates every output deterministically, identical to the tracked
     outputs.push(await Promise.all(inventory.generated.map((file) => fs.readFile(path.join(copy.dir, file)))))
   }
   for (const [i, file] of inventory.generated.entries()) {
-    assert.deepEqual(outputs[0][i], outputs[1][i], file)
-    assert.deepEqual(outputs[0][i], await original(file), file)
+    assert.deepEqual(outputs[0]?.[i], outputs[1]?.[i], file)
+    assert.deepEqual(outputs[0]?.[i], await original(file), file)
   }
 })
 
@@ -183,7 +206,7 @@ test('npm pack builds through prepack and keeps its JSON output parseable', asyn
   const out = path.join(temp, 'packed')
   await fs.mkdir(out)
   const { stdout, stderr } = await exec('npm', ['pack', '--json', '--pack-destination', out], { cwd: copy.dir, env })
-  const [{ filename, files }] = JSON.parse(stdout)
+  const [{ filename, files }]: [PackResult] = JSON.parse(stdout)
   assert.match(stderr, new RegExp(`build: wrote src/forum\\.js\\n[^]*${summary('build', 'are up to date').replace(/[()]/g, '\\$&')}`))
   for (const file of DAMAGED) assert.ok(files.some((entry) => entry.path === file), file)
   const extracted = path.join(temp, 'packed-extracted')

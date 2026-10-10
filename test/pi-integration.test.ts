@@ -2,7 +2,7 @@
 // session runtime, event dispatch, prompt renderer and bash tool. It needs a Pi installation, so it
 // runs only when PI_FORUM_TEST_PI_ROOT names the root of an installed @earendil-works/pi-coding-agent:
 //
-//   PI_FORUM_TEST_PI_ROOT=/path/to/node_modules/@earendil-works/pi-coding-agent node --test test/pi-integration.test.js
+//   PI_FORUM_TEST_PI_ROOT=/path/to/node_modules/@earendil-works/pi-coding-agent node --test test/pi-integration.test.ts
 //
 // With the variable set, a root that cannot be loaded fails the suite. Every run uses its own agent
 // directory, sessions, working directory, HOME, TMPDIR and npm cache under one temp directory, and
@@ -10,16 +10,49 @@
 // /forum is submitted through session.prompt(), which runs extension commands before any model check.
 // Agent runs, where needed, stream from a synthetic provider extension the test controls. The pi
 // executable itself also runs, headless in print, JSON and RPC mode and in tmux as a terminal.
+//
+// The installed host is imported at run time from PI_FORUM_TEST_PI_ROOT, so nothing here imports Pi's
+// packages for their values: those imports are type-only, against the Pi this repository develops
+// against (the pinned 1.1.0 devDependencies), and the modules loaded from the root are typed as them
+// where they are imported (setUp). What Pi writes for other processes (JSON and RPC records, session
+// files) and what the probe extensions log is typed where it is parsed. pi-forum itself, in both
+// variants, is always loaded from its generated JavaScript.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
+import type { FileHandle, FileReadResult } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { after, before, describe, test } from 'node:test'
+import { after, before, describe, test, type TestContext } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
+import type {
+  AgentSession,
+  AgentSessionEvent,
+  AgentSessionRuntime,
+  CreateAgentSessionRuntimeFactory,
+  CustomEntry,
+  Extension,
+  ExtensionContext,
+  ExtensionError,
+  ExtensionUIContext,
+  FileEntry,
+  JsonAgentSessionEvent,
+  RpcExtensionUIRequest,
+  RpcResponse,
+  SessionEntry,
+  SessionHeader,
+  Theme,
+} from '@earendil-works/pi-coding-agent'
+import type { AssistantMessage, JsonObject } from '@earendil-works/pi-ai'
+import type { AutocompleteItem } from '@earendil-works/pi-tui'
 import { createForum } from '../src/forum.js'
-import { copyCheckout, listFiles } from './checkout.js'
+import type { Message, Topic } from '../src/types.js'
+import { copyCheckout, listFiles, ROOT } from './checkout.ts'
+import type { LifecycleEvent, LifecycleProbeConfig, LifecycleProbeState } from './fixtures/pi-lifecycle-probe.ts'
+import type { RepairProbeConfig, RepairProbeRecord } from './fixtures/pi-repair-probe.ts'
+import type { StartupProbeConfig, StartupProbeRecord } from './fixtures/pi-startup-probe.ts'
+import type { NpmCall } from './fixtures/npm-logger.mts'
 import {
   FILE_SYNTHETIC_PROVIDER,
   SYNTHETIC_PROVIDER,
@@ -30,67 +63,86 @@ import {
   rpcProcess,
   tmuxSession,
   until,
-} from './pi-fixtures.js'
+  type TerminalUI,
+} from './pi-fixtures.ts'
 
 const exec = promisify(execFile)
-const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const PI_ROOT = process.env.PI_FORUM_TEST_PI_ROOT
 const HOST_PACKAGE = '@earendil-works/pi-coding-agent'
 const NODE_DIR = path.dirname(process.execPath)
 const BASE_PATH = [NODE_DIR, '/usr/bin', '/bin'].join(path.delimiter)
 
+// The two package variants under test, in the order setUp adds them to packages.
+const VARIANTS = ['source checkout', 'packed tarball'] as const
+
 const SKIP_REASON =
   'host-specific: set PI_FORUM_TEST_PI_ROOT to an installed @earendil-works/pi-coding-agent root to run it'
 
-let pi
-let piAi
-let piTui
-let piTheme
-let piManifest
-let temp
-let tarball
-let savedEnv
-let probes
+// What AgentSession.bindExtensions takes, which Pi's index does not export by name.
+type ExtensionBindings = Parameters<AgentSession['bindExtensions']>[0]
+type ExtensionMode = NonNullable<ExtensionBindings['mode']>
+
+// The installed host's modules, typed as the Pi this repository develops against.
+type PiCodingAgent = typeof import('@earendil-works/pi-coding-agent')
+type PiAi = typeof import('@earendil-works/pi-ai')
+type PiTui = typeof import('@earendil-works/pi-tui')
+
+// The fields of the host's package.json that this test reads.
+interface HostManifest {
+  name: string
+  version: string
+  exports: { '.': { import: string } }
+  bin: { pi: string }
+}
+
+// A package variant under test: the source checkout or the packed tarball, extracted.
+interface PackageVariant {
+  label: string
+  dir: string
+}
+
+// The probe extensions Pi loads: two lifecycle probes around pi-forum and the two synthetic providers.
+interface Probes {
+  before: string
+  after: string
+  synthetic: string
+  fileSynthetic: string
+}
+
+// setUp assigns all of these before any test runs.
+let pi!: PiCodingAgent
+let piAi!: PiAi
+let piTui!: PiTui
+let piTheme!: Theme
+let piManifest!: HostManifest
+let temp!: string
+let tarball!: string
+let savedEnv: NodeJS.ProcessEnv | undefined
+let probes!: Probes
 let calls = 0
-const packages = []
+const packages: PackageVariant[] = []
 
 // Replaces the whole process environment, so nothing from the caller's shell or Pi session leaks in.
-function setEnvironment(env) {
+function setEnvironment(env: NodeJS.ProcessEnv) {
   for (const key of Object.keys(process.env)) delete process.env[key]
   Object.assign(process.env, env)
 }
 
-// Two probe extensions load around pi-forum and record what each lifecycle event sees before and
-// after pi-forum's own handler, plus the rendered prompt and the extension context Pi passes.
-function probeSource(position) {
-  return `export default function (pi) {
-  const state = globalThis.piForumProbe
-  for (const name of ['session_start', 'session_shutdown']) {
-    pi.on(name, (event, ctx) => {
-      state.events.push({
-        probe: ${JSON.stringify(position)},
-        type: event.type,
-        reason: event.reason,
-        sessionId: ctx.sessionManager.getSessionId(),
-        forumDir: process.env.PI_FORUM_DIR,
-        path: process.env.PATH,
-      })
-    })
-  }
-  pi.on('before_agent_start', (event, ctx) => {
-    ${position === 'before' ? "event.systemPromptOptions.sections.team_notes = 'Notes from another extension.'" : ''}
-    state.starts = (state.starts ?? 0) + 1
-    state.prompts[${JSON.stringify(position)}] = event.systemPrompt
-    state.ctx = ctx
-  })
-  // Setting state.cancel cancels the next /new, /resume or /fork, as an extension or the user can.
-  ${position === 'before' ? "for (const name of ['session_before_switch', 'session_before_fork']) pi.on(name, () => (state.cancel ? { cancel: true } : undefined))" : ''}
+// Copies the probe extension test/fixtures/<fixture> to dest, a .ts file Pi loads, and writes the
+// configuration it reads next to it (X.ts reads X.json).
+async function installProbe<Config>(fixture: string, dest: string, config: Config) {
+  await fs.copyFile(new URL(`./fixtures/${fixture}`, import.meta.url), dest)
+  await fs.writeFile(dest.replace(/\.ts$/, '.json'), JSON.stringify(config))
 }
-`
+
+// The lines of a JSONL file Pi or a probe wrote, each one JSON.stringify of a Line.
+async function logRecords<Line>(file: string): Promise<Line[]> {
+  return (await fs.readFile(file, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Line)
 }
 
 async function setUp() {
-  piManifest = JSON.parse(await fs.readFile(path.join(PI_ROOT, 'package.json'), 'utf8'))
+  // The installed host's own package.json, which it ships.
+  piManifest = JSON.parse(await fs.readFile(path.join(PI_ROOT!, 'package.json'), 'utf8')) as HostManifest
   assert.equal(piManifest.name, HOST_PACKAGE, `${PI_ROOT} is not the ${HOST_PACKAGE} package root`)
   temp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-pi-test-')))
   for (const dir of ['home', 'tmp', 'npm-cache', 'xdg', 'probes', 'extracted']) await fs.mkdir(path.join(temp, dir))
@@ -111,35 +163,41 @@ async function setUp() {
     PI_TELEMETRY: '0',
   })
 
-  pi = await import(pathToFileURL(path.join(PI_ROOT, piManifest.exports['.'].import)).href)
+  // The boundary to the installed host: its modules are typed as the Pi this repository develops
+  // against, which the host must provide.
+  pi = (await import(pathToFileURL(path.join(PI_ROOT!, piManifest.exports['.'].import)).href)) as PiCodingAgent
   // The host's own copies of its AI and terminal libraries, which it also gives extensions.
-  const hostLibrary = async (name) => {
-    for (const dir of [path.join(PI_ROOT, 'node_modules', '@earendil-works'), path.dirname(PI_ROOT)]) {
+  const hostLibrary = async (name: string) => {
+    for (const dir of [path.join(PI_ROOT!, 'node_modules', '@earendil-works'), path.dirname(PI_ROOT!)]) {
       const entry = path.join(dir, name, 'dist', 'index.js')
-      if (await fs.access(entry).then(() => true, () => false)) return import(pathToFileURL(entry).href)
+      if (await fs.access(entry).then(() => true, () => false)) return pathToFileURL(entry).href
     }
     throw new Error(`cannot find @earendil-works/${name} for ${PI_ROOT}`)
   }
-  piAi = await hostLibrary('pi-ai')
-  piTui = await hostLibrary('pi-tui')
+  piAi = (await import(await hostLibrary('pi-ai'))) as PiAi
+  piTui = (await import(await hostLibrary('pi-tui'))) as PiTui
   pi.initTheme('dark')
-  // Pi passes custom UI factories this live view of the active theme.
-  piTheme = new Proxy({}, { get: (_target, key) => globalThis[Symbol.for('@earendil-works/pi-coding-agent:theme')][key] })
+  // Pi passes custom UI factories this live view of the active theme, which initTheme set.
+  const themeKey = Symbol.for('@earendil-works/pi-coding-agent:theme')
+  piTheme = new Proxy({} as Theme, { get: (_target, key) => Reflect.get(Reflect.get(globalThis, themeKey) as Theme, key) })
 
-  probes = {}
-  for (const position of ['before', 'after']) {
-    probes[position] = path.join(temp, 'probes', `probe-${position}.js`)
-    await fs.writeFile(probes[position], probeSource(position))
+  probes = {
+    before: path.join(temp, 'probes', 'probe-before.ts'),
+    after: path.join(temp, 'probes', 'probe-after.ts'),
+    synthetic: path.join(temp, 'probes', 'synthetic.ts'),
+    fileSynthetic: path.join(temp, 'probes', 'synthetic-file.ts'),
   }
-  probes.synthetic = path.join(temp, 'probes', 'synthetic.js')
+  for (const position of ['before', 'after'] as const) {
+    await installProbe<LifecycleProbeConfig>('pi-lifecycle-probe.ts', probes[position], { position })
+  }
   await fs.writeFile(probes.synthetic, SYNTHETIC_PROVIDER)
-  probes.fileSynthetic = path.join(temp, 'probes', 'synthetic-file.js')
   await fs.writeFile(probes.fileSynthetic, FILE_SYNTHETIC_PROVIDER)
 
   // Packs the tracked files without running prepack, so the working tree is never rebuilt
-  // (build.test.js covers prepack in a scratch copy).
+  // (build.test.ts covers prepack in a scratch copy).
   const { stdout } = await exec('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temp], { cwd: ROOT })
-  const [{ filename }] = JSON.parse(stdout)
+  // npm pack --json lists one entry per packed package.
+  const [{ filename }] = JSON.parse(stdout) as [{ filename: string }]
   tarball = path.join(temp, filename)
   await exec('tar', ['-xzf', tarball, '-C', path.join(temp, 'extracted')])
   packages.push({ label: 'source checkout', dir: ROOT.replace(/\/$/, '') })
@@ -151,60 +209,21 @@ async function tearDown() {
   if (temp) await fs.rm(temp, { recursive: true, force: true })
 }
 
-// A UI context for modes with a UI (as RPC binds one): records notifications, ignores the rest.
-function recordingUI(notices) {
-  const ui = { notify: (message, type = 'info') => notices.push({ type, message }) }
+type Notice = TerminalUI['notices'][number]
+// A notification as an RPC client gets it, whose type Pi may leave out.
+type RpcNotice = { type: Notice['type'] | undefined; message: string }
+
+// Any other ui method a mode with a UI might call does nothing and returns undefined, so the proxy
+// stands in for the whole ExtensionUIContext.
+function asUIContext(ui: Partial<ExtensionUIContext>) {
   return new Proxy(ui, {
-    get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined),
-  })
+    get: (target, key) => (key in target ? Reflect.get(target, key) : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined),
+  }) as ExtensionUIContext
 }
 
-// Extension source for a pi subprocess, loaded after pi-forum: appends what each session start and
-// shutdown sees to log, one JSON line each, including whether Pi trusts the project.
-function startupProbeSource(log) {
-  return `import fs from 'node:fs'
-export default function (pi) {
-  for (const name of ['session_start', 'session_shutdown']) {
-    pi.on(name, (event, ctx) => {
-      let trusted
-      try {
-        trusted = ctx.isProjectTrusted()
-      } catch (err) {
-        trusted = String(err)
-      }
-      const record = { type: event.type, reason: event.reason, cwd: ctx.cwd, trusted, sessionId: ctx.sessionManager.getSessionId(), forumDir: process.env.PI_FORUM_DIR ?? null, PATH: process.env.PATH }
-      fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(record) + '\\n')
-    })
-  }
-}
-`
-}
-
-// Extension source for a pi subprocess, loaded after pi-forum. At session start, once marker
-// exists, it removes marker and the file at forums, so pi-forum's own startup activation has
-// already failed on that file and the same runtime can then select again. /probe-env appends
-// { type: 'probe-env', forumDir, PATH, forums, entries } to log: whether forums exists, and the
-// entries of this session's generated directory, or null while it does not exist.
-function repairProbeSource({ log, marker, forums }) {
-  return `import fs from 'node:fs'
-import path from 'node:path'
-export default function (pi) {
-  pi.on('session_start', () => {
-    if (!fs.existsSync(${JSON.stringify(marker)})) return
-    fs.rmSync(${JSON.stringify(marker)})
-    fs.rmSync(${JSON.stringify(forums)})
-  })
-  pi.registerCommand('probe-env', {
-    description: 'Record the environment for the test',
-    handler: async (_args, ctx) => {
-      const dir = process.env.PI_FORUM_DIR ?? path.join(${JSON.stringify(forums)}, 'sessions', ctx.sessionManager.getSessionId())
-      const entries = fs.existsSync(dir) ? fs.readdirSync(dir) : null
-      const record = { type: 'probe-env', forumDir: process.env.PI_FORUM_DIR ?? null, PATH: process.env.PATH, forums: fs.existsSync(${JSON.stringify(forums)}), entries }
-      fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(record) + '\\n')
-    },
-  })
-}
-`
+// A UI context for modes with a UI (as RPC binds one): records notifications, ignores the rest.
+function recordingUI(notices: Notice[]) {
+  return asUIContext({ notify: (message, type = 'info') => notices.push({ type, message }) })
 }
 
 // Starts a Pi session runtime like the CLI does, with its own agent dir, sessions and project.
@@ -215,10 +234,41 @@ export default function (pi) {
 // uiContext and uiMode bind another UI and mode instead; abortHandler receives extension aborts;
 // synthetic also loads the synthetic provider. The SDK trusts the project, as Pi does for one
 // without protected resources; real trust decisions are covered through the pi executable.
+interface HostOptions {
+  supplied?: string
+  mode?: 'extension' | 'settings' | 'installed'
+  ui?: boolean
+  PATH?: string
+  uiContext?: ExtensionUIContext
+  uiMode?: ExtensionMode
+  abortHandler?: () => void
+  synthetic?: boolean
+  agentDir?: string
+  project?: string
+  sessions?: string
+}
+
+interface Host {
+  runtime: AgentSessionRuntime
+  agentDir: string
+  project: string
+  errors: ExtensionError[]
+  notices: Notice[]
+  probe: LifecycleProbeState
+  readonly sessionId: string
+  defaultDir(id: string): string
+}
+
+// Where /forum status looks for saved defaults: the agent dir and the working directory.
+interface StatusWhere {
+  agentDir: string
+  project: string
+}
+
 async function openHost(
-  packageDir,
-  { supplied, mode = 'extension', ui = false, PATH = BASE_PATH, uiContext, uiMode, abortHandler, synthetic = false, ...dirs } = {},
-) {
+  packageDir: string,
+  { supplied, mode = 'extension', ui = false, PATH = BASE_PATH, uiContext, uiMode, abortHandler, synthetic = false, ...dirs }: HostOptions = {},
+): Promise<Host> {
   const dir = await fs.mkdtemp(path.join(temp, 'host-'))
   const agentDir = dirs.agentDir ?? path.join(dir, 'agent')
   const project = dirs.project ?? path.join(dir, 'project')
@@ -234,10 +284,11 @@ async function openHost(
     ...(synthetic ? [probes.synthetic] : []),
     ...(mode === 'extension' ? [probes.before, packageDir, probes.after] : [probes.before, probes.after]),
   ]
-  globalThis.piForumProbe = { events: [], prompts: {} }
-  const errors = []
-  const notices = []
-  const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
+  const probe: LifecycleProbeState = { events: [], prompts: {} }
+  globalThis.piForumProbe = probe
+  const errors: ExtensionError[] = []
+  const notices: Notice[] = []
+  const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
     const services = await pi.createAgentSessionServices({
       cwd,
       agentDir,
@@ -249,17 +300,17 @@ async function openHost(
         noContextFiles: true,
       },
     })
-    const created = await pi.createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })
+    const created = await pi.createAgentSessionFromServices({ services, sessionManager, ...(sessionStartEvent && { sessionStartEvent }) })
     return { ...created, services, diagnostics: services.diagnostics }
   }
-  const bindings = {
+  const bindings: ExtensionBindings = {
     onError: (error) => errors.push(error),
     ...(ui && { uiContext: recordingUI(notices) }),
     ...(uiContext && { uiContext }),
     ...(uiMode && { mode: uiMode }),
     ...(abortHandler && { abortHandler }),
   }
-  const bind = (session) => session.bindExtensions(bindings)
+  const bind = (session: AgentSession) => session.bindExtensions(bindings)
   const runtime = await pi.createAgentSessionRuntime(createRuntime, {
     cwd: project,
     agentDir: pi.getAgentDir(),
@@ -273,7 +324,7 @@ async function openHost(
     project,
     errors,
     notices,
-    probe: globalThis.piForumProbe,
+    probe,
     get sessionId() {
       return runtime.session.sessionId
     },
@@ -281,8 +332,8 @@ async function openHost(
   }
 }
 
-function piCli(args, options) {
-  return exec(process.execPath, [path.join(PI_ROOT, piManifest.bin.pi), ...args], options)
+function piCli(args: readonly string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) {
+  return exec(process.execPath, [path.join(PI_ROOT!, piManifest.bin.pi), ...args], options)
 }
 
 // The pi executable run headless with directories of its own under a new run directory: HOME,
@@ -290,9 +341,20 @@ function piCli(args, options) {
 // offline, loads no extensions but packageDir and then extensions, and gets no environment but the
 // one given here plus each launch's env. launch(extra, { cwd, env }) runs it with stdin closed, as
 // Pi would otherwise read piped stdin into the prompt; args and options build other launches.
-async function headlessPi(packageDir, { extensions = [] } = {}) {
+interface LaunchOptions {
+  cwd?: string
+  env?: NodeJS.ProcessEnv
+}
+
+async function headlessPi(packageDir: string, { extensions = [] }: { extensions?: readonly string[] } = {}) {
   const run = await fs.mkdtemp(path.join(temp, 'headless-'))
-  const paths = Object.fromEntries(['home', 'agent', 'project', 'tmp', 'sessions'].map((name) => [name, path.join(run, name)]))
+  const paths = {
+    home: path.join(run, 'home'),
+    agent: path.join(run, 'agent'),
+    project: path.join(run, 'project'),
+    tmp: path.join(run, 'tmp'),
+    sessions: path.join(run, 'sessions'),
+  }
   for (const target of Object.values(paths)) await fs.mkdir(target)
   const base = {
     PATH: BASE_PATH,
@@ -303,23 +365,24 @@ async function headlessPi(packageDir, { extensions = [] } = {}) {
     PI_TELEMETRY: '0',
     PI_SKIP_VERSION_CHECK: '1',
   }
-  const args = (extra) => [
-    path.join(PI_ROOT, piManifest.bin.pi),
+  const args = (extra: readonly string[]) => [
+    path.join(PI_ROOT!, piManifest.bin.pi),
     ...['--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'],
     ...['--session-dir', paths.sessions, '-e', packageDir, ...extensions.flatMap((extension) => ['-e', extension])],
     ...extra,
   ]
-  const options = ({ cwd = paths.project, env = {} } = {}) => ({ cwd, env: { ...base, ...env }, timeout: 30000 })
-  const launch = (extra, launchOptions) => {
+  const options = ({ cwd = paths.project, env = {} }: LaunchOptions = {}) => ({ cwd, env: { ...base, ...env }, timeout: 30000 })
+  const launch = (extra: readonly string[], launchOptions?: LaunchOptions) => {
     const running = exec(process.execPath, args(extra), options(launchOptions))
-    running.child.stdin.end()
+    // exec pipes stdin, so the child has one.
+    running.child.stdin!.end()
     return running
   }
   return { run, paths, args, options, launch }
 }
 
 // The extension Pi loaded from packageDir, with no load errors or warnings for it.
-function loadedExtension(host, packageDir) {
+function loadedExtension(host: Host, packageDir: string): Extension {
   const result = host.runtime.services.resourceLoader.getExtensions()
   assert.deepEqual(result.errors, [])
   const entry = path.join(packageDir, 'extension', 'index.js')
@@ -329,8 +392,9 @@ function loadedExtension(host, packageDir) {
   return extension
 }
 
-// Dispatches before_agent_start through Pi's runner, as the start of an agent run does.
-async function startRun(host) {
+// Dispatches before_agent_start through Pi's runner, as the start of an agent run does. The
+// rendered prompts are the ones the two lifecycle probes saw.
+async function startRun(host: Host) {
   const { session } = host.runtime
   const options = {
     cwd: host.runtime.cwd,
@@ -339,27 +403,51 @@ async function startRun(host) {
   }
   const result = await session.extensionRunner.emitBeforeAgentStart('Check the forum.', undefined, options)
   assert.equal(result.systemPromptOptions.forceSystemPrompt, undefined)
-  return { sections: result.systemPromptOptions.sections, ...host.probe.prompts }
+  // Both probes saw this run.
+  return { sections: result.systemPromptOptions.sections, before: host.probe.prompts.before!, after: host.probe.prompts.after! }
+}
+
+// What Pi's bash tool reports to programmatic callers (its outputSchema), as far as these tests read it.
+interface BashOutput {
+  output: string
+  exit_code: number
+}
+
+// Pi 1.1.0's createBashTool wraps the bash tool definition, whose execute takes the extension context
+// of a run as a fifth argument, and passes it on (core/tools/tool-definition-wrapper.js); the
+// AgentTool type it is declared as leaves that argument out.
+interface BashTool {
+  execute(toolCallId: string, params: { command: string }, signal: undefined, onUpdate: undefined, ctx: ExtensionContext | undefined): Promise<{ structuredContent?: unknown }>
 }
 
 // Runs a command with Pi's standard bash tool and the extension context of the current run.
-async function bash(host, command) {
-  const tool = pi.createBashTool(host.runtime.cwd)
+async function bash(host: Host, command: string) {
+  const tool: BashTool = pi.createBashTool(host.runtime.cwd)
   const result = await tool.execute(`call-${++calls}`, { command }, undefined, undefined, host.probe.ctx)
-  return result.structuredContent
+  // The bash tool declares an outputSchema, so it always sets structuredContent to a BashOutput.
+  return result.structuredContent as BashOutput
 }
 
-const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-const quote = (arg) => `'${arg.replaceAll("'", `'\\''`)}'`
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const quote = (arg: string) => `'${arg.replaceAll("'", `'\\''`)}'`
 
-async function forum(host, args) {
+// pi-forum's JSON output for a CLI call, as far as these tests read it.
+interface ForumOutput {
+  topic: Topic
+  message: Message
+  items: (Topic & Message)[]
+}
+
+async function forum(host: Host, args: readonly string[]): Promise<ForumOutput> {
   const { output, exit_code: code } = await bash(host, `pi-forum ${args.map(quote).join(' ')}`)
   assert.equal(code, 0, output)
-  return JSON.parse(output)
+  // pi-forum's CLI writes one JSON result on success.
+  return JSON.parse(output) as ForumOutput
 }
 
 // Adds a user/assistant exchange without a model so the session file exists for resume and fork.
-function converse(host, text) {
+// The session then has a leaf, the assistant reply, whose parent is the user message.
+function converse(host: Host, text: string) {
   const manager = host.runtime.session.sessionManager
   const user = manager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() })
   const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
@@ -378,26 +466,34 @@ function converse(host, text) {
 
 // Submits a slash command as the editor does and returns the notifications it produced. Pi runs
 // a registered extension command with a real command context and never reaches the model.
-async function slash(host, text) {
+async function slash(host: Host, text: string) {
   host.notices.length = 0
   await host.runtime.session.prompt(text)
   return host.notices.splice(0)
 }
 
-const info = (message) => ({ type: 'info', message })
-const warning = (message) => ({ type: 'warning', message })
+const info = (message: string): Notice => ({ type: 'info', message })
+const warning = (message: string): Notice => ({ type: 'warning', message })
 const USAGE =
   'Usage: /forum [on|off|status] | /forum on|off|reset project|user | /forum topics [--after CURSOR] | ' +
   '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
-const onOff = (enabled) => (enabled ? 'on' : 'off')
+const onOff = (enabled: boolean) => (enabled ? 'on' : 'off')
 const NOTHING_SAVED = 'Effective default: off (nothing saved applies).'
 const SUPPLIED = 'Effective default: on, because PI_FORUM_DIR is supplied.'
 
 // What /forum status reports for a host's agentDir and project (or cwd): the state line, then each
 // saved default as last read, the effective default and any temporary override. user and project
 // are a saved value (undefined when not set) or, as a string, the whole description of the scope.
-function statusText(where, state, { user, project, cwd = where.project, effective = NOTHING_SAVED, override } = {}) {
-  const scope = (value, file) => (typeof value === 'string' ? value : `${value === undefined ? 'not set' : onOff(value)} (${file})`)
+interface StatusOptions {
+  user?: boolean | string
+  project?: boolean | string
+  cwd?: string
+  effective?: string
+  override?: boolean | undefined
+}
+
+function statusText(where: StatusWhere, state: string, { user, project, cwd = where.project, effective = NOTHING_SAVED, override }: StatusOptions = {}) {
+  const scope = (value: boolean | string | undefined, file: string) => (typeof value === 'string' ? value : `${value === undefined ? 'not set' : onOff(value)} (${file})`)
   const lines = [
     state,
     'Saved defaults, as last read:',
@@ -411,15 +507,54 @@ function statusText(where, state, { user, project, cwd = where.project, effectiv
 // The session entry type of /forum text results, which Pi renders with pi-forum's entry renderer.
 const ENTRY_TYPE = 'pi-forum.output'
 
+// A /forum text result: the entry pi-forum appends, whose data is the text.
+type OutputEntry = CustomEntry<{ text: string }>
+
+// An entry of ENTRY_TYPE, which pi-forum appends with { text } as its data.
+const isOutput = (entry: SessionEntry): entry is OutputEntry => entry.type === 'custom' && entry.customType === ENTRY_TYPE
+
+// An entry the caller has checked is a /forum text result, and its text.
+const asOutput = (entry: SessionEntry | undefined) => entry as OutputEntry
+const outputText = (entry: SessionEntry | undefined) => asOutput(entry).data!.text
+
+// An entry's type and its custom type, if it has one.
+const entryKind = (entry: SessionEntry) => [entry.type, 'customType' in entry ? entry.customType : undefined]
+
+// A record Pi writes to stdout in JSON or RPC mode: the session header JSON mode starts with, a
+// session event, an RPC response or an extension UI request, as Pi 1.1.0 declares them.
+type WireRecord = SessionHeader | JsonAgentSessionEvent | RpcResponse | RpcExtensionUIRequest
+
+// jsonRecords checks only that each record is a JSON object; the ones Pi writes are WireRecords.
+const wire = (record: JsonObject) => record as unknown as WireRecord
+
+// Pi's successful response to an RPC command, which the caller checks or knows succeeds.
+type RpcResult<Command extends RpcResponse['command']> = Extract<RpcResponse, { command: Command; success: true }>
+
+// A record's type and, for one that carries an entry, the entry's type, custom type and data.
+function entryOf(record: WireRecord) {
+  const entry = 'entry' in record ? record.entry : undefined
+  return [record.type, entry?.type, entry && 'customType' in entry ? entry.customType : undefined, entry && 'data' in entry ? entry.data : undefined]
+}
+
 // Takes the lifecycle events recorded since the last call.
-function takeEvents(host) {
+function takeEvents(host: Host) {
   return host.probe.events.splice(0)
 }
 
 // What a session replacement must look like: the old runtime restores everything before the new
 // one starts. The new runtime stays off unless the current environment supplies a directory (or,
 // with forumDir and no supplied directory, a saved default turns its generated one on).
-function assertReplacement(host, events, { reason, from, to, forumDir, packageDir, supplied, basePath = BASE_PATH }) {
+interface Replacement {
+  reason: LifecycleEvent['reason']
+  from: string
+  to: string
+  forumDir?: string
+  packageDir: string
+  supplied?: string
+  basePath?: string
+}
+
+function assertReplacement(host: Host, events: LifecycleEvent[], { reason, from, to, forumDir, packageDir, supplied, basePath = BASE_PATH }: Replacement) {
   const bin = path.join(packageDir, 'bin')
   const before = supplied
   assert.deepEqual(
@@ -431,12 +566,13 @@ function assertReplacement(host, events, { reason, from, to, forumDir, packageDi
       ['after', 'session_start', reason, to],
     ],
   )
-  assert.equal(events[1].forumDir, before)
-  assert.equal(events[1].path, basePath)
-  assert.equal(events[2].forumDir, before)
-  assert.equal(events[2].path, basePath)
-  assert.equal(events[3].forumDir, forumDir)
-  assert.equal(events[3].path, forumDir === undefined ? basePath : `${bin}${path.delimiter}${BASE_PATH}`)
+  // The four events checked above.
+  assert.equal(events[1]!.forumDir, before)
+  assert.equal(events[1]!.path, basePath)
+  assert.equal(events[2]!.forumDir, before)
+  assert.equal(events[2]!.path, basePath)
+  assert.equal(events[3]!.forumDir, forumDir)
+  assert.equal(events[3]!.path, forumDir === undefined ? basePath : `${bin}${path.delimiter}${BASE_PATH}`)
   if (forumDir === undefined) assertUnbound(basePath)
   else assertBound(host, forumDir, packageDir)
 }
@@ -447,14 +583,14 @@ function assertUnbound(basePath = BASE_PATH) {
   assert.equal(process.env.PI_SESSION_ID, undefined)
 }
 
-function assertBound(host, forumDir, packageDir) {
+function assertBound(host: Host, forumDir: string, packageDir: string) {
   assert.equal(process.env.PI_FORUM_DIR, forumDir)
   assert.equal(process.env.PATH, `${path.join(packageDir, 'bin')}${path.delimiter}${BASE_PATH}`)
   assert.equal(process.env.PI_SESSION_ID, undefined)
 }
 
 // A forum with a topic of three messages, the second long enough to scroll, and another topic.
-async function seedForum(forumDir) {
+async function seedForum(forumDir: string) {
   const forum = createForum({ forumDir })
   const { topic, message: kickoff } = await forum.createTopic({ title: 'Release plan', author: 'ralph', body: 'Kickoff' })
   const body = `${Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(4, '0')}`).join('\n')}\nLAST LINE ✓`
@@ -468,13 +604,25 @@ async function seedForum(forumDir) {
 // LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI), and how pi-forum must show each.
 const BIDI_CONTROLS = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
 const BIDI = BIDI_CONTROLS.map((code) => String.fromCodePoint(code)).join('')
-const shownCode = (code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`
+const shownCode = (code: number) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`
 const BIDI_SHOWN = BIDI_CONTROLS.map(shownCode).join('')
 const RAW_TEXT = new RegExp(`[\\u0000-\\u0009\\u000b-\\u001f\\u007f-\\u009f${BIDI}]`, 'u')
 
+// A line of the log.jsonl test/fixtures/pi-file-synthetic.ts appends to in PI_FORUM_SYNTHETIC_DIR.
+interface SyntheticLogEntry {
+  at: number
+  event: string
+  call?: number
+  n?: number
+  delta?: string
+}
+
+// A canonical record of a forum's log, as src/forum.js writes them.
+type LogRecord = ({ type: 'topic_created' } & Topic) | ({ type: 'message_posted' } & Message)
+
 // Appends canonical records to a forum's log, as an import would: IDs the API accepts but never
 // generates, such as ones starting with "-".
-async function importRecords(forumDir, records) {
+async function importRecords(forumDir: string, records: readonly LogRecord[]) {
   await fs.mkdir(forumDir, { recursive: true })
   await fs.appendFile(path.join(forumDir, 'events.jsonl'), records.map((record) => `${JSON.stringify(record)}\n`).join(''))
 }
@@ -503,74 +651,94 @@ const LONG_LINES = [
 // A forum that pages: 23 topics, the first with 22 messages, the last of which is LONG_BODY; the
 // last topic has a terminal control and every bidirectional control in its title, and no messages. The expected pages are read
 // back through src/forum.js with the text page size.
-async function seedPages(forumDir) {
+async function seedPages(forumDir: string) {
   const forum = createForum({ forumDir })
   const { topic, message: kickoff } = await forum.createTopic({ title: 'Release plan', author: 'ralph', body: 'Kickoff' })
   for (let i = 2; i <= 22; i++) await forum.createTopic({ title: `Topic ${String(i).padStart(2, '0')}`, author: 'sam' })
   const { topic: quiet } = await forum.createTopic({ title: `Quiet\x1b[2J ${BIDI}`, author: 'sam' })
   for (let i = 1; i <= 20; i++) await forum.postMessage({ topicId: topic.id, author: 'sam', body: `Update ${i}\nmore` })
-  const long = await forum.postMessage({ topicId: topic.id, author: 'ralph', body: LONG_BODY, replyTo: kickoff.id })
-  const topics = [await forum.listTopics({ limit: 20 })]
-  topics.push(await forum.listTopics({ after: topics[0].next_cursor, limit: 20 }))
-  const messages = [await forum.listMessages({ topicId: topic.id, limit: 20 })]
-  messages.push(await forum.listMessages({ topicId: topic.id, after: messages[0].next_cursor, limit: 20 }))
-  const all = [await forum.listMessages({ limit: 20 })]
-  all.push(await forum.listMessages({ after: all[0].next_cursor, limit: 20 }))
+  // The topic was created with a body, so it has its first message.
+  const long = await forum.postMessage({ topicId: topic.id, author: 'ralph', body: LONG_BODY, replyTo: kickoff!.id })
+  const first = await forum.listTopics({ limit: 20 })
+  const topics = [first, await forum.listTopics({ after: first.next_cursor, limit: 20 })] as const
+  const firstMessages = await forum.listMessages({ topicId: topic.id, limit: 20 })
+  const messages = [firstMessages, await forum.listMessages({ topicId: topic.id, after: firstMessages.next_cursor, limit: 20 })] as const
+  const firstAll = await forum.listMessages({ limit: 20 })
+  const all = [firstAll, await forum.listMessages({ after: firstAll.next_cursor, limit: 20 })] as const
   return { topic, kickoff, quiet, long, topics, messages, all }
 }
 
 // The /forum text results expected for those pages, line by line: a heading, the directory and
 // whether agents use it, the rows, then a copyable next-page command or the end of the list.
-const shownText = (text) => BIDI_CONTROLS.reduce((shown, code) => shown.replaceAll(String.fromCodePoint(code), shownCode(code)), text.replaceAll('\x1b', '␛'))
-const targetLines = (forumDir, { origin = 'supplied PI_FORUM_DIR', on = true } = {}) => [
+const shownText = (text: string) => BIDI_CONTROLS.reduce((shown, code) => shown.replaceAll(String.fromCodePoint(code), shownCode(code)), text.replaceAll('\x1b', '␛'))
+const targetLines = (forumDir: string, { origin = 'supplied PI_FORUM_DIR', on = true } = {}) => [
   `Forum directory: ${forumDir} (${origin})`,
   on ? 'Forum is on for agents.' : 'Forum is off for agents; reading does not turn it on.',
 ]
-const topicRows = (items) => items.flatMap((t, i) => [`${i + 1}. ${shownText(t.title)}`, `   Topic ${t.id} · by ${t.created_by} · ${t.created_at}`])
-const messageRows = (items) =>
+const topicRows = (items: readonly Topic[]) => items.flatMap((t, i) => [`${i + 1}. ${shownText(t.title)}`, `   Topic ${t.id} · by ${t.created_by} · ${t.created_at}`])
+const messageRows = (items: readonly Message[]) =>
   items.flatMap((m, i) => [
     `${i + 1}. ${m.author} · ${m.created_at}`,
     `   Message ${m.id} · topic ${m.topic_id}${m.reply_to ? ` · reply to ${m.reply_to}` : ''}`,
     `   ${m.body.includes('\n') ? `${m.body.split('\n')[0]}…` : m.body}`,
   ])
-function listText({ heading, after, target, rows, empty, next }) {
+interface ListTextOptions {
+  heading: string
+  after?: string
+  target: readonly string[]
+  rows: readonly string[]
+  empty?: string
+  next?: string
+}
+function listText({ heading, after, target, rows, empty, next }: ListTextOptions) {
   const paging = next ? `20 shown; there may be more. Next page: ${next}` : 'You are caught up.'
   return [`${heading} · ${after ? `after cursor ${after}` : 'from the start'}`, ...target, '', ...(rows.length ? rows : [empty]), '', paging].join('\n')
 }
-function messageText({ target, message, lines }) {
+function messageText({ target, message, lines }: { target: readonly string[]; message: Message; lines: readonly string[] }) {
   const fields = [`Message: ${message.id}`, `Topic: ${message.topic_id}`, `Author: ${message.author}`, `Created: ${message.created_at}`]
   if (message.reply_to) fields.push(`Reply to: ${message.reply_to}`)
   return ['Forum message', ...target, '', ...fields, '', `Body (${lines.length} line${lines.length === 1 ? '' : 's'}):`, ...lines].join('\n')
 }
 
 // The entries pi-forum appended for text results.
-const outputs = (session) => session.sessionManager.getEntries().filter((entry) => entry.type === 'custom' && entry.customType === ENTRY_TYPE)
+const outputs = (session: AgentSession) => session.sessionManager.getEntries().filter(isOutput)
 
 // Complete records of another topic, about size bytes, so a full scan takes many chunk reads.
-function filler(size) {
+function filler(size: number) {
   const line = `${JSON.stringify({ type: 'message_posted', id: 'filler', topic_id: 'filler-topic', author: 'f', body: 'x'.repeat(900), created_at: '2026-01-01T00:00:00.000Z' })}\n`
   return line.repeat(Math.ceil(size / line.length))
 }
 
+// The positional reads src/ makes on a log's descriptor.
+type PositionalRead = (buffer: Buffer, offset: number, length: number, position: number) => Promise<FileReadResult<Buffer>>
+
+interface SlowReads {
+  handles: FileHandle[]
+  // The position of each read.
+  reads: number[]
+  restore(): void
+}
+
 // Slows each read of file and records its descriptors and reads, so Esc can land mid-scan.
-function slowReads(t, file) {
-  const trace = { handles: [], reads: [] }
+function slowReads(t: TestContext, file: string): SlowReads {
+  const handles: FileHandle[] = []
+  const reads: number[] = []
   const open = fs.open
-  const mock = t.mock.method(fs, 'open', async (...args) => {
+  const mock = t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
     const handle = await open(...args)
     if (args[0] === file) {
-      trace.handles.push(handle)
+      handles.push(handle)
       const read = handle.read.bind(handle)
-      handle.read = async (...readArgs) => {
-        trace.reads.push(readArgs[3])
+      const slow: PositionalRead = async (...readArgs) => {
+        reads.push(readArgs[3])
         await new Promise((resolve) => setTimeout(resolve, 10))
         return read(...readArgs)
       }
+      handle.read = slow as FileHandle['read']
     }
     return handle
   })
-  trace.restore = () => mock.mock.restore()
-  return trace
+  return { handles, reads, restore: () => mock.mock.restore() }
 }
 
 if (!PI_ROOT) test('real Pi host acceptance', { skip: SKIP_REASON }, () => {})
@@ -581,14 +749,15 @@ else describe('real Pi host', () => {
   test('the host package and its runtime versions are recorded', (t) => {
     t.diagnostic(`${HOST_PACKAGE} ${piManifest.version} at ${PI_ROOT}`)
     t.diagnostic(`node ${process.version}`)
-    for (const name of ['createAgentSessionRuntime', 'createBashTool', 'getAgentDir', 'SessionManager']) {
+    for (const name of ['createAgentSessionRuntime', 'createBashTool', 'getAgentDir', 'SessionManager'] as const) {
       assert.ok(pi[name], `${HOST_PACKAGE} does not export ${name}`)
     }
   })
 
-  for (const variant of [0, 1]) {
-    describe(['source checkout', 'packed tarball'][variant], () => {
-      const pkg = () => packages[variant]
+  for (const variant of [0, 1] as const) {
+    describe(VARIANTS[variant], () => {
+      // setUp adds both variants.
+      const pkg = () => packages[variant]!
 
       test('loads through Pi with the three lifecycle hooks, the /forum command and no tools', async () => {
         const host = await openHost(pkg().dir)
@@ -597,14 +766,15 @@ else describe('real Pi host', () => {
           assert.deepEqual([...extension.handlers.keys()].sort(), ['before_agent_start', 'session_shutdown', 'session_start'])
           assert.equal(extension.tools.size, 0)
           assert.deepEqual([...extension.commands.keys()], ['forum'])
-          assert.deepEqual([...extension.entryRenderers.keys()], [ENTRY_TYPE])
+          assert.deepEqual([...extension.entryRenderers!.keys()], [ENTRY_TYPE])
           assert.equal(typeof host.runtime.session.extensionRunner.getEntryRenderer(ENTRY_TYPE), 'function')
           const command = host.runtime.session.extensionRunner.getCommand('forum')
           assert.ok(command, 'Pi resolves /forum')
-          assert.match(command.description, /on or off/)
-          assert.match(command.description, /save or reset whether new sessions start with it for this project or user/)
-          assert.match(command.description, /as text, or browse them with \/forum ui$/)
-          const complete = (prefix) => command.getArgumentCompletions(prefix).map((item) => item.value)
+          assert.match(command.description!, /on or off/)
+          assert.match(command.description!, /save or reset whether new sessions start with it for this project or user/)
+          assert.match(command.description!, /as text, or browse them with \/forum ui$/)
+          // pi-forum completes /forum arguments synchronously, with an array.
+          const complete = (prefix: string) => (command.getArgumentCompletions!(prefix) as AutocompleteItem[]).map((item) => item.value)
           assert.deepEqual(complete(''), ['on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'ui'])
           assert.deepEqual(complete('o'), ['on', 'off'])
           assert.deepEqual(complete('st'), ['status'])
@@ -631,7 +801,7 @@ else describe('real Pi host', () => {
         const host = await openHost(dir, { ui: true })
         assert.equal(pi.getAgentDir(), host.agentDir)
         const first = host.sessionId
-        const firstFile = host.runtime.session.sessionFile
+        const firstFile = host.runtime.session.sessionFile!
 
         // Startup without PI_FORUM_DIR is quietly off: no environment changes, storage or guidance.
         let events = takeEvents(host)
@@ -684,8 +854,8 @@ else describe('real Pi host', () => {
         await fs.access(path.join(host.defaultDir(first), 'events.jsonl'))
         const userEntry = converse(host, 'first question')
         converse(host, 'second question')
-        const forkEntry = host.runtime.session.sessionManager.getLeafId()
-        const secondUser = host.runtime.session.sessionManager.getEntry(forkEntry).parentId
+        const forkEntry = host.runtime.session.sessionManager.getLeafId()!
+        const secondUser = host.runtime.session.sessionManager.getEntry(forkEntry)!.parentId!
 
         // /reload: shutdown removes the generated value, so explicit activation is needed again.
         await host.runtime.session.reload()
@@ -741,7 +911,7 @@ else describe('real Pi host', () => {
         assert.equal((await forum(host, ['topic', 'create', 'Forked'])).topic.created_by, forked)
 
         // /clone at the current leaf: Pi reports it as a fork, and it also starts off.
-        await host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' })
+        await host.runtime.fork(host.runtime.session.sessionManager.getLeafId()!, { position: 'at' })
         const cloned = host.sessionId
         assert.ok(![first, second, forked].includes(cloned))
         assertReplacement(host, takeEvents(host), { reason: 'fork', from: forked, to: cloned, packageDir: dir })
@@ -767,14 +937,14 @@ else describe('real Pi host', () => {
         const first = host.sessionId
         const startup = takeEvents(host)
         assert.deepEqual(startup.map((e) => [e.probe, e.reason, e.forumDir]), [['before', 'startup', shared], ['after', 'startup', shared]])
-        assert.equal(startup[0].path, BASE_PATH)
+        assert.equal(startup[0]!.path, BASE_PATH)
         assertBound(host, shared, dir)
         assert.deepEqual(await fs.readdir(shared), [])
         let run = await startRun(host)
         assert.ok(run.after.includes(`Forum directory: ${shared} (PI_FORUM_DIR; supplied at launch; other sessions may share it)`))
         const { topic } = await forum(host, ['topic', 'create', 'Shared', '--body', 'from the first session'])
         converse(host, 'question')
-        const firstFile = host.runtime.session.sessionFile
+        const firstFile = host.runtime.session.sessionFile!
 
         await host.runtime.newSession()
         const second = host.sessionId
@@ -805,12 +975,12 @@ else describe('real Pi host', () => {
         const { dir } = pkg()
         const host = await openHost(dir, { ui: true })
         const first = host.sessionId
-        const firstFile = host.runtime.session.sessionFile
+        const firstFile = host.runtime.session.sessionFile!
         const forumDir = host.defaultDir(first)
         const log = path.join(forumDir, 'events.jsonl')
         const on = `Forum is on: ${forumDir} (session default)`
         const inactive = ` Last selected directory (inactive): ${forumDir} (session default)`
-        const status = (state, override) => statusText(host, state, { override })
+        const status = (state: string, override?: boolean) => statusText(host, state, { override })
         takeEvents(host)
         assertUnbound()
         assert.deepEqual(await slash(host, '/forum'), [info(status('Forum is off.'))])
@@ -832,8 +1002,8 @@ else describe('real Pi host', () => {
         const bytes = await fs.readFile(log)
         const userEntry = converse(host, 'first question')
         converse(host, 'second question')
-        const leaf = host.runtime.session.sessionManager.getLeafId()
-        const secondUser = host.runtime.session.sessionManager.getEntry(leaf).parentId
+        const leaf = host.runtime.session.sessionManager.getLeafId()!
+        const secondUser = host.runtime.session.sessionManager.getEntry(leaf)!.parentId!
 
         // Invalid arguments are case-sensitive and only produce the usage warning, for text reads and
         // the browser too.
@@ -904,15 +1074,15 @@ else describe('real Pi host', () => {
 
         // Every runtime Pi rebuilds without a supplied directory starts off and needs explicit activation.
         await host.runtime.session.navigateTree(leaf, { summarize: false })
-        const rebuilds = [
+        const rebuilds: [LifecycleEvent['reason'], () => Promise<unknown>][] = [
           ['reload', () => host.runtime.session.reload()],
           ['new', () => host.runtime.newSession()],
           ['resume', () => host.runtime.switchSession(firstFile)],
           ['fork', () => host.runtime.fork(secondUser)],
-          ['fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' })], // /clone
+          ['fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId()!, { position: 'at' })], // /clone
         ]
         for (const [reason, rebuild] of rebuilds) {
-          assert.match((await slash(host, '/forum off'))[0].message, /^Forum is off\./)
+          assert.match((await slash(host, '/forum off'))[0]!.message, /^Forum is off\./)
           assert.equal(process.env.PATH, BASE_PATH)
           const from = host.sessionId
           takeEvents(host)
@@ -925,7 +1095,7 @@ else describe('real Pi host', () => {
           assert.equal(offRun.after, offRun.before)
           assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${host.defaultDir(to)} (session default)`)])
           assertBound(host, host.defaultDir(to), dir)
-          assert.ok((await startRun(host)).sections.forum.includes(`Your author identity: ${to} `))
+          assert.ok((await startRun(host)).sections.forum!.includes(`Your author identity: ${to} `))
         }
 
         await host.runtime.dispose()
@@ -942,7 +1112,7 @@ else describe('real Pi host', () => {
         const host = await openHost(dir, { ui: true, supplied: shared, PATH: userPath })
         const first = host.sessionId
         const on = `Forum is on: ${shared} (supplied PI_FORUM_DIR)`
-        const status = (override) => statusText(host, on, { effective: SUPPLIED, override })
+        const status = (override?: boolean) => statusText(host, on, { effective: SUPPLIED, override })
         takeEvents(host)
         assertBound(host, shared, dir)
         assert.deepEqual(await slash(host, '/forum'), [info(status())])
@@ -963,7 +1133,7 @@ else describe('real Pi host', () => {
 
         assert.deepEqual(await slash(host, '/forum on'), [info(on)])
         assertBound(host, shared, dir)
-        assert.ok((await startRun(host)).sections.forum.includes(`Forum directory: ${shared} (PI_FORUM_DIR; supplied at launch`))
+        assert.ok((await startRun(host)).sections.forum!.includes(`Forum directory: ${shared} (PI_FORUM_DIR; supplied at launch`))
 
         // A new session after off starts on with the same supplied directory.
         await slash(host, '/forum off')
@@ -980,12 +1150,12 @@ else describe('real Pi host', () => {
       })
 
       test('an invalid PI_FORUM_DIR is reported and /forum keeps it unavailable without changing anything', async (t) => {
-        const reports = []
-        t.mock.method(console, 'error', (...args) => reports.push(args.join(' ')))
+        const reports: string[] = []
+        t.mock.method(console, 'error', (...args: unknown[]) => reports.push(args.join(' ')))
         const host = await openHost(pkg().dir, { supplied: 'relative/forum' })
         try {
           assert.equal(reports.length, 1)
-          assert.match(reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative\/forum"; the forum is disabled/)
+          assert.match(reports[0]!, /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative\/forum"; the forum is disabled/)
           assert.equal(process.env.PI_FORUM_DIR, 'relative/forum')
           assert.equal(process.env.PATH, BASE_PATH)
           const run = await startRun(host)
@@ -993,7 +1163,7 @@ else describe('real Pi host', () => {
           assert.equal((await bash(host, 'command -v pi-forum')).exit_code, 1)
 
           // Without a UI, command feedback goes to stderr. Status and a failed on change nothing.
-          const command = async (text) => {
+          const command = async (text: string) => {
             reports.length = 0
             await host.runtime.session.prompt(text)
             return reports.splice(0)
@@ -1032,7 +1202,7 @@ else describe('real Pi host', () => {
 
           // Once the environment is fixed, only an explicit /forum on selects again.
           delete process.env.PI_FORUM_DIR
-          assert.match((await slash(host, '/forum'))[0].message, /^Forum is unavailable: /)
+          assert.match((await slash(host, '/forum'))[0]!.message, /^Forum is unavailable: /)
           assert.equal(process.env.PI_FORUM_DIR, undefined)
           assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${generated} (session default)`)])
           assertBound(host, generated, dir)
@@ -1051,7 +1221,7 @@ else describe('real Pi host', () => {
           // On selects the current value, now an externally supplied directory.
           assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${elsewhere} (supplied PI_FORUM_DIR)`)])
           assertBound(host, elsewhere, dir)
-          assert.ok((await startRun(host)).sections.forum.includes(`Forum directory: ${elsewhere} `))
+          assert.ok((await startRun(host)).sections.forum!.includes(`Forum directory: ${elsewhere} `))
         } finally {
           await host.runtime.dispose()
         }
@@ -1076,12 +1246,12 @@ else describe('real Pi host', () => {
           assert.deepEqual(await slash(host, '/forum on'), [info(`Forum is on: ${host.defaultDir(host.sessionId)} (session default)`)])
           assertBound(host, host.defaultDir(host.sessionId), dir)
           const run = await startRun(host)
-          assert.ok(run.sections.forum.includes(`Your author identity: ${host.sessionId} `))
+          assert.ok(run.sections.forum!.includes(`Your author identity: ${host.sessionId} `))
           const created = await forum(host, ['topic', 'create', 'Installed'])
           assert.equal(created.topic.created_by, host.sessionId)
           const on = `Forum is on: ${host.defaultDir(host.sessionId)} (session default)`
           assert.deepEqual(await slash(host, '/forum status'), [info(statusText(host, on, { override: true }))])
-          assert.match((await slash(host, '/forum off'))[0].message, /^Forum is off\./)
+          assert.match((await slash(host, '/forum off'))[0]!.message, /^Forum is off\./)
           assert.equal(process.env.PATH, BASE_PATH)
           assert.deepEqual(await slash(host, '/forum on'), [info(on)])
         } finally {
@@ -1098,18 +1268,18 @@ else describe('real Pi host', () => {
         const { dir } = pkg()
         const host = await openHost(dir, { ui: true, synthetic: true })
         const calls = installSyntheticProvider(piAi.createAssistantMessageEventStream)
-        await host.runtime.session.setModel(host.runtime.session.modelRuntime.getModel('forum-synthetic', 'held'))
+        await host.runtime.session.setModel(host.runtime.session.modelRuntime.getModel('forum-synthetic', 'held')!)
         const userFile = path.join(host.agentDir, 'forum.json')
         const projectFile = path.join(host.project, '.pi', 'forum.json')
         const first = host.sessionId
-        const firstFile = host.runtime.session.sessionFile
-        const on = (id) => `Forum is on: ${host.defaultDir(id)} (session default)`
-        const inactive = (id) => `Forum is off. Last selected directory (inactive): ${host.defaultDir(id)} (session default)`
+        const firstFile = host.runtime.session.sessionFile!
+        const on = (id: string) => `Forum is on: ${host.defaultDir(id)} (session default)`
+        const inactive = (id: string) => `Forum is off. Last selected directory (inactive): ${host.defaultDir(id)} (session default)`
         const fromUser = 'Effective default: on, from the user default.'
         const projectOff = 'Effective default: off, from the project default, which takes precedence over the user default (on).'
-        const lasts = (scope, enabled) => `This lasts until the session is reloaded or replaced; the saved ${scope} default (${onOff(enabled)}) applies then.`
+        const lasts = (scope: string, enabled: boolean) => `This lasts until the session is reloaded or replaced; the saved ${scope} default (${onOff(enabled)}) applies then.`
         // A scoped command: its reply, and nothing added to the session, sent to the model or posted.
-        const scoped = async (text) => {
+        const scoped = async (text: string) => {
           const { session } = host.runtime
           const entries = session.sessionManager.getEntries().length
           const messages = session.messages.length
@@ -1135,7 +1305,7 @@ else describe('real Pi host', () => {
         const bytes = await fs.readFile(log)
         converse(host, 'first question')
         converse(host, 'second question')
-        const secondUser = host.runtime.session.sessionManager.getEntry(host.runtime.session.sessionManager.getLeafId()).parentId
+        const secondUser = host.runtime.session.sessionManager.getEntry(host.runtime.session.sessionManager.getLeafId()!)!.parentId!
 
         // A bare off lasts until reload, which applies the saved user default to the same session.
         assert.deepEqual(await slash(host, '/forum off'), [info(`${inactive(first)}\n${lasts('user', true)}`)])
@@ -1190,9 +1360,9 @@ else describe('real Pi host', () => {
         const forked = host.sessionId
         assert.ok(![first, second].includes(forked))
         assertReplacement(host, takeEvents(host), { reason: 'fork', from: first, to: forked, forumDir: host.defaultDir(forked), packageDir: dir })
-        assert.ok((await startRun(host)).sections.forum.includes(`Your author identity: ${forked} `))
+        assert.ok((await startRun(host)).sections.forum!.includes(`Your author identity: ${forked} `))
         await slash(host, '/forum off')
-        await host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' }) // /clone
+        await host.runtime.fork(host.runtime.session.sessionManager.getLeafId()!, { position: 'at' }) // /clone
         const cloned = host.sessionId
         assert.ok(![first, second, forked].includes(cloned))
         assertReplacement(host, takeEvents(host), { reason: 'fork', from: forked, to: cloned, forumDir: host.defaultDir(cloned), packageDir: dir })
@@ -1224,21 +1394,21 @@ else describe('real Pi host', () => {
         try {
           const pinned = path.join(host.project, '.pi', 'forum')
           const first = host.sessionId
-          const firstFile = host.runtime.session.sessionManager.getSessionFile()
+          const firstFile = host.runtime.session.sessionManager.getSessionFile()!
           await slash(host, '/forum on user')
           await createForum({ forumDir: host.defaultDir(first) }).createTopic({ title: 'Session only', author: first })
           const original = await fs.readFile(path.join(host.defaultDir(first), 'events.jsonl'))
           const notices = await slash(host, '/forum on project')
-          assert.match(notices[0].message, /\(project default\)/)
+          assert.match(notices[0]!.message, /\(project default\)/)
           assertBound(host, pinned, dir)
           assert.deepEqual(await fs.readdir(pinned), [])
-          assert.match((await startRun(host)).sections.forum, /project default; shared by sessions in this working directory/)
+          assert.match((await startRun(host)).sections.forum!, /project default; shared by sessions in this working directory/)
           await createForum({ forumDir: pinned }).createTopic({ title: 'Shared project', author: first })
           const bytes = await fs.readFile(path.join(pinned, 'events.jsonl'))
           converse(host, 'First persisted exchange')
           const forkAt = converse(host, 'Second persisted exchange')
           takeEvents(host)
-          const replace = async (reason, operation) => {
+          const replace = async (reason: LifecycleEvent['reason'], operation: () => Promise<unknown>) => {
             const from = host.sessionId
             await slash(host, '/forum off')
             await operation()
@@ -1249,7 +1419,7 @@ else describe('real Pi host', () => {
           await replace('new', () => host.runtime.newSession())
           await replace('resume', () => host.runtime.switchSession(firstFile))
           await replace('fork', () => host.runtime.fork(forkAt))
-          await replace('fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId(), { position: 'at' }))
+          await replace('fork', () => host.runtime.fork(host.runtime.session.sessionManager.getLeafId()!, { position: 'at' }))
           const pinnedSession = host.sessionId
           await slash(host, '/forum on user')
           assertBound(host, pinned, dir)
@@ -1269,7 +1439,7 @@ else describe('real Pi host', () => {
 
       // Browsing in the terminal UI while an agent run streams from the synthetic provider. The UI
       // host is Pi's real renderer on an in-memory terminal (see createTerminalUI).
-      for (const [screen, renderer] of [['regular', 'TuiMainScreen'], ['fullscreen', 'TuiAltScreen']]) {
+      for (const [screen, renderer] of [['regular', 'TuiMainScreen'], ['fullscreen', 'TuiAltScreen']] as const) {
         test(`browsing during a streaming agent run (${screen} renderer) leaves the run, its context and the environment alone`, { timeout: 60000 }, async (t) => {
           const { dir } = pkg()
           const shared = path.join(temp, `browsed forum ${variant} ${screen}`)
@@ -1287,14 +1457,14 @@ else describe('real Pi host', () => {
             if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') ui.showStreamed(event.assistantMessageEvent.delta)
           })
           try {
-            await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held'))
+            await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held')!)
             let settled = false
             const run = session.prompt('Plan the release.').finally(() => {
               settled = true
             })
             await until(() => calls.length === 1 && session.isStreaming, 'the synthetic run to start')
             ui.setMark()
-            calls[0].delta('first')
+            calls[0]!.delta('first')
             await until(() => ui.screen().includes('assistant: first'), 'the first delta to render')
 
             // What browsing must not change: persisted entries, model context, queues, prompt,
@@ -1315,23 +1485,23 @@ else describe('real Pi host', () => {
               assert.deepEqual(state(), { ...baseline, env })
               assert.equal(settled, false)
               assert.equal(session.isStreaming, true)
-              assert.equal(calls[0].aborted, false)
+              assert.equal(calls[0]!.aborted, false)
             }
-            const browse = async (text, shown) => {
+            const browse = async (text: string, shown: string) => {
               ui.setMark()
               const pending = session.prompt(text)
               await until(() => ui.overlayFocused() && ui.shows(shown), `${text} to show ${shown}`, { detail: ui.screen })
               // Wrapped, so awaiting the overlay does not also await the command it belongs to.
               return { pending }
             }
-            const press = async (key, shown) => {
+            const press = async (key: string, shown?: string) => {
               ui.setMark()
               ui.type(key)
               if (shown) await until(() => ui.shows(shown), `${JSON.stringify(key)} to show ${shown}`, { detail: ui.screen })
             }
             // Esc goes to the focused overlay; the interaction ends through done and the editor
             // gets focus back.
-            const close = async (pending) => {
+            const close = async (pending: Promise<void>) => {
               ui.type('\x1b')
               assert.equal(await pending, undefined)
               assert.equal(ui.component, null)
@@ -1343,7 +1513,7 @@ else describe('real Pi host', () => {
             let { pending } = await browse('/forum ui', 'Forum · Topics · page 1')
             assert.match(ui.screen(), /Forum is on for agents/)
             ui.setMark()
-            calls[0].delta(' second')
+            calls[0]!.delta(' second')
             await until(
               () => ui.written().includes('assistant: first second') && ui.screen().includes('assistant: first second') && ui.screen().includes('Forum · Topics'),
               'a delta to render while the overlay is open',
@@ -1371,7 +1541,7 @@ else describe('real Pi host', () => {
             pending = (await browse(`/forum ui messages ${topic.id}`, `Forum · Messages in topic ${topic.id} · page 1`)).pending
             assert.match(ui.screen(), /Forum is off for agents; browsing only/)
             ui.setMark()
-            calls[0].delta(' third')
+            calls[0]!.delta(' third')
             await until(
               () => ui.screen().includes('assistant: first second third') && ui.screen().includes('Forum is off for agents'),
               'a delta to render while browsing off',
@@ -1380,7 +1550,7 @@ else describe('real Pi host', () => {
             stillRunning(offEnv)
             ui.notices.length = 0
             await session.prompt('/forum status')
-            assert.match(ui.notices[0].message, /^Forum is off\./)
+            assert.match(ui.notices[0]!.message, /^Forum is off\./)
 
             // Esc during a slow first read cancels only that read: the log is closed early.
             const trace = slowReads(t, path.join(shared, 'events.jsonl'))
@@ -1417,21 +1587,22 @@ else describe('real Pi host', () => {
 
             // Released, the run completes normally with every delta and one provider request.
             process.env.PI_FORUM_DIR = shared
-            calls[0].delta(' done')
-            calls[0].finish()
+            calls[0]!.delta(' done')
+            calls[0]!.finish()
             await run
             assert.equal(session.isStreaming, false)
-            const reply = session.messages.at(-1)
+            // The run's reply, an assistant message, as the next line checks.
+            const reply = session.messages.at(-1) as AssistantMessage
             assert.equal(reply.role, 'assistant')
             assert.equal(reply.stopReason, 'stop')
             assert.deepEqual(reply.content, [{ type: 'text', text: 'first second third done' }])
             const added = session.sessionManager.getEntries().slice(baseline.entries)
-            assert.deepEqual(added.map((entry) => [entry.type, entry.message?.role]), [['message', 'assistant']])
+            assert.deepEqual(added.map((entry) => [entry.type, entry.type === 'message' ? entry.message.role : undefined]), [['message', 'assistant']])
             assert.equal(session.messages.length, baseline.messages + 1)
             assert.deepEqual([session.getSteeringMessages(), session.getFollowUpMessages()], [[], []])
             assert.equal(host.probe.starts, baseline.starts)
             assert.equal(calls.length, 1)
-            assert.equal(calls[0].aborted, false)
+            assert.equal(calls[0]!.aborted, false)
             assert.equal(extensionAborts, 0)
             assert.equal(sessionAborts.mock.callCount(), 0)
             assert.equal(ui.editor.escapes, 0)
@@ -1469,16 +1640,16 @@ else describe('real Pi host', () => {
           if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') ui.showStreamed(event.assistantMessageEvent.delta)
         })
         const unfollow = ui.follow(session)
-        const events = []
+        const events: string[] = []
         const unrecord = session.subscribe((event) => events.push(event.type))
         try {
-          await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held'))
+          await session.setModel(session.modelRuntime.getModel('forum-synthetic', 'held')!)
           let settled = false
           const run = session.prompt('Plan the release.').finally(() => {
             settled = true
           })
           await until(() => calls.length === 1 && session.isStreaming, 'the synthetic run to start')
-          calls[0].delta('first')
+          calls[0]!.delta('first')
           await until(() => ui.screen().includes('assistant: first'), 'the first delta to render')
           const state = () => ({
             messages: session.messages.length,
@@ -1498,32 +1669,32 @@ else describe('real Pi host', () => {
             assert.deepEqual(state(), baseline)
             assert.equal(settled, false)
             assert.equal(session.isStreaming, true)
-            assert.equal(calls[0].aborted, false)
+            assert.equal(calls[0]!.aborted, false)
           }
           // A successful read: exactly one entry, its data only the text, drawn whole and unstyled
           // although collapsed, and no notification.
-          const read = async (command, expected) => {
+          const read = async (command: string, expected: string) => {
             ui.notices.length = 0
             events.length = 0
             const before = session.sessionManager.getEntries().length
             const shown = ui.entries.length
             await session.prompt(command)
             const added = session.sessionManager.getEntries().slice(before)
-            assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
-            assert.deepEqual(added[0].data, { text: expected }, command)
+            assert.deepEqual(added.map(entryKind), [['custom', ENTRY_TYPE]], command)
+            assert.deepEqual(asOutput(added[0]).data, { text: expected }, command)
             assert.deepEqual(events, ['entry_appended'], command)
             assert.deepEqual(ui.notices, [], command)
             assert.equal(ui.entries.length, shown + 1)
-            assert.equal(ui.entries.at(-1).entry.id, added[0].id)
-            const raw = ui.entries.at(-1).component.render(300)
+            assert.equal(ui.entries.at(-1)!.entry.id, added[0]!.id)
+            const raw = ui.entries.at(-1)!.component!.render(300)
             for (const line of raw) assert.doesNotMatch(line, /\x1b/)
             assert.deepEqual(ui.entryLines(), expected.split('\n').map((line) => ` ${line}`.trimEnd()), command)
-            await until(() => ui.shows(expected.split('\n').at(-1)) && ui.screen().includes('assistant: first'), `${command} to show its last line above the streamed text`, { detail: ui.screen })
+            await until(() => ui.shows(expected.split('\n').at(-1)!) && ui.screen().includes('assistant: first'), `${command} to show its last line above the streamed text`, { detail: ui.screen })
             stillRunning()
             return expected
           }
           // A read that fails: one notification, nothing appended.
-          const fails = async (command, notice) => {
+          const fails = async (command: string, notice: Notice) => {
             ui.notices.length = 0
             const before = session.sessionManager.getEntries().length
             await session.prompt(command)
@@ -1537,12 +1708,12 @@ else describe('real Pi host', () => {
           assert.equal(topics[0].items.length, 20)
           const nextTopics = `/forum topics --after ${topics[0].next_cursor}`
           const first = await read('/forum topics', listText({ heading: 'Forum topics', target, rows: topicRows(topics[0].items), next: nextTopics }))
-          assert.equal(first.split('\n').at(-1).match(/Next page: (.+)$/)[1], nextTopics)
+          assert.equal(first.split('\n').at(-1)!.match(/Next page: (.+)$/)![1], nextTopics)
           await read(nextTopics, listText({ heading: 'Forum topics', after: topics[0].next_cursor, target, rows: topicRows(topics[1].items) }))
-          assert.equal(topics[1].items.at(-1).id, quiet.id)
+          assert.equal(topics[1].items.at(-1)!.id, quiet.id)
           assert.equal(await read('/forum topics', first), first)
           await read(`/forum topics --after=${topics[1].next_cursor}`, listText({ heading: 'Forum topics', after: topics[1].next_cursor, target, rows: [], empty: 'No newer topics.' }))
-          calls[0].delta(' second')
+          calls[0]!.delta(' second')
           await until(() => ui.screen().includes('assistant: first second'), 'a delta to render after text reads')
 
           // Messages in a topic and across the forum, paged the same way; --after=CURSOR works too.
@@ -1577,7 +1748,7 @@ else describe('real Pi host', () => {
           await until(() => ui.overlayFocused() && ui.shows('› Release plan'), 'the browser to open', { detail: ui.screen })
           const entries = session.sessionManager.getEntries().length
           await session.prompt(`/forum read ${long.id}`)
-          assert.deepEqual(outputs(session).at(-1).data, { text: messageText({ target, message: long, lines: LONG_LINES }) })
+          assert.deepEqual(outputs(session).at(-1)!.data, { text: messageText({ target, message: long, lines: LONG_LINES }) })
           assert.equal(session.sessionManager.getEntries().length, entries + 1)
           assert.ok(ui.overlayFocused())
           await until(() => ui.shows('Forum · Topics · page 1') && ui.shows('› Release plan'), 'the browser to keep its view', { detail: ui.screen })
@@ -1604,7 +1775,7 @@ else describe('real Pi host', () => {
             await pending
             await until(() => trace.handles.every((handle) => handle.fd === -1), 'the log to close after reselection')
             await new Promise((resolve) => setTimeout(resolve, 100))
-            assert.deepEqual(ui.notices.map((notice) => [notice.type, notice.message.split(' ').slice(0, 3).join(' ')]).slice(1), [['info', 'Forum is off.'], ['info', 'Forum is on:']], slow)
+            assert.deepEqual(ui.notices.map((notice: Notice) => [notice.type, notice.message.split(' ').slice(0, 3).join(' ')]).slice(1), [['info', 'Forum is off.'], ['info', 'Forum is on:']], slow)
             assert.equal(session.sessionManager.getEntries().length, before, slow)
             assert.ok(trace.reads.length < 64, `${trace.reads.length} reads of a 64-chunk log`)
             trace.reads.length = 0
@@ -1615,10 +1786,11 @@ else describe('real Pi host', () => {
 
           // Released, the run completes with every delta from its one request; the forum added only
           // its entries.
-          calls[0].delta(' done')
-          calls[0].finish()
+          calls[0]!.delta(' done')
+          calls[0]!.finish()
           await run
-          const reply = session.messages.at(-1)
+          // The run's reply, an assistant message.
+          const reply = session.messages.at(-1) as AssistantMessage
           assert.equal(reply.stopReason, 'stop')
           assert.deepEqual(reply.content, [{ type: 'text', text: 'first second done' }])
           const added = session.sessionManager.getEntries().slice(entriesBefore)
@@ -1632,7 +1804,7 @@ else describe('real Pi host', () => {
           assert.deepEqual([session.getSteeringMessages(), session.getFollowUpMessages()], [[], []])
           assert.equal(host.probe.starts, baseline.starts)
           assert.equal(calls.length, 1)
-          assert.equal(calls[0].aborted, false)
+          assert.equal(calls[0]!.aborted, false)
           assert.equal(extensionAborts, 0)
           assert.equal(sessionAborts.mock.callCount(), 0)
           assert.equal(ui.editor.escapes, 0)
@@ -1655,25 +1827,25 @@ else describe('real Pi host', () => {
         const { session } = host.runtime
         const unfollow = ui.follow(session)
         // A text read: its one entry's text, or null after checking that it added nothing.
-        const text = async (command) => {
+        const text = async (command: string) => {
           ui.notices.length = 0
           const before = session.sessionManager.getEntries().length
           await session.prompt(command)
           const added = session.sessionManager.getEntries().slice(before)
           if (added.length === 0) return null
-          assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
+          assert.deepEqual(added.map(entryKind), [['custom', ENTRY_TYPE]], command)
           assert.deepEqual(ui.notices, [], command)
-          assert.equal(ui.entries.at(-1).entry.id, added[0].id)
-          return added[0].data.text
+          assert.equal(ui.entries.at(-1)!.entry.id, added[0]!.id)
+          return outputText(added[0])
         }
-        const browse = async (text, shown) => {
+        const browse = async (text: string, shown: string) => {
           ui.setMark()
           const pending = session.prompt(text)
           await until(() => ui.overlayFocused() && ui.shows(shown), `${text} to show ${shown}`, { detail: ui.screen })
           // Wrapped, so awaiting the overlay does not also await the command it belongs to.
           return { pending }
         }
-        const close = async (pending) => {
+        const close = async (pending: Promise<void>) => {
           ui.type('\x1b')
           await pending
           assert.equal(ui.tui.getFocusedComponent(), ui.editor)
@@ -1718,8 +1890,8 @@ else describe('real Pi host', () => {
           for (const command of ['/forum topics', '/forum messages', '/forum read some-id']) {
             assert.equal(await text(command), null)
             assert.equal(ui.notices.length, 1, command)
-            assert.equal(ui.notices[0].type, 'error')
-            assert.ok(ui.notices[0].message.startsWith(`Could not read ${generated}: forum directory ${generated} is unavailable: ENOENT`), ui.notices[0].message)
+            assert.equal(ui.notices[0]!.type, 'error')
+            assert.ok(ui.notices[0]!.message.startsWith(`Could not read ${generated}: forum directory ${generated} is unavailable: ENOENT`), ui.notices[0]!.message)
           }
           pending = (await browse('/forum ui topics', 'FORUM_UNAVAILABLE')).pending
           assert.match(ui.screen(), /ENOENT/)
@@ -1737,10 +1909,10 @@ else describe('real Pi host', () => {
           await fs.symlink(a, link)
           process.env.PI_FORUM_DIR = link
           await session.prompt('/forum on')
-          const resolvedTo = (real) => `Forum directory: ${link} (supplied PI_FORUM_DIR), resolved to ${real}`
+          const resolvedTo = (real: string) => `Forum directory: ${link} (supplied PI_FORUM_DIR), resolved to ${real}`
           let shown = await text('/forum topics')
-          assert.equal(shown.split('\n')[1], resolvedTo(a))
-          assert.match(shown, /\n1\. In A\n/)
+          assert.equal(shown!.split('\n')[1], resolvedTo(a))
+          assert.match(shown!, /\n1\. In A\n/)
           pending = (await browse('/forum ui topics', 'In A')).pending
           await close(pending)
           await fs.rm(link)
@@ -1755,8 +1927,8 @@ else describe('real Pi host', () => {
           pending = (await browse('/forum ui', 'In B')).pending
           await close(pending)
           shown = await text('/forum topics')
-          assert.equal(shown.split('\n')[1], resolvedTo(b))
-          assert.match(shown, /\n1\. In B\n/)
+          assert.equal(shown!.split('\n')[1], resolvedTo(b))
+          assert.match(shown!, /\n1\. In B\n/)
           await fs.rm(link)
           await fs.symlink(a, link)
           assert.equal(await text('/forum topics'), null)
@@ -1817,7 +1989,8 @@ else describe('real Pi host', () => {
         const { dir } = pkg()
         const shared = path.join(temp, `text mode forum ${variant}`)
         const { topic, long } = await seedForum(shared)
-        const other = (await createForum({ forumDir: shared }).listTopics({})).items[1]
+        // seedForum creates two topics.
+        const other = (await createForum({ forumDir: shared }).listTopics({})).items[1]!
         const reader = createForum({ forumDir: shared })
         const target = targetLines(shared)
         const results = {
@@ -1826,14 +1999,14 @@ else describe('real Pi host', () => {
           empty: listText({ heading: `Forum messages in topic ${other.id}`, target, rows: [], empty: 'No messages yet.' }),
           read: messageText({ target, message: long, lines: long.body.split('\n') }),
         }
-        const reads = [
+        const reads: [string, string][] = [
           ['/forum topics', results.topics],
           [`/forum messages ${topic.id}`, results.messages],
           [`/forum messages ${other.id}`, results.empty],
           [`/forum read ${long.id}`, results.read],
         ]
-        const browserNeeded = (command) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
-        const guided = [
+        const browserNeeded = (command: string) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
+        const guided: [string, string][] = [
           ['/forum ui', browserNeeded('/forum topics')],
           ['/forum ui topics', browserNeeded('/forum topics')],
           [`/forum ui messages ${topic.id}`, browserNeeded(`/forum messages ${topic.id}`)],
@@ -1841,12 +2014,13 @@ else describe('real Pi host', () => {
           [`/forum ui read ${long.id}`, browserNeeded(`/forum read ${long.id}`)],
         ]
         // Records what anyone writes to stdout as text; the test runner's own binary frames pass.
-        const captureStdout = async (fn) => {
-          const written = []
+        const captureStdout = async (fn: () => Promise<void>) => {
+          const written: string[] = []
           const write = process.stdout.write
-          process.stdout.write = function (chunk, ...rest) {
+          process.stdout.write = function (this: typeof process.stdout, chunk: string | Uint8Array, ...rest: unknown[]) {
             if (typeof chunk === 'string') return written.push(chunk) > 0
-            return write.call(this, chunk, ...rest)
+            // Passed on as the caller wrote it.
+            return write.apply(this, [chunk, ...rest] as Parameters<typeof write>)
           }
           try {
             await fn()
@@ -1857,18 +2031,15 @@ else describe('real Pi host', () => {
         }
         const stderr = t.mock.method(console, 'error', () => {})
 
-        for (const mode of ['rpc', 'print', 'json']) {
-          const notices = []
-          const rpcUI = new Proxy(
-            { notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') },
-            { get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined) },
-          )
+        for (const mode of ['rpc', 'print', 'json'] as const) {
+          const notices: RpcNotice[] = []
+          const rpcUI = asUIContext({ notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') })
           const host = await openHost(dir, { supplied: shared, uiMode: mode, ...(mode === 'rpc' && { uiContext: rpcUI }) })
           const { session } = host.runtime
           // RPC has a UI, so feedback is notified; print and JSON have none and write it to stderr.
           const feedback = () => {
             if (mode === 'rpc') return notices.splice(0)
-            const written = stderr.mock.calls.map((call) => ({ type: 'info', message: call.arguments.join(' ') }))
+            const written = stderr.mock.calls.map((call): RpcNotice => ({ type: 'info', message: call.arguments.join(' ') }))
             stderr.mock.resetCalls()
             return written
           }
@@ -1878,12 +2049,12 @@ else describe('real Pi host', () => {
             const written = await captureStdout(async () => {
               for (const [command, expected] of reads) {
                 const before = session.sessionManager.getEntries().length
-                const appended = []
+                const appended: AgentSessionEvent[] = []
                 const unsubscribe = session.subscribe((event) => appended.push(event))
                 await session.prompt(command)
                 unsubscribe()
                 const added = session.sessionManager.getEntries().slice(before)
-                assert.deepEqual(added.map((entry) => [entry.type, entry.customType, entry.data]), [['custom', ENTRY_TYPE, { text: expected }]], `${mode} ${command}`)
+                assert.deepEqual(added.map((entry) => [...entryKind(entry), 'data' in entry ? entry.data : undefined]), [['custom', ENTRY_TYPE, { text: expected }]], `${mode} ${command}`)
                 assert.deepEqual(appended, [{ type: 'entry_appended', entry: added[0] }], `${mode} ${command}`)
                 assert.deepEqual(feedback(), [info(expected)], `${mode} ${command}`)
               }
@@ -1909,46 +2080,45 @@ else describe('real Pi host', () => {
         const { dir } = pkg()
         const shared = path.join(temp, `imported forum ${variant}`)
         // Three imported topics of 21 messages each; some message IDs start with "-" too.
-        const special = { '-odd': ['--after=y', '--', '-m'], '--after=x': [], '--': [] }
-        const posted = {}
-        const records = []
+        const special: { [topicId: string]: string[]; '-odd': string[] } = { '-odd': ['--after=y', '--', '-m'], '--after=x': [], '--': [] }
+        const posted: Record<string, string[]> = {}
+        const records: LogRecord[] = []
         let clock = 0
         const at = () => new Date(Date.UTC(2026, 0, 1, 0, 0, clock++)).toISOString()
         for (const [topicId, ids] of Object.entries(special)) {
           records.push({ type: 'topic_created', id: topicId, title: `Topic ${topicId} ${BIDI}`, created_by: 'imp', created_at: at() })
-          posted[topicId] = Array.from({ length: 21 }, (_, i) => ids[i] ?? `${topicId}#${i}`)
-          for (const id of posted[topicId]) records.push({ type: 'message_posted', id, topic_id: topicId, author: 'imp', body: `${id} ${BIDI}`, created_at: at() })
+          const topicIds = Array.from({ length: 21 }, (_, i) => ids[i] ?? `${topicId}#${i}`)
+          posted[topicId] = topicIds
+          for (const id of topicIds) records.push({ type: 'message_posted', id, topic_id: topicId, author: 'imp', body: `${id} ${BIDI}`, created_at: at() })
         }
         await importRecords(shared, records)
-        const notices = []
-        const rpcUI = new Proxy(
-          { notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') },
-          { get: (target, key) => (key in target ? target[key] : key === 'then' || typeof key === 'symbol' ? undefined : () => undefined) },
-        )
+        const notices: RpcNotice[] = []
+        const rpcUI = asUIContext({ notify: (message, type) => notices.push({ type, message }), custom: () => assert.fail('RPC has no custom terminal UI') })
         const host = await openHost(dir, { supplied: shared, uiMode: 'rpc', uiContext: rpcUI })
         const { session } = host.runtime
         const messages = session.messages.length
         // A successful read: exactly one entry holding the text, and the same text notified.
-        const read = async (command) => {
+        const read = async (command: string) => {
           notices.length = 0
           const before = session.sessionManager.getEntries().length
           await session.prompt(command)
           const added = session.sessionManager.getEntries().slice(before)
-          assert.deepEqual(added.map((entry) => [entry.type, entry.customType]), [['custom', ENTRY_TYPE]], command)
-          assert.deepEqual(notices, [info(added[0].data.text)], command)
-          assert.doesNotMatch(added[0].data.text, RAW_TEXT, command)
-          return added[0].data.text
+          assert.deepEqual(added.map(entryKind), [['custom', ENTRY_TYPE]], command)
+          assert.deepEqual(notices, [info(outputText(added[0]))], command)
+          assert.doesNotMatch(outputText(added[0]), RAW_TEXT, command)
+          return outputText(added[0])
         }
-        const feedback = async (command) => {
+        const feedback = async (command: string) => {
           notices.length = 0
           const before = session.sessionManager.getEntries().length
           await session.prompt(command)
           assert.equal(session.sessionManager.getEntries().length, before, command)
           assert.equal(notices.length, 1, command)
-          return notices[0]
+          return notices[0]!
         }
-        const guidance = async (command) => (await feedback(command)).message.match(/read it as text with: (.+)$/)[1]
-        const ids = (text) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
+        // Guidance ends with the text command, and pages with the next one.
+        const guidance = async (command: string) => (await feedback(command)).message.match(/read it as text with: (.+)$/)![1]!
+        const ids = (text: string) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
         try {
           let entries = 0
           for (const topicId of Object.keys(special)) {
@@ -1956,17 +2126,17 @@ else describe('real Pi host', () => {
             assert.equal(command, `/forum messages -- ${topicId}`)
             const first = await read(command)
             assert.ok(first.startsWith(`Forum messages in topic ${topicId} · from the start\n`), first)
-            assert.deepEqual(ids(first), posted[topicId].slice(0, 20))
-            assert.ok(first.includes(`   ${posted[topicId][0]} ${BIDI_SHOWN}\n`), first)
+            assert.deepEqual(ids(first), posted[topicId]!.slice(0, 20))
+            assert.ok(first.includes(`   ${posted[topicId]![0]} ${BIDI_SHOWN}\n`), first)
             const cursor = (await createForum({ forumDir: shared }).listMessages({ topicId, limit: 20 })).next_cursor
-            const next = first.match(/Next page: (.+)$/)[1]
+            const next = first.match(/Next page: (.+)$/)![1]!
             assert.equal(next, `/forum messages --after ${cursor} -- ${topicId}`)
             const rest = await read(next)
-            assert.deepEqual(ids(rest), posted[topicId].slice(20))
+            assert.deepEqual(ids(rest), posted[topicId]!.slice(20))
             assert.match(rest, /\nYou are caught up\.$/)
             const error = await feedback(`/forum messages --after ${cursor.slice(0, -2)} -- ${topicId}`)
             assert.equal(error.type, 'error')
-            const restart = error.message.match(/Run (.+) to start from the first page\.$/)[1]
+            const restart = error.message.match(/Run (.+) to start from the first page\.$/)![1]!
             assert.equal(restart, command)
             assert.equal(await read(restart), first)
             entries += 3
@@ -1997,13 +2167,15 @@ else describe('real Pi host', () => {
         const ui = createTerminalUI(piTui, piTui.TuiMainScreen, piTheme, { columns: 200 })
         const host = await openHost(dir, { supplied: shared, uiContext: ui.ui, uiMode: 'tui' })
         const unfollow = ui.follow(host.runtime.session)
-        const records = async (file) => (await fs.readFile(file, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+        // The session file's records: its header, then its entries.
+        const records = (file: string) => logRecords<FileEntry>(file)
         // What a replay must show: the same entries, drawn the same way, through the current runtime.
-        const drawn = () => ui.entries.map(({ entry, component }) => [entry.id, component.render(200).join('\n')])
+        // pi-forum's renderer draws each of its entries.
+        const drawn = () => ui.entries.map(({ entry, component }) => [entry.id, component!.render(200).join('\n')] as const)
         // The roles of the messages Pi would send the model from this session.
         const context = () => host.runtime.session.sessionManager.buildSessionContext().messages.map((message) => message.role)
         try {
-          const file = host.runtime.session.sessionFile
+          const file = host.runtime.session.sessionFile!
           // Before any conversation Pi keeps the session in memory; a text read does not change that.
           await host.runtime.session.prompt('/forum topics')
           assert.equal(outputs(host.runtime.session).length, 1)
@@ -2016,10 +2188,10 @@ else describe('real Pi host', () => {
           const persisted = outputs(host.runtime.session)
           assert.equal(persisted.length, 2)
           assert.deepEqual((await records(file)).filter((entry) => entry.type === 'custom'), persisted)
-          assert.deepEqual(persisted.map((entry) => entry.data.text.split('\n')[0]), ['Forum topics · from the start', 'Forum message'])
+          assert.deepEqual(persisted.map((entry) => outputText(entry).split('\n')[0]), ['Forum topics · from the start', 'Forum message'])
           const shown = drawn()
           assert.deepEqual(shown.map(([id]) => id), persisted.map((entry) => entry.id))
-          assert.ok(shown[1][1].trimEnd().endsWith(' LAST LINE ✓'))
+          assert.ok(shown[1]![1].trimEnd().endsWith(' LAST LINE ✓'))
 
           // /reload: the new runtime's renderer draws the persisted entries again; none reach the model.
           await host.runtime.session.reload()
@@ -2055,7 +2227,7 @@ else describe('real Pi host', () => {
         const forumDir = path.join(headless.run, 'forum')
         const { topic, long } = await seedForum(forumDir)
         // An imported topic and message whose IDs start with "-", holding every bidirectional control.
-        const imported = { id: '--after=x', topic_id: '-odd', author: 'imp', body: `${BIDI}\nsecond`, created_at: '2026-01-02T00:00:01.000Z' }
+        const imported: Message = { id: '--after=x', topic_id: '-odd', author: 'imp', body: `${BIDI}\nsecond`, created_at: '2026-01-02T00:00:01.000Z' }
         await importRecords(forumDir, [
           { type: 'topic_created', id: '-odd', title: `Odd ${BIDI}`, created_by: 'imp', created_at: '2026-01-02T00:00:00.000Z' },
           { type: 'message_posted', ...imported },
@@ -2084,7 +2256,7 @@ else describe('real Pi host', () => {
         const texts = [topicsText, messagesText, readText, oddText, importedText]
         assert.ok(topicsText.includes(`. Odd ${BIDI_SHOWN}\n   Topic -odd · by imp`))
         for (const text of texts) assert.doesNotMatch(text, RAW_TEXT)
-        const browserNeeded = (command) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
+        const browserNeeded = (command: string) => `${target.join('\n')}\nThe forum browser needs the terminal UI; read it as text with: ${command}`
         const feedback = [
           ...texts,
           browserNeeded('/forum topics'),
@@ -2092,8 +2264,7 @@ else describe('real Pi host', () => {
           statusText({ agentDir: paths.agent, project: paths.project }, `Forum is on: ${forumDir} (supplied PI_FORUM_DIR)`, { effective: SUPPLIED }),
         ]
         const env = { PI_FORUM_DIR: forumDir }
-        const piRun = (extra) => headless.launch(extra, { env })
-        const entryOf = (record) => [record.type, record.entry?.type, record.entry?.customType, record.entry?.data]
+        const piRun = (extra: readonly string[]) => headless.launch(extra, { env })
 
         // Print: nothing on stdout, each result once on stderr.
         const print = await piRun(['-p', ...commands])
@@ -2102,8 +2273,8 @@ else describe('real Pi host', () => {
 
         // JSON: stdout is only Pi's records, the session header and one entry_appended per result.
         const json = await piRun(['--mode', 'json', ...commands])
-        const records = jsonRecords(json.stdout)
-        assert.equal(records[0].type, 'session')
+        const records = jsonRecords(json.stdout).map(wire)
+        assert.equal(records[0]!.type, 'session')
         assert.deepEqual(records.slice(1).map(entryOf), texts.map((text) => ['entry_appended', 'custom', ENTRY_TYPE, { text }]))
         assert.equal(json.stderr, feedback.map((text) => `${text}\n`).join(''))
 
@@ -2115,14 +2286,14 @@ else describe('real Pi host', () => {
             const response = await rpc.request({ type: 'prompt', message: command })
             assert.deepEqual([response.success, response.data], [true, { disposition: 'handled' }], command)
             const read = texts[commands.indexOf(command)]
-            const shown = rpc.records.slice(from, -1).map((record) => (record.type === 'extension_ui_request' ? [record.type, record.method, record.notifyType, record.message] : entryOf(record)))
+            const shown = rpc.records.slice(from, -1).map(wire).map((record) => (record.type === 'extension_ui_request' ? [record.type, record.method, 'notifyType' in record ? record.notifyType : undefined, 'message' in record ? record.message : undefined] : entryOf(record)))
             const notified = ['extension_ui_request', 'notify', 'info', feedback[commands.indexOf(command)]]
             assert.deepEqual(shown, read ? [['entry_appended', 'custom', ENTRY_TYPE, { text: read }], notified] : [notified], command)
           }
-          const { data } = await rpc.request({ type: 'get_entries' })
-          assert.deepEqual(data.entries.filter((entry) => entry.type === 'custom').map((entry) => [entry.customType, entry.data]), texts.map((text) => [ENTRY_TYPE, { text }]))
+          const { data } = wire(await rpc.request({ type: 'get_entries' })) as RpcResult<'get_entries'>
+          assert.deepEqual(data.entries.filter((entry): entry is CustomEntry => entry.type === 'custom').map((entry) => [entry.customType, entry.data]), texts.map((text) => [ENTRY_TYPE, { text }]))
           assert.deepEqual(data.entries.filter((entry) => entry.type === 'custom_message' || entry.type === 'message'), [])
-          assert.deepEqual((await rpc.request({ type: 'get_messages' })).data.messages, [])
+          assert.deepEqual((wire(await rpc.request({ type: 'get_messages' })) as RpcResult<'get_messages'>).data.messages, [])
           assert.equal(await rpc.close(), 0)
         } finally {
           await rpc.kill()
@@ -2141,21 +2312,23 @@ else describe('real Pi host', () => {
       test('the pi executable saves defaults with /forum and later processes apply them by precedence and project trust', { timeout: 120000 }, async () => {
         const { dir } = pkg()
         const probeLog = path.join(temp, `startup-probe-${variant}.jsonl`)
-        const probe = path.join(temp, 'probes', `startup-probe-${variant}.js`)
-        await fs.writeFile(probe, startupProbeSource(probeLog))
+        const probe = path.join(temp, 'probes', `startup-probe-${variant}.ts`)
+        await installProbe<StartupProbeConfig>('pi-startup-probe.ts', probe, { log: probeLog })
         const headless = await headlessPi(dir, { extensions: [probes.fileSynthetic, probe] })
         const { paths, run } = headless
         // The synthetic provider is the model, and records any request it gets.
         const control = path.join(run, 'control')
         await fs.mkdir(control)
         const userFile = path.join(paths.agent, 'forum.json')
-        const projectFile = (cwd) => path.join(cwd, '.pi', 'forum.json')
-        const sessionDir = (id) => path.join(paths.agent, 'forums', 'sessions', id)
-        const projectDir = (cwd) => path.join(cwd, '.pi', 'forum')
-        const projectState = (cwd) => `Forum is on: ${projectDir(cwd)} (project default)`
-        const inactiveProject = (cwd) => `Forum is off. Last selected directory (inactive): ${projectDir(cwd)} (project default)`
-        const dirs = {}
-        for (const name of ['a', 'b', 'project', 'project/sub', 'custom', 'protected']) {
+        const projectFile = (cwd: string) => path.join(cwd, '.pi', 'forum.json')
+        const sessionDir = (id: string) => path.join(paths.agent, 'forums', 'sessions', id)
+        const projectDir = (cwd: string) => path.join(cwd, '.pi', 'forum')
+        const projectState = (cwd: string) => `Forum is on: ${projectDir(cwd)} (project default)`
+        const inactiveProject = (cwd: string) => `Forum is off. Last selected directory (inactive): ${projectDir(cwd)} (project default)`
+        const names = ['a', 'b', 'project', 'project/sub', 'custom', 'protected'] as const
+        // Filled in below, one directory per name.
+        const dirs = {} as Record<(typeof names)[number], string>
+        for (const name of names) {
           dirs[name] = path.join(run, 'cwd', name)
           await fs.mkdir(dirs[name], { recursive: true })
         }
@@ -2167,32 +2340,34 @@ else describe('real Pi host', () => {
         await fs.writeFile(projectFile(dirs.protected), '{"enabled":true}')
         let seen = 0
         // One pi process: its stderr lines, and the session start and shutdown the probe saw.
-        const launch = async (cwd, commands, { flags = [], env = {}, mode = ['-p'] } = {}) => {
+        const launch = async (cwd: string, commands: readonly string[], { flags = [], env = {}, mode = ['-p'] }: { flags?: readonly string[]; env?: NodeJS.ProcessEnv; mode?: readonly string[] } = {}) => {
           const result = await headless.launch([...flags, '--model', 'forum-synthetic/held', ...mode, ...commands], {
             cwd,
             env: { PI_FORUM_SYNTHETIC_DIR: control, ...env },
           })
-          const records = (await fs.readFile(probeLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)).slice(seen)
+          const records = (await logRecords<StartupProbeRecord>(probeLog)).slice(seen)
           seen += records.length
           assert.deepEqual(records.map((record) => [record.type, record.reason]), [['session_start', 'startup'], ['session_shutdown', 'quit']])
-          const [start, shutdown] = records
+          // The two records checked above.
+          const [start, shutdown] = records as [StartupProbeRecord, StartupProbeRecord]
           assert.equal(start.cwd, cwd)
           assert.equal(shutdown.sessionId, start.sessionId)
           if (mode[0] === '-p') assert.equal(result.stdout, '')
           return { ...result, start, shutdown, id: start.sessionId }
         }
-        const where = (cwd) => ({ agentDir: paths.agent, project: cwd })
-        const reply = (...lines) => `${lines.join('\n')}\n`
-        const on = (id) => `Forum is on: ${sessionDir(id)} (session default)`
-        const inactive = (id) => `Forum is off. Last selected directory (inactive): ${sessionDir(id)} (session default)`
+        type Launched = Awaited<ReturnType<typeof launch>>
+        const where = (cwd: string): StatusWhere => ({ agentDir: paths.agent, project: cwd })
+        const reply = (...lines: string[]) => `${lines.join('\n')}\n`
+        const on = (id: string) => `Forum is on: ${sessionDir(id)} (session default)`
+        const inactive = (id: string) => `Forum is off. Last selected directory (inactive): ${sessionDir(id)} (session default)`
         const fromUser = 'Effective default: on, from the user default.'
-        const untrusted = (cwd) =>
+        const untrusted = (cwd: string) =>
           `ignored, project ${cwd} is not trusted, so ${projectFile(cwd)} is ignored; run /trust and restart Pi, or start Pi with --approve, to use project defaults`
-        const refused = (cwd) =>
+        const refused = (cwd: string) =>
           `Could not save the project default: project ${cwd} is not trusted, so ${projectFile(cwd)} is ignored; run /trust and restart Pi, ` +
           'or start Pi with --approve, to use project defaults; the project default was not changed. This session is unchanged.'
         // Both default directory kinds are runtime-owned and restored at shutdown.
-        const startedOn = async ({ start, shutdown, id }, project = false, entries = []) => {
+        const startedOn = async ({ start, shutdown, id }: Launched, project = false, entries: string[] = []) => {
           const target = project ? projectDir(start.cwd) : sessionDir(id)
           assert.equal(start.forumDir, target)
           assert.equal(start.PATH, `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`)
@@ -2201,7 +2376,7 @@ else describe('real Pi host', () => {
           assert.equal(shutdown.forumDir, null)
           assert.equal(shutdown.PATH, BASE_PATH)
         }
-        const startedOff = ({ start, shutdown }) => {
+        const startedOff = ({ start, shutdown }: Launched) => {
           for (const record of [start, shutdown]) assert.deepEqual([record.forumDir, record.PATH], [null, BASE_PATH])
         }
 
@@ -2305,7 +2480,7 @@ else describe('real Pi host', () => {
         // default is ignored and cannot be changed. Saved allow and deny decisions, and --approve, apply.
         const protectedBytes = await fs.readFile(projectFile(dirs.protected))
         const protectedOn = 'Effective default: on, from the project default, which takes precedence over the user default (off).'
-        const deniedProtected = async (label) => {
+        const deniedProtected = async (label: string) => {
           result = await launch(dirs.protected, ['/forum status', '/forum off project'])
           startedOff(result)
           assert.equal(result.start.trusted, false, label)
@@ -2377,18 +2552,20 @@ else describe('real Pi host', () => {
       test('the pi executable reports unusable saved defaults and activation failures apart from what was saved', { timeout: 60000 }, async () => {
         const { dir } = pkg()
         const probeLog = path.join(temp, `failure-probe-${variant}.jsonl`)
-        const probe = path.join(temp, 'probes', `failure-probe-${variant}.js`)
-        await fs.writeFile(probe, startupProbeSource(probeLog))
-        const headless = await headlessPi(dir, { extensions: [probe, path.join(temp, 'probes', `repair-probe-${variant}.js`)] })
+        const probe = path.join(temp, 'probes', `failure-probe-${variant}.ts`)
+        await installProbe<StartupProbeConfig>('pi-startup-probe.ts', probe, { log: probeLog })
+        const repairProbe = path.join(temp, 'probes', `repair-probe-${variant}.ts`)
+        const headless = await headlessPi(dir, { extensions: [probe, repairProbe] })
         const { paths } = headless
         const forums = path.join(paths.agent, 'forums')
         const marker = path.join(headless.run, 'repair-after-startup')
-        await fs.writeFile(path.join(temp, 'probes', `repair-probe-${variant}.js`), repairProbeSource({ log: probeLog, marker, forums }))
-        const records = async () => (await fs.readFile(probeLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+        await installProbe<RepairProbeConfig>('pi-repair-probe.ts', repairProbe, { log: probeLog, marker, forums })
+        // Both probes write to the one log.
+        const records = () => logRecords<StartupProbeRecord | RepairProbeRecord>(probeLog)
         const userFile = path.join(paths.agent, 'forum.json')
         const projectFile = path.join(paths.project, '.pi', 'forum.json')
         const where = { agentDir: paths.agent, project: paths.project }
-        const starts = async () => (await fs.readFile(probeLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)).filter((record) => record.type === 'session_start')
+        const starts = async () => (await records()).filter((record): record is StartupProbeRecord => record.type === 'session_start')
 
         // A malformed user file is ignored with a warning, the project default applies, and the file
         // is never replaced.
@@ -2398,11 +2575,11 @@ else describe('real Pi host', () => {
         let result = await headless.launch(['-p', '/forum status', '/forum off user'])
         const lines = result.stderr.split('\n')
         const forumDir = path.join(paths.project, '.pi', 'forum')
-        assert.match(lines[0], new RegExp(`^pi-forum: ${escapeRegExp(userFile)} is not valid JSON: .+; this saved default is ignored\\. Run /forum status for details\\.$`))
+        assert.match(lines[0]!, new RegExp(`^pi-forum: ${escapeRegExp(userFile)} is not valid JSON: .+; this saved default is ignored\\. Run /forum status for details\\.$`))
         assert.equal(lines[1], `Forum is on: ${forumDir} (project default)`)
-        assert.match(lines[3], new RegExp(`^ {2}user: unusable, ${escapeRegExp(userFile)} is not valid JSON: `))
+        assert.match(lines[3]!, new RegExp(`^ {2}user: unusable, ${escapeRegExp(userFile)} is not valid JSON: `))
         assert.equal(lines[5], 'Effective default: on, from the project default.')
-        assert.match(lines[6], new RegExp(`^Could not save the user default: ${escapeRegExp(userFile)} is not valid JSON: .+; refusing to replace it, fix or remove it first\\. This session is unchanged\\.$`))
+        assert.match(lines[6]!, new RegExp(`^Could not save the user default: ${escapeRegExp(userFile)} is not valid JSON: .+; refusing to replace it, fix or remove it first\\. This session is unchanged\\.$`))
         assert.equal(lines.length, 8)
         assert.equal(await fs.readFile(userFile, 'utf8'), '{oops')
 
@@ -2413,13 +2590,13 @@ else describe('real Pi host', () => {
         await fs.rm(forums, { recursive: true, force: true })
         await fs.writeFile(forums, 'not a directory')
         result = await headless.launch(['-p', '/forum on user', '/forum status'])
-        let sessionId = (await starts()).at(-1).sessionId
+        let sessionId = (await starts()).at(-1)!.sessionId
         let cannot = `cannot initialize forum directory ${path.join(forums, 'sessions', sessionId)}: `
         let out = result.stderr.split('\n')
         assert.equal(out[0], `Saved the user default: on (${userFile}).`)
-        assert.match(out[1], new RegExp(`^Forum is unavailable: ${escapeRegExp(cannot)}.+\\. Run /forum on to retry\\.$`))
+        assert.match(out[1]!, new RegExp(`^Forum is unavailable: ${escapeRegExp(cannot)}.+\\. Run /forum on to retry\\.$`))
         assert.equal(out[2], 'Effective default: on, from the user default.')
-        assert.match(out[3], /^Forum is unavailable: /)
+        assert.match(out[3]!, /^Forum is unavailable: /)
         assert.equal(await fs.readFile(userFile, 'utf8'), '{\n  "enabled": true\n}\n')
 
         // The next process fails to activate at startup. The repair probe then removes the
@@ -2429,13 +2606,14 @@ else describe('real Pi host', () => {
         const seen = (await records()).length
         result = await headless.launch(['-p', '/forum status', '/forum on project', '/probe-env', '/forum status', '/forum on', '/probe-env', '/forum status'])
         const run = (await records()).slice(seen)
-        sessionId = run[0].sessionId
+        // The run starts with its session start, as checked below.
+        sessionId = (run[0] as StartupProbeRecord).sessionId
         const ownDir = path.join(forums, 'sessions', sessionId)
         assert.deepEqual(run.map((record) => record.type), ['session_start', 'probe-env', 'probe-env', 'session_shutdown'])
-        assert.deepEqual([run[0].forumDir, run[0].PATH], [null, BASE_PATH])
+        assert.deepEqual([run[0]!.forumDir, run[0]!.PATH], [null, BASE_PATH])
         await assert.rejects(fs.access(marker), { code: 'ENOENT' })
         out = result.stderr.split('\n')
-        const failed = out[0].match(new RegExp(`^pi-forum: (${escapeRegExp(`cannot initialize forum directory ${ownDir}: `)}.+); the forum is disabled and the environment is unchanged\\. Fix it and run /forum on to retry\\.$`))
+        const failed = out[0]!.match(new RegExp(`^pi-forum: (${escapeRegExp(`cannot initialize forum directory ${ownDir}: `)}.+); the forum is disabled and the environment is unchanged\\. Fix it and run /forum on to retry\\.$`))
         assert.ok(failed, out[0])
         const unavailable = `Forum is unavailable: ${failed[1]}. Run /forum on to retry.`
         const projectOn = 'Effective default: on, from the project default, which takes precedence over the user default (on).'
@@ -2458,7 +2636,7 @@ else describe('real Pi host', () => {
         assert.deepEqual(run[1], { type: 'probe-env', forumDir: null, PATH: BASE_PATH, forums: false, entries: null })
         // After bare /forum on: the project pin, exposed with the bundled bin. No session directory.
         assert.deepEqual(run[2], { type: 'probe-env', forumDir: pinnedDir, PATH: `${path.join(dir, 'bin')}${path.delimiter}${BASE_PATH}`, forums: false, entries: [] })
-        assert.deepEqual([run[3].forumDir, run[3].PATH], [null, BASE_PATH])
+        assert.deepEqual([run[3]!.forumDir, run[3]!.PATH], [null, BASE_PATH])
         await assert.rejects(fs.access(forums), { code: 'ENOENT' })
         assert.deepEqual(await fs.readdir(pinnedDir), [])
         assert.deepEqual(await fs.readdir(paths.sessions, { recursive: true }), [])
@@ -2470,13 +2648,19 @@ else describe('real Pi host', () => {
   // screen. The synthetic provider is driven through files; nothing goes to the network.
   describe('real pi in a terminal', async () => {
     const skip = (await hasTmux()) ? false : 'tmux is not installed'
-    for (const variant of [0, 1]) {
-      for (const tuiMode of ['regular', 'fullscreen']) {
-        const label = `${['source checkout', 'packed tarball'][variant]}, ${tuiMode}`
+    for (const variant of [0, 1] as const) {
+      for (const tuiMode of ['regular', 'fullscreen'] as const) {
+        const label = `${VARIANTS[variant]}, ${tuiMode}`
         test(`${label}: browsing works by keyboard while a run streams, and Esc closes only the browser`, { skip, timeout: 120000 }, async () => {
-          const { dir } = packages[variant]
+          const { dir } = packages[variant]!
           const run = await fs.mkdtemp(path.join(temp, 'terminal-'))
-          const paths = Object.fromEntries(['home', 'agent', 'project', 'control', 'tmp'].map((name) => [name, path.join(run, name)]))
+          const paths = {
+            home: path.join(run, 'home'),
+            agent: path.join(run, 'agent'),
+            project: path.join(run, 'project'),
+            control: path.join(run, 'control'),
+            tmp: path.join(run, 'tmp'),
+          }
           for (const target of Object.values(paths)) await fs.mkdir(target)
           const forumDir = path.join(run, 'forum')
           const { topic, long } = await seedForum(forumDir)
@@ -2493,7 +2677,7 @@ else describe('real Pi host', () => {
             PI_FORUM_SYNTHETIC_DIR: paths.control,
           }
           const args = [
-            path.join(PI_ROOT, piManifest.bin.pi),
+            path.join(PI_ROOT!, piManifest.bin.pi),
             ...['--no-session', '--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'],
             ...['-e', probes.fileSynthetic, '-e', dir, '--model', 'forum-synthetic/held', '--tui-mode', tuiMode],
           ]
@@ -2505,21 +2689,21 @@ else describe('real Pi host', () => {
             (await fs.readFile(path.join(paths.control, 'log.jsonl'), 'utf8').catch(() => ''))
               .split('\n')
               .filter(Boolean)
-              .map((line) => JSON.parse(line))
+              .map((line) => JSON.parse(line) as SyntheticLogEntry)
           let delta = 0
-          const stream = (text) => fs.writeFile(path.join(paths.control, `delta-${++delta}`), text)
-          const shows = async (...texts) => {
+          const stream = (text: string) => fs.writeFile(path.join(paths.control, `delta-${++delta}`), text)
+          const shows = async (...texts: string[]) => {
             const screen = (await terminal.screen()).replace(/\s+/g, ' ')
             return texts.every((text) => screen.includes(text))
           }
-          const waitFor = (...texts) => until(() => shows(...texts), texts.join(' and '), { detail: () => '(see the screen above)' }).catch(async (err) => {
+          const waitFor = (...texts: string[]) => until(() => shows(...texts), texts.join(' and '), { detail: () => '(see the screen above)' }).catch(async (err: Error) => {
             err.message += `\n${await terminal.screen()}`
             throw err
           })
-          const gone = (text) => until(async () => !(await shows(text)), `${text} to go away`)
+          const gone = (text: string) => until(async () => !(await shows(text)), `${text} to go away`)
           // A trailing space closes Pi's argument completion, so Enter submits rather than picks a
           // completion; /forum trims its arguments.
-          const submit = async (text) => {
+          const submit = async (text: string) => {
             await terminal.text(`${text} `)
             await waitFor(text)
             await terminal.keys('Enter')
@@ -2588,9 +2772,9 @@ else describe('real Pi host', () => {
             const entries = await log()
             assert.deepEqual(entries.filter((entry) => entry.event === 'request').length, 1)
             assert.deepEqual(entries.filter((entry) => entry.event === 'abort'), [])
-            const updates = entries.filter((entry) => entry.event === 'message_update').map((entry) => [entry.delta, entry.at])
+            const updates = entries.filter((entry) => entry.event === 'message_update').map((entry) => [entry.delta, entry.at] as const)
             assert.deepEqual(updates.map(([text]) => text), ['\nD1', '\nD2', '\nD3'])
-            assert.ok(updates[1][1] < closedAt, 'the second delta reached the agent while the browser was open')
+            assert.ok(updates[1]![1] < closedAt, 'the second delta reached the agent while the browser was open')
             await waitFor('D1', 'D2', 'D3')
           } finally {
             await terminal.kill()
@@ -2600,10 +2784,17 @@ else describe('real Pi host', () => {
         })
       }
 
-      test(`${['source checkout', 'packed tarball'][variant]}: text results stay in the transcript of a continued session`, { skip, timeout: 120000 }, async () => {
-        const { dir } = packages[variant]
+      test(`${VARIANTS[variant]}: text results stay in the transcript of a continued session`, { skip, timeout: 120000 }, async () => {
+        const { dir } = packages[variant]!
         const run = await fs.mkdtemp(path.join(temp, 'continued-'))
-        const paths = Object.fromEntries(['home', 'agent', 'project', 'control', 'tmp', 'sessions'].map((name) => [name, path.join(run, name)]))
+        const paths = {
+          home: path.join(run, 'home'),
+          agent: path.join(run, 'agent'),
+          project: path.join(run, 'project'),
+          control: path.join(run, 'control'),
+          tmp: path.join(run, 'tmp'),
+          sessions: path.join(run, 'sessions'),
+        }
         for (const target of Object.values(paths)) await fs.mkdir(target)
         const forumDir = path.join(run, 'forum')
         await seedForum(forumDir)
@@ -2622,22 +2813,22 @@ else describe('real Pi host', () => {
           PI_FORUM_DIR: forumDir,
           PI_FORUM_SYNTHETIC_DIR: paths.control,
         }
-        const command = (...extra) =>
-          ['exec', 'env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), process.execPath, path.join(PI_ROOT, piManifest.bin.pi)]
+        const command = (...extra: string[]) =>
+          ['exec', 'env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), process.execPath, path.join(PI_ROOT!, piManifest.bin.pi)]
             .concat(['--session-dir', paths.sessions, '--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-mcp'])
             .concat(['-e', probes.fileSynthetic, '-e', dir, '--model', 'forum-synthetic/held', ...extra])
             .map(quote)
             .join(' ')
         const terminal = tmuxSession('pi-forum', path.join(run, 'tmux.sock'))
-        const shows = async (...texts) => {
+        const shows = async (...texts: string[]) => {
           const screen = (await terminal.screen()).replace(/\s+/g, ' ')
           return texts.every((text) => screen.includes(text))
         }
-        const waitFor = (...texts) => until(() => shows(...texts), texts.join(' and ')).catch(async (err) => {
+        const waitFor = (...texts: string[]) => until(() => shows(...texts), texts.join(' and ')).catch(async (err: Error) => {
           err.message += `\n${await terminal.screen()}`
           throw err
         })
-        const submit = async (text) => {
+        const submit = async (text: string) => {
           await terminal.text(`${text} `)
           await waitFor(text)
           await terminal.keys('Enter')
@@ -2660,16 +2851,17 @@ else describe('real Pi host', () => {
           // The session file holds the conversation and the text result, which a continued session
           // draws again through the extension's renderer; nothing is sent to the model.
           const [file] = await fs.readdir(paths.sessions, { recursive: true }).then((names) => names.filter((name) => name.endsWith('.jsonl')))
-          const entries = (await fs.readFile(path.join(paths.sessions, file), 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
-          const texts = entries.filter((entry) => entry.type === 'custom' && entry.customType === ENTRY_TYPE)
+          // Pi wrote one session file, its header and then its entries.
+          const entries = await logRecords<FileEntry>(path.join(paths.sessions, file!))
+          const texts = entries.filter((entry): entry is OutputEntry => entry.type === 'custom' && entry.customType === ENTRY_TYPE)
           assert.equal(texts.length, 1)
-          assert.deepEqual(texts[0].data.text.split('\n').filter((line) => shown.includes(line)), shown)
-          const roles = entries.filter((entry) => entry.type === 'message').map((entry) => entry.message.role)
+          assert.deepEqual(outputText(texts[0]).split('\n').filter((line) => shown.includes(line)), shown)
+          const roles = entries.flatMap((entry) => (entry.type === 'message' ? [entry.message.role] : []))
           assert.deepEqual(roles.filter((role) => role !== 'system'), ['user', 'assistant'])
           await terminal.start(command('--continue'), { cwd: paths.project })
           await waitFor('Answered.', ...shown)
           await quit()
-          const log = (await fs.readFile(path.join(paths.control, 'log.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+          const log = (await fs.readFile(path.join(paths.control, 'log.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line) as SyntheticLogEntry)
           assert.equal(log.filter((entry) => entry.event === 'request').length, 1)
         } finally {
           await terminal.kill()
@@ -2682,13 +2874,16 @@ else describe('real Pi host', () => {
   // and runs Pi's npm install for Git packages in the clone; `pi install npm:...` installs into Pi's
   // npm root. A Git URL rewrite points the GitHub URL at a local repository holding a commit of this
   // checkout (tracked and new files, as they would be committed), npm runs offline with an empty
-  // cache, and a shim ahead of npm on PATH records every npm call Pi makes. Each installation then
-  // loads in Pi from its settings and runs its bundled CLI: no dev dependencies, compiler or build.
+  // cache, and a shim ahead of npm on PATH (test/fixtures/npm-logger.mts) records every npm call Pi
+  // makes. Each installation then loads in Pi from its settings and runs its bundled CLI: no dev
+  // dependencies, compiler or build.
   describe('consumer installs through pi install', () => {
     const GIT_SOURCE = 'git:github.com/pi-forum-test/pi-forum'
-    let routes
-    let committed
-    let gitEnv
+    // The before hook assigns these.
+    let routes!: string
+    let committed!: string[]
+    let gitEnv!: NodeJS.ProcessEnv
+    let npm!: string
 
     before(async () => {
       routes = path.join(temp, 'routes')
@@ -2700,35 +2895,28 @@ else describe('real Pi host', () => {
         `[url "file://${repo}"]\n\tinsteadOf = https://github.com/pi-forum-test/pi-forum\n[protocol "file"]\n\tallow = always\n`,
       )
       gitEnv = { GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: '1' }
-      const git = (args) => exec('git', args, { cwd: repo, env: { ...process.env, ...gitEnv } })
+      const git = (args: readonly string[]) => exec('git', args, { cwd: repo, env: { ...process.env, ...gitEnv } })
       await git(['init', '-q', '-b', 'main'])
       await git(['add', '-A'])
       await git(['-c', 'user.name=pi-forum test', '-c', 'user.email=test@example.invalid', 'commit', '-q', '-m', 'snapshot'])
 
-      let npm
+      let found: string | undefined
       for (const dir of BASE_PATH.split(path.delimiter)) {
         if (await fs.access(path.join(dir, 'npm'), fs.constants.X_OK).then(() => true, () => false)) {
-          npm = path.join(dir, 'npm')
+          found = path.join(dir, 'npm')
           break
         }
       }
-      assert.ok(npm, 'npm is not on PATH')
+      assert.ok(found, 'npm is not on PATH')
+      npm = found
+      // The shim is the executable fixture itself, linked as npm: Node runs it by its real path, as
+      // the native TypeScript module it is, and it runs the npm found here (PI_FORUM_TEST_NPM).
       await fs.mkdir(path.join(routes, 'shim'))
-      await fs.writeFile(
-        path.join(routes, 'shim', 'npm'),
-        `#!/usr/bin/env node
-const { appendFileSync } = require('node:fs')
-const { spawnSync } = require('node:child_process')
-appendFileSync(process.env.PI_FORUM_TEST_NPM_LOG, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }) + '\\n')
-const result = spawnSync(${JSON.stringify(npm)}, process.argv.slice(2), { stdio: 'inherit' })
-process.exitCode = result.status ?? 1
-`,
-        { mode: 0o755 },
-      )
+      await fs.symlink(fileURLToPath(new URL('./fixtures/npm-logger.mts', import.meta.url)), path.join(routes, 'shim', 'npm'))
     })
 
     // Runs `pi install source` with a new agent dir and project; returns those and the npm calls.
-    async function piInstall(source) {
+    async function piInstall(source: string) {
       const run = await fs.mkdtemp(path.join(routes, 'install-'))
       const [agentDir, project] = [path.join(run, 'agent'), path.join(run, 'project')]
       for (const dir of [agentDir, project]) await fs.mkdir(dir)
@@ -2741,17 +2929,20 @@ process.exitCode = result.status ?? 1
           PATH: [path.join(routes, 'shim'), BASE_PATH].join(path.delimiter),
           PI_CODING_AGENT_DIR: agentDir,
           PI_FORUM_TEST_NPM_LOG: log,
+          PI_FORUM_TEST_NPM: npm,
           npm_config_cache: path.join(run, 'npm-cache'),
           npm_config_offline: 'true',
         },
       })
-      const calls = (await fs.readFile(log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      // Each line is one NpmCall the shim wrote.
+      const calls = (await fs.readFile(log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line) as NpmCall)
       return { agentDir, project, calls }
     }
 
     // Pi loads the installed package from its settings; enabled, its bundled CLI posts through bash.
-    async function assertInstalledLoads(installed, { agentDir, project }, source) {
-      const settings = JSON.parse(await fs.readFile(path.join(agentDir, 'settings.json'), 'utf8'))
+    async function assertInstalledLoads(installed: string, { agentDir, project }: { agentDir: string; project: string }, source: string) {
+      // Pi's settings file, as far as this reads it.
+      const settings = JSON.parse(await fs.readFile(path.join(agentDir, 'settings.json'), 'utf8')) as { packages: unknown[] }
       assert.deepEqual(settings.packages, [source])
       const host = await openHost(installed, { mode: 'installed', ui: true, agentDir, project })
       try {
@@ -2760,7 +2951,7 @@ process.exitCode = result.status ?? 1
         const on = `Forum is on: ${host.defaultDir(host.sessionId)} (session default)`
         assert.deepEqual(await slash(host, '/forum on'), [info(on)])
         assertBound(host, host.defaultDir(host.sessionId), installed)
-        assert.ok((await startRun(host)).sections.forum.includes(`Your author identity: ${host.sessionId} `))
+        assert.ok((await startRun(host)).sections.forum!.includes(`Your author identity: ${host.sessionId} `))
         const { output } = await bash(host, 'command -v pi-forum')
         assert.equal(output.trim(), path.join(installed, 'bin', 'pi-forum'))
         const created = await forum(host, ['topic', 'create', 'Installed', '--body', source])
@@ -2768,7 +2959,7 @@ process.exitCode = result.status ?? 1
         assert.deepEqual((await forum(host, ['message', 'list'])).items.map((m) => m.body), [source])
         // The installed extension's text reader shows the post as a session entry.
         await host.runtime.session.prompt('/forum topics')
-        assert.deepEqual(outputs(host.runtime.session).map((entry) => entry.data.text.split('\n').includes('1. Installed')), [true])
+        assert.deepEqual(outputs(host.runtime.session).map((entry) => outputText(entry).split('\n').includes('1. Installed')), [true])
       } finally {
         await host.runtime.dispose()
       }
@@ -2776,13 +2967,31 @@ process.exitCode = result.status ?? 1
       assert.deepEqual(host.errors, [])
     }
 
-    test('pi install git: clones a commit of this checkout, runs only npm install --omit=dev --legacy-peer-deps, and loads it', async () => {
+    // What npm install --omit=dev leaves in a package whose dependencies it all omits: nothing with
+    // npm 11, which leaves omitted packages out of the tree it builds. npm 10 (10.9) creates the
+    // directory of every package in its tree before it removes the omitted ones, which leaves their
+    // empty scope directories, and saves its hidden lockfile, node_modules/.package-lock.json,
+    // recording that no package is installed. ignored is git status --porcelain --ignored.
+    async function assertNothingInstalled(dir: string, ignored: string) {
+      const modules = path.join(dir, 'node_modules')
+      if (ignored === '') return assert.rejects(fs.access(modules), { code: 'ENOENT' })
+      assert.equal(ignored, '!! node_modules/\n')
+      assert.deepEqual(await listFiles(modules), ['.package-lock.json'])
+      // npm's lockfile, as far as this reads it.
+      const lock = JSON.parse(await fs.readFile(path.join(modules, '.package-lock.json'), 'utf8')) as { name: string; packages: unknown }
+      assert.deepEqual([lock.name, lock.packages], ['pi-forum', {}])
+    }
+
+    test('pi install git: clones a commit of this checkout, runs only npm install --omit=dev --legacy-peer-deps, and loads it', async (t) => {
+      t.diagnostic(`npm ${(await exec(npm, ['--version'])).stdout.trim()} at ${npm}`)
       const { agentDir, project, calls } = await piInstall(GIT_SOURCE)
       const installed = path.join(agentDir, 'git', 'github.com', 'pi-forum-test', 'pi-forum')
       assert.deepEqual(calls, [{ cwd: installed, args: ['install', '--omit=dev', '--legacy-peer-deps'] }])
-      // The clone is exactly the commit: nothing installed, built, rewritten or added (not even ignored files).
-      assert.equal((await exec('git', ['status', '--porcelain', '--ignored'], { cwd: installed })).stdout, '')
-      assert.deepEqual(await listFiles(installed, { skip: ['.git'] }), committed)
+      // The clone is exactly the commit: nothing installed, built, rewritten or added, and nothing
+      // ignored but what npm leaves after installing nothing.
+      assert.equal((await exec('git', ['status', '--porcelain'], { cwd: installed })).stdout, '')
+      await assertNothingInstalled(installed, (await exec('git', ['status', '--porcelain', '--ignored'], { cwd: installed })).stdout)
+      assert.deepEqual(await listFiles(installed, { skip: ['.git', 'node_modules'] }), committed)
       await assertInstalledLoads(installed, { agentDir, project }, GIT_SOURCE)
     })
 

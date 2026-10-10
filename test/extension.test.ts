@@ -9,10 +9,37 @@ import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import type { CustomEntry, EntryRenderOptions } from '@earendil-works/pi-coding-agent'
+import type { AutocompleteItem } from '@earendil-works/pi-tui'
+import type { BrowserForum } from '../extension/browser-state.js'
+import type { OutputEntryData } from '../extension/entry-renderer.js'
 import { formatMessage, formatMessageList, formatTarget, formatTopicList } from '../extension/output.js'
 import { createPreferenceStore } from '../extension/preferences.js'
-import { createForumRuntime, forumCompletions, SECTION_NAME, USAGE } from '../extension/runtime.js'
+import {
+  type CreateReader,
+  createForumRuntime,
+  type ForumRuntime,
+  type ForumRuntimeOptions,
+  forumCompletions,
+  type RuntimeReport,
+  SECTION_NAME,
+  USAGE,
+} from '../extension/runtime.js'
+import type {
+  ForumTarget,
+  ForumView,
+  NotifyType,
+  OpenBrowser,
+  OpenBrowserRequest,
+  PreferenceFs,
+  PreferenceScope,
+  PreferenceStore,
+  RuntimeContext,
+  ScopeState,
+} from '../extension/types.js'
 import { createForum } from '../src/forum.js'
+import type { Forum, ListMessagesOptions, ListOptions, Message, Page, ReadCallOptions, Topic, WarningHandler } from '../src/types.js'
+import type { Text } from './fixtures/extension-tui.ts'
 
 const exec = promisify(execFile)
 // A mutable copy of node:fs, for stores that need some calls replaced or recorded.
@@ -21,20 +48,27 @@ const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
 const NODE_DIR = path.dirname(process.execPath)
 const AGENT_DIR = '/home/tester/.config/pi-agent'
 const PROJECT = '/home/tester/project'
-const roots = []
+const roots: string[] = []
 
 after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
 })
 
+// The UI a test gives Pi's context: notify, and custom where a browser could open. A stand-in custom
+// resolves with whatever it likes, so it is not generic like Pi's.
+type TestUI = Pick<RuntimeContext['ui'], 'notify'> & {
+  custom?: (...args: Parameters<RuntimeContext['ui']['custom']>) => Promise<unknown>
+}
+
 // A trusted project context by default; extra replaces any field, such as cwd or isProjectTrusted.
-function ctx(sessionId, ui, mode, extra) {
+function ctx(sessionId: string, ui?: TestUI, mode?: RuntimeContext['mode'], extra?: Partial<RuntimeContext>): RuntimeContext {
+  // @ts-expect-error -- ui and mode only where a test uses them: without a UI the runtime reports to stderr, and it reads the mode only for reads
   return { hasUI: Boolean(ui), ui, mode, cwd: PROJECT, isProjectTrusted: () => true, sessionManager: { getSessionId: () => sessionId }, ...extra }
 }
 
 // A preference store with nothing saved, so unit tests never read real files; saving fails the test.
-function noPreferences() {
-  const scope = (name, file) => ({ scope: name, path: file, exists: false, enabled: undefined, ignored: null, error: null })
+function noPreferences(): PreferenceStore {
+  const scope = <S extends PreferenceScope>(name: S, file: string): ScopeState<S> => ({ scope: name, path: file, exists: false, enabled: undefined, ignored: null, error: null })
   return {
     load: () => ({
       enabled: undefined,
@@ -48,7 +82,7 @@ function noPreferences() {
 }
 
 // What /forum status adds when nothing is saved, then any temporary override.
-function noDefaults(override) {
+function noDefaults(override?: string) {
   const lines = [
     'Saved defaults, as last read:',
     `  user: not set (${path.join(AGENT_DIR, 'forum.json')})`,
@@ -59,8 +93,19 @@ function noDefaults(override) {
   return lines.join('\n')
 }
 
-function defaultDir(sessionId, agentDir = AGENT_DIR) {
+function defaultDir(sessionId: string, agentDir = AGENT_DIR) {
   return path.join(agentDir, 'forums', 'sessions', sessionId)
+}
+
+// The stand-in host's environment and what it gives each runtime it starts.
+interface HostOptions {
+  env: NodeJS.ProcessEnv
+  agentDir?: ForumRuntimeOptions['getAgentDir']
+  mkdir?: ForumRuntimeOptions['mkdir']
+  createForum?: CreateReader
+  openBrowser?: OpenBrowser
+  preferences?: PreferenceStore
+  context?: Partial<RuntimeContext>
 }
 
 // Mimics Pi: every session start gets a fresh extension runtime, and the previous runtime's
@@ -68,13 +113,14 @@ function defaultDir(sessionId, agentDir = AGENT_DIR) {
 // Most unit tests use virtual paths; directory tests opt into node:fs with mkdir: mkdirSync.
 // Text results reach onText, recorded in texts; the host's report records everything else. Saved
 // defaults come from preferences, by default none; context adds to every ctx.
-function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, openBrowser, preferences = noPreferences(), context } = {}) {
-  const reports = []
-  const types = []
-  const texts = []
-  let runtime = null
-  let sessionId = null
-  const report = (message, _ctx, type = 'error') => {
+function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, openBrowser, preferences = noPreferences(), context }: HostOptions) {
+  const reports: string[] = []
+  const types: NotifyType[] = []
+  const texts: string[] = []
+  // Set by start, which every test calls before anything that uses it.
+  let runtime: ForumRuntime | null = null
+  let sessionId: string | null = null
+  const report: RuntimeReport = (message, _ctx, type = 'error') => {
     reports.push(message)
     types.push(type)
   }
@@ -84,9 +130,9 @@ function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, 
     types,
     texts,
     get runtime() {
-      return runtime
+      return runtime!
     },
-    start(id) {
+    start(id: string) {
       runtime?.sessionShutdown()
       runtime = createForumRuntime({
         binDir: BIN_DIR,
@@ -103,41 +149,45 @@ function host({ env, agentDir = () => AGENT_DIR, mkdir = () => {}, createForum, 
       runtime.sessionStart(ctx(id, undefined, undefined, context))
     },
     quit() {
-      runtime.sessionShutdown()
+      runtime!.sessionShutdown()
     },
     // Runs /forum ARGS in the current runtime and returns its single feedback message.
-    forum(args) {
+    forum(args: string) {
       const count = reports.length
-      runtime.command(args, ctx(sessionId, undefined, undefined, context))
+      runtime!.command(args, ctx(sessionId!, undefined, undefined, context))
       assert.equal(reports.length, count + 1)
-      return reports.at(-1)
+      return reports.at(-1)!
     },
     // The state line of /forum ARGS (status by default), without the saved defaults after it.
     status(args = 'status') {
       return this.forum(args).split('\n')[0]
     },
     // Runs a reading /forum ARGS in the given mode; resolves to the [message, type] reports it made.
-    async browse(args, mode = 'tui') {
+    async browse(args: string, mode: RuntimeContext['mode'] = 'tui') {
       const count = reports.length
       const ui = mode === 'tui' || mode === 'rpc' ? { notify: () => assert.fail('reports go through report') } : undefined
-      assert.equal(await runtime.command(args, ctx(sessionId, ui, mode, context)), undefined)
-      return reports.slice(count).map((message, i) => [message, types[count + i]])
+      assert.equal(await runtime!.command(args, ctx(sessionId!, ui, mode, context)), undefined)
+      return reports.slice(count).map((message, i): [string, NotifyType | undefined] => [message, types[count + i]])
     },
     // Runs a text /forum ARGS in the terminal UI, which reports nothing on success; resolves to its text.
-    async text(args) {
+    async text(args: string) {
       const count = texts.length
       assert.deepEqual(await this.browse(args), [])
       assert.equal(texts.length, count + 1)
-      return texts.at(-1)
+      return texts.at(-1)!
     },
-    prompt(sections = { cwd: '<cwd>\n/project\n</cwd>' }) {
+    prompt(sections: Record<string, string> = { cwd: '<cwd>\n/project\n</cwd>' }) {
       const event = { type: 'before_agent_start', prompt: 'hi', systemPromptOptions: { sections } }
-      const result = runtime.beforeAgentStart(event, ctx(sessionId, undefined, undefined, context))
+      const result = runtime!.beforeAgentStart(event, ctx(sessionId!, undefined, undefined, context))
       assert.equal(result, undefined)
       return event.systemPromptOptions.sections
     },
   }
 }
+
+type Host = ReturnType<typeof host>
+// What the runtime opens a selection's read client with.
+type ReaderConfig = Parameters<CreateReader>[0]
 
 const BASE_PATH = ['/usr/local/bin', '/usr/bin'].join(path.delimiter)
 const withBin = (base = BASE_PATH) => [BIN_DIR, base].join(path.delimiter)
@@ -207,7 +257,7 @@ describe('binding selection', () => {
       assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: supplied })
       assert.equal(h.runtime.binding, null)
       assert.equal(h.reports.length, 1)
-      assert.match(h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got ".*"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
+      assert.match(h.reports[0]!, /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got ".*"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
       assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
       h.quit()
       h.quit()
@@ -230,7 +280,7 @@ describe('binding selection', () => {
 describe('session lifecycle', () => {
   test('explicit activation after new, fork, clone, resume and reload follows the session ID', () => {
     const h = host({ env: { PATH: BASE_PATH } })
-    const expectGenerated = (id) => {
+    const expectGenerated = (id: string) => {
       assert.equal(h.runtime.state.status, 'off')
       assert.deepEqual(h.env, { PATH: BASE_PATH })
       assert.equal(h.forum('on'), `Forum is on: ${defaultDir(id)} (session default)`)
@@ -275,7 +325,7 @@ describe('session lifecycle', () => {
       assert.deepEqual(h.env, before.env)
       assert.equal(h.prompt()[SECTION_NAME], before.section)
     }
-    assert.match(before.section, new RegExp(`Forum directory: ${defaultDir('s-1')} `))
+    assert.match(before.section!, new RegExp(`Forum directory: ${defaultDir('s-1')} `))
   })
 
   test('cleanup is idempotent and a repeated start does not stack changes', () => {
@@ -412,7 +462,7 @@ describe('prompt section', () => {
     h.start('s-1')
     h.forum('on')
     const others = { preamble: 'You are...', cwd: '<cwd>\n/p\n</cwd>', tool_guidance: 'x' }
-    const sections = { ...others }
+    const sections: Record<string, string> = { ...others }
     h.prompt(sections)
     const first = sections[SECTION_NAME]
     h.prompt(sections)
@@ -426,7 +476,7 @@ describe('prompt section', () => {
     const h = host({ env: { PATH: BASE_PATH } })
     h.start('s-1')
     h.forum('on')
-    const text = h.prompt()[SECTION_NAME]
+    const text = h.prompt()[SECTION_NAME]!
     assert.doesNotMatch(text, /<\/?forum>/)
     assert.match(text, new RegExp(`Forum directory: ${defaultDir('s-1')} \\(PI_FORUM_DIR; this session's default forum\\)`))
     assert.match(text, /Your author identity: s-1 /)
@@ -447,7 +497,7 @@ describe('prompt section', () => {
       const h = host({ env })
       h.start('s-1')
       if (supplied === undefined) h.forum('on')
-      const guidance = h.prompt()[SECTION_NAME].split('\n\nAgents you start:\n')[1]
+      const guidance = h.prompt()[SECTION_NAME]!.split('\n\nAgents you start:\n')[1]!
       assert.equal(typeof guidance, 'string')
       assert.match(guidance, /When starting a fresh child, include concise pi-forum usage instructions in its task\/context/)
       assert.match(guidance, /Your system prompt is not automatically inherited/)
@@ -468,13 +518,13 @@ describe('prompt section', () => {
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' } })
     h.start('s-1')
     h.start('s-2')
-    const text = h.prompt()[SECTION_NAME]
+    const text = h.prompt()[SECTION_NAME]!
     assert.match(text, /Forum directory: \/shared\/forum \(PI_FORUM_DIR; supplied at launch; other sessions may share it\)/)
     assert.match(text, /Your author identity: s-2 /)
   })
 })
 
-const snapshot = (h) => ({ env: { ...h.env }, state: h.runtime.state })
+const snapshot = (h: Host) => ({ env: { ...h.env }, state: h.runtime.state })
 
 describe('/forum parsing, completion and feedback', () => {
   for (const args of ['', '   ', 'status', '  status\t']) {
@@ -606,18 +656,20 @@ describe('/forum parsing, completion and feedback', () => {
   })
 
   test('text and browser forms route to their reads with exactly the given IDs and cursor', async () => {
-    const calls = []
-    const client = {
+    const calls: unknown[][] = []
+    const client: BrowserForum = {
       resolved: undefined,
-      listTopics: async ({ after, limit }) => (calls.push(['topics', after, limit]), { items: [], next_cursor: 'c' }),
-      listMessages: async ({ topicId, after, limit }) => (calls.push(['messages', topicId, after, limit]), { items: [], next_cursor: 'c' }),
-      getMessage: async (id) => (calls.push(['read', id]), { id, topic_id: 't', author: 'a', created_at: 'now', body: 'b' }),
+      listTopics: async ({ after, limit }: ListOptions) => (calls.push(['topics', after, limit]), { items: [], next_cursor: 'c' }),
+      listMessages: async ({ topicId, after, limit }: ListMessagesOptions) => (calls.push(['messages', topicId, after, limit]), { items: [], next_cursor: 'c' }),
+      getMessage: async (id: string) => (calls.push(['read', id]), { id, topic_id: 't', author: 'a', created_at: 'now', body: 'b' }),
     }
-    const views = []
+    const views: ForumView[] = []
     const h = host({
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       createForum: () => client,
-      openBrowser: async ({ view }) => views.push(view),
+      openBrowser: async ({ view }) => {
+        views.push(view)
+      },
     })
     h.start('s-1')
     const text = {
@@ -682,7 +734,7 @@ describe('/forum parsing, completion and feedback', () => {
   })
 
   test('completions are the actions, or the scopes after on, off and reset and the browser views after ui', () => {
-    const items = (...values) => values.map((value) => ({ value, label: value }))
+    const items = (...values: string[]) => values.map((value) => ({ value, label: value }))
     assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'ui'))
     assert.deepEqual(forumCompletions('on '), items('on project', 'on user'))
     assert.deepEqual(forumCompletions('off u'), items('off user'))
@@ -712,8 +764,8 @@ describe('/forum parsing, completion and feedback', () => {
 
   test('feedback uses ui.notify when the mode has a UI and stderr otherwise', (t) => {
     const stderr = t.mock.method(console, 'error', () => {})
-    const notices = []
-    const ui = { notify: (message, type) => notices.push([message, type]) }
+    const notices: [string, NotifyType | undefined][] = []
+    const ui: TestUI = { notify: (message, type) => notices.push([message, type]) }
     const runtime = createForumRuntime({
       binDir: BIN_DIR,
       getAgentDir: () => AGENT_DIR,
@@ -799,7 +851,8 @@ describe('/forum toggling', () => {
     assert.equal(h.forum('on'), 'Forum is on: /team/forum (supplied PI_FORUM_DIR)')
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/team/forum' })
     h.forum('off')
-    delete h.env.PI_FORUM_DIR
+    // The environment as it is now, not as the assertion above narrowed it.
+    delete (h.env as NodeJS.ProcessEnv).PI_FORUM_DIR
     assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
     h.quit()
     assert.deepEqual(h.env, { PATH: BASE_PATH })
@@ -856,7 +909,7 @@ describe('/forum toggling', () => {
   test('an invalid startup binding is unavailable until on succeeds', () => {
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' } })
     h.start('s-1')
-    assert.match(h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
+    assert.match(h.reports[0]!, /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative"; the forum is disabled and the environment is unchanged\. Fix it and run \/forum on to retry\.$/)
     const reason = 'PI_FORUM_DIR must be a nonempty absolute path, got "relative"'
     assert.deepEqual(h.runtime.state, { status: 'unavailable', reason, selected: null })
     assert.equal(h.status(''), `Forum is unavailable: ${reason}. Run /forum on to retry.`)
@@ -876,7 +929,8 @@ describe('/forum toggling', () => {
     h.start('s-1')
     assert.equal(h.forum('off'), 'Forum is off.')
     assert.deepEqual(h.env, { PATH: BASE_PATH, PI_FORUM_DIR: '' })
-    delete h.env.PI_FORUM_DIR
+    // The environment as it is now, not as the assertion above narrowed it.
+    delete (h.env as NodeJS.ProcessEnv).PI_FORUM_DIR
     assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
   })
 })
@@ -896,7 +950,9 @@ describe('/forum binding drift', () => {
     assert.equal(h.runtime.binding, null)
 
     // Putting the value back by hand does not reactivate it; only /forum on does.
-    h.env.PI_FORUM_DIR = defaultDir('s-1')
+    // The environment as it is now, not as the assertion above narrowed it.
+    const env: NodeJS.ProcessEnv = h.env
+    env.PI_FORUM_DIR = defaultDir('s-1')
     assert.match(h.forum(''), /^Forum is unavailable: PI_FORUM_DIR was removed/)
     assert.equal(h.forum('on'), `Forum is on: ${defaultDir('s-1')} (session default)`)
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: defaultDir('s-1') })
@@ -1039,7 +1095,7 @@ describe('/forum across the session lifecycle', () => {
     h.start('s-1')
     h.forum('on')
     const others = { preamble: 'p', cwd: 'c', tool_guidance: 't' }
-    const sections = { ...others }
+    const sections: Record<string, string> = { ...others }
     h.prompt(sections)
     const text = sections[SECTION_NAME]
     assert.deepEqual(Object.keys(sections), [...Object.keys(others), SECTION_NAME])
@@ -1052,17 +1108,36 @@ describe('/forum across the session lifecycle', () => {
   })
 })
 
+// The options the runtime passes last with every read: its selection's signal and a warning handler,
+// and for lists the cursor, page size and topic.
+interface RuntimeReadOptions extends ReadCallOptions {
+  signal: AbortSignal
+  onWarning: WarningHandler
+  after?: string | undefined
+  limit?: number
+  topicId?: string | undefined
+}
+
 describe('/forum saved defaults', () => {
   // A temporary agent directory and project with the given saved defaults (undefined leaves the file
   // out), read through the real store. Forum directories stay virtual unless mkdir is given.
-  async function saved({ user, project, env = { PATH: BASE_PATH }, trusted = true, fs: storeFs, ...options } = {}) {
+  interface SavedOptions extends Omit<HostOptions, 'env'> {
+    // A saved value, or the raw file content when a string.
+    user?: boolean | string | undefined
+    project?: boolean | string | undefined
+    env?: NodeJS.ProcessEnv
+    trusted?: boolean
+    fs?: PreferenceFs
+  }
+
+  async function saved({ user, project, env = { PATH: BASE_PATH }, trusted = true, fs: storeFs, ...options }: SavedOptions = {}) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-forum-defaults-test-'))
     roots.push(root)
     const agentDir = path.join(root, 'agent')
     const cwd = path.join(root, 'project')
     const userFile = path.join(agentDir, 'forum.json')
     const projectFile = path.join(cwd, '.pi', 'forum.json')
-    for (const [file, value] of [[userFile, user], [projectFile, project]]) {
+    for (const [file, value] of [[userFile, user], [projectFile, project]] as const) {
       if (value === undefined) continue
       await fs.mkdir(path.dirname(file), { recursive: true })
       await fs.writeFile(file, typeof value === 'string' ? value : JSON.stringify({ enabled: value }))
@@ -1074,8 +1149,14 @@ describe('/forum saved defaults', () => {
       context: { cwd, isProjectTrusted: () => trusted },
       ...options,
     })
-    const read = async (file) => JSON.parse(await fs.readFile(file, 'utf8'))
-    return { h, root, agentDir, cwd, userFile, projectFile, read, projectDir: path.join(cwd, '.pi', 'forum'), dir: (id) => defaultDir(id, agentDir) }
+    const read = async (file: string): Promise<unknown> => JSON.parse(await fs.readFile(file, 'utf8'))
+    return { h, root, agentDir, cwd, userFile, projectFile, read, projectDir: path.join(cwd, '.pi', 'forum'), dir: (id: string) => defaultDir(id, agentDir) }
+  }
+
+  // A topics read the runtime made, settled by the test.
+  interface TopicsRead {
+    options: RuntimeReadOptions
+    resolve: (page: Page<Topic>) => void
   }
 
   test('startup precedence: a supplied PI_FORUM_DIR, then the project default, then the user default, then off', async () => {
@@ -1143,17 +1224,18 @@ describe('/forum saved defaults', () => {
     assert.deepEqual(untrusted.h.reports, [])
     const lines = untrusted.h.forum('status').split('\n')
     assert.equal(lines[2], `  user: on (${untrusted.userFile})`)
-    assert.match(lines[3], /^ {2}project: ignored, project .* is not trusted, so .*forum\.json is ignored; run \/trust and restart Pi/)
+    assert.match(lines[3]!, /^ {2}project: ignored, project .* is not trusted, so .*forum\.json is ignored; run \/trust and restart Pi/)
     assert.equal(lines[4], 'Effective default: on, from the user default.')
 
     const malformed = await saved({ user: '{oops', project: true })
     malformed.h.start('s-1')
     assert.equal(malformed.h.runtime.state.status, 'on')
     assert.equal(malformed.h.reports.length, 1)
-    assert.match(malformed.h.reports[0], /^pi-forum: .*forum\.json is not valid JSON: .*; this saved default is ignored\. Run \/forum status for details\.$/)
+    assert.match(malformed.h.reports[0]!, /^pi-forum: .*forum\.json is not valid JSON: .*; this saved default is ignored\. Run \/forum status for details\.$/)
     assert.equal(malformed.h.types[0], 'warning')
-    assert.match(malformed.h.forum('status').split('\n')[2], /^ {2}user: unusable, .*forum\.json is not valid JSON/)
+    assert.match(malformed.h.forum('status').split('\n')[2]!, /^ {2}user: unusable, .*forum\.json is not valid JSON/)
 
+    // @ts-expect-error -- a context without a cwd, which the store checks at run time
     const nowhere = await saved({ user: false, context: { cwd: undefined } })
     nowhere.h.start('s-1')
     assert.match(nowhere.h.forum('status'), /\n {2}project: ignored, no absolute working directory is known for project preferences\nEffective default: off, from the user default\.$/)
@@ -1164,7 +1246,7 @@ describe('/forum saved defaults', () => {
     t.h.start('s-1')
     assert.equal(t.h.runtime.state.status, 'unavailable')
     assert.deepEqual(t.h.env, { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' })
-    assert.match(t.h.reports[0], /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative"; the forum is disabled/)
+    assert.match(t.h.reports[0]!, /^pi-forum: PI_FORUM_DIR must be a nonempty absolute path, got "relative"; the forum is disabled/)
     const reply = t.h.forum('on user')
     assert.match(reply, /^The user default was already on \(.*\)\.\nForum is unavailable: PI_FORUM_DIR must be/)
     assert.deepEqual(t.h.env, { PATH: BASE_PATH, PI_FORUM_DIR: 'relative' })
@@ -1250,7 +1332,9 @@ describe('/forum saved defaults', () => {
     // A value someone else supplies while off is supplied, and outranks a saved off.
     t.h.start('s-3')
     t.h.forum('off')
-    t.h.env.PI_FORUM_DIR = '/shared/forum'
+    // The environment as it is now, not as the assertion above narrowed it.
+    const env: NodeJS.ProcessEnv = t.h.env
+    env.PI_FORUM_DIR = '/shared/forum'
     const reply = t.h.forum('off user')
     assert.equal(
       reply,
@@ -1324,7 +1408,7 @@ describe('/forum saved defaults', () => {
     assert.ok(reply.includes(`Forum is on: ${t.projectDir} (project default)`))
     assert.deepEqual(t.h.runtime.binding, { forumDir: t.projectDir, generated: true, project: true })
     assert.deepEqual(await fs.readdir(t.projectDir), [])
-    assert.match(t.h.prompt()[SECTION_NAME], /project default; shared by sessions in this working directory/)
+    assert.match(t.h.prompt()[SECTION_NAME]!, /project default; shared by sessions in this working directory/)
     assert.match(await t.h.text('topics'), /\(project default\)/)
     await createForum({ forumDir: t.projectDir }).createTopic({ title: 'Project history', author: 'b' })
     const projectBytes = await fs.readFile(path.join(t.projectDir, 'events.jsonl'))
@@ -1337,8 +1421,9 @@ describe('/forum saved defaults', () => {
     assert.match(t.h.forum('on'), /\(project default\)$/)
     for (const id of ['s-1', 's-2', 's-3', 's-1']) {
       t.h.start(id)
-      assert.equal(t.h.env.PI_FORUM_DIR, t.projectDir)
-      assert.equal((await createForum({ forumDir: t.projectDir }).listTopics()).items[0].title, 'Project history')
+      // The environment as it is now, not as the assertion above narrowed it.
+      assert.equal((t.h.env as NodeJS.ProcessEnv).PI_FORUM_DIR, t.projectDir)
+      assert.equal((await createForum({ forumDir: t.projectDir }).listTopics()).items[0]!.title, 'Project history')
     }
     t.h.start('s-2')
     t.h.forum('reset project')
@@ -1352,14 +1437,15 @@ describe('/forum saved defaults', () => {
   })
 
   test('changing a healthy target discards its browser and late read, but saving the same target keeps them', async () => {
-    const clients = []
-    const opened = []
+    const clients: TopicsRead[][] = []
+    const opened: OpenBrowserRequest[] = []
     const t = await saved({
       user: true,
+      // @ts-expect-error -- a client with only the read this test makes
       createForum: () => {
-        const calls = []
+        const calls: TopicsRead[] = []
         clients.push(calls)
-        return { resolved: undefined, listTopics: (options) => new Promise((resolve) => calls.push({ options, resolve })) }
+        return { resolved: undefined, listTopics: (options: RuntimeReadOptions) => new Promise<Page<Topic>>((resolve) => calls.push({ options, resolve })) }
       },
       openBrowser: async (request) => {
         opened.push(request)
@@ -1374,22 +1460,22 @@ describe('/forum saved defaults', () => {
     const reading = t.h.runtime.command('topics', tui)
     await new Promise(setImmediate)
     t.h.forum('on project')
-    assert.equal(opened[0].browser.closeReason, 'discarded')
-    assert.equal(opened[0].signal.aborted, true)
-    assert.equal(clients[0][1].options.signal.aborted, true)
-    clients[0][1].resolve({ items: [], next_cursor: 'c' })
+    assert.equal(opened[0]!.browser.closeReason, 'discarded')
+    assert.equal(opened[0]!.signal.aborted, true)
+    assert.equal(clients[0]![1]!.options.signal.aborted, true)
+    clients[0]![1]!.resolve({ items: [], next_cursor: 'c' })
     await Promise.all([browsing, reading])
     assert.deepEqual(t.h.texts, [])
 
     const projectBrowser = t.h.runtime.command('ui', tui)
     await new Promise(setImmediate)
-    assert.equal(opened[1].target.project, true)
+    assert.equal(opened[1]!.target.project, true)
     for (const command of ['on project', 'on user']) {
       t.h.forum(command)
-      assert.equal(opened[1].signal.aborted, false)
+      assert.equal(opened[1]!.signal.aborted, false)
     }
     t.h.forum('reset project')
-    assert.equal(opened[1].signal.aborted, true)
+    assert.equal(opened[1]!.signal.aborted, true)
     assert.equal(t.h.env.PI_FORUM_DIR, t.dir('s-1'))
     await projectBrowser
     t.h.quit()
@@ -1411,18 +1497,20 @@ describe('/forum saved defaults', () => {
     t.h.forum('on user')
     assert.equal(t.h.runtime.state.status, 'unavailable')
     t.h.forum('on')
-    assert.equal(t.h.env.PI_FORUM_DIR, t.projectDir)
+    // The environment as it is now, not as the assertion above narrowed it.
+    assert.equal((t.h.env as NodeJS.ProcessEnv).PI_FORUM_DIR, t.projectDir)
     t.h.quit()
     assert.deepEqual(t.h.env, { PATH: BASE_PATH })
   })
 
   test('a failed save changes nothing: override, status, environment, selection, client and browser are kept', async () => {
     const failing = { ...nodeFs(), renameSync: () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }) } }
-    const clients = []
-    const opened = []
+    const clients: ReaderConfig[] = []
+    const opened: OpenBrowserRequest[] = []
     const t = await saved({
       user: true,
       fs: failing,
+      // @ts-expect-error -- a client with only the read this test makes
       createForum: (config) => (clients.push(config), { resolved: undefined, listTopics: async () => ({ items: [], next_cursor: 'c' }) }),
       openBrowser: async (request) => {
         opened.push(request)
@@ -1442,13 +1530,13 @@ describe('/forum saved defaults', () => {
       assert.equal(t.h.types.at(-1), 'error')
       assert.deepEqual({ ...snapshot(t.h), defaults: t.h.runtime.defaults, prompt: t.h.prompt({ cwd: 'x' }) }, before, args)
     }
-    assert.equal(opened[0].browser.closed, false)
-    assert.equal(opened[0].signal.aborted, false)
+    assert.equal(opened[0]!.browser.closed, false)
+    assert.equal(opened[0]!.signal.aborted, false)
     await t.h.text('topics')
     assert.equal(clients.length, 1)
     assert.deepEqual(await t.read(t.userFile), { enabled: true })
     assert.deepEqual((await fs.readdir(t.agentDir)).sort(), ['forum.json'])
-    opened[0].browser.close()
+    opened[0]!.browser.close()
     await browsing
 
     // An untrusted project is refused the same way, and nothing is created.
@@ -1469,7 +1557,7 @@ describe('/forum saved defaults', () => {
     t.h.start('s-1')
     const lines = t.h.forum('on user').split('\n')
     assert.equal(lines[0], `Saved the user default: on (${t.userFile}).`)
-    assert.match(lines[1], /^Forum is unavailable: cannot initialize forum directory .*: ENOTDIR.* Run \/forum on to retry\.$/)
+    assert.match(lines[1]!, /^Forum is unavailable: cannot initialize forum directory .*: ENOTDIR.* Run \/forum on to retry\.$/)
     assert.equal(lines[2], 'Effective default: on, from the user default.')
     assert.equal(t.h.types.at(-1), 'warning')
     assert.deepEqual(await t.read(t.userFile), { enabled: true })
@@ -1478,7 +1566,7 @@ describe('/forum saved defaults', () => {
 
     // The next runtime tries again and reports the failure like a supplied binding's.
     t.h.start('s-2')
-    assert.match(t.h.reports.at(-1), /^pi-forum: cannot initialize forum directory .*; the forum is disabled and the environment is unchanged\./)
+    assert.match(t.h.reports.at(-1)!, /^pi-forum: cannot initialize forum directory .*; the forum is disabled and the environment is unchanged\./)
   })
 
   test('scoped commands leave drift unavailable when the default stays on; only bare on repairs it', async () => {
@@ -1495,9 +1583,11 @@ describe('/forum saved defaults', () => {
     assert.equal(t.h.forum('on'), `Forum is on: ${t.dir('s-1')} (session default)`)
 
     // A default that turns off releases what is still owned, as /forum off does.
-    t.h.env.PI_FORUM_DIR = '/other'
+    // The environment as it is now, not as the assertion above narrowed it.
+    const env: NodeJS.ProcessEnv = t.h.env
+    env.PI_FORUM_DIR = '/other'
     t.h.forum('status')
-    delete t.h.env.PI_FORUM_DIR
+    delete env.PI_FORUM_DIR
     t.h.forum('off user')
     assert.deepEqual(t.h.runtime.state.status, 'off')
     assert.deepEqual(t.h.env, { PATH: BASE_PATH })
@@ -1513,16 +1603,16 @@ describe('/forum saved defaults', () => {
     assert.equal(t.h.types.at(-1), 'warning')
     assert.equal(lines.length, 4)
     assert.equal(lines[0], `The user default was already on (${t.userFile}).`)
-    assert.match(lines[1], /^Warning: .*forum\.json is not valid JSON: .*; this saved default is ignored\. Run \/forum status for details\.$/)
-    assert.ok(lines[1].includes(t.projectFile))
+    assert.match(lines[1]!, /^Warning: .*forum\.json is not valid JSON: .*; this saved default is ignored\. Run \/forum status for details\.$/)
+    assert.ok(lines[1]!.includes(t.projectFile))
     assert.equal(lines[2], `Forum is on: ${t.dir('s-1')} (session default)`)
     assert.equal(lines[3], 'Effective default: on, from the user default.')
     assert.deepEqual(t.h.runtime.defaults, { enabled: true, source: 'user', override: null })
     assert.equal(await fs.readFile(t.projectFile, 'utf8'), '{oops')
 
     // Unreadable after startup: resetting the project leaves nothing usable, so the forum turns off.
-    let failing = null
-    const store = {
+    let failing: string | null = null
+    const store: PreferenceFs = {
       ...nodeFs(),
       readFileSync: (file, ...rest) => {
         if (file === failing) throw Object.assign(new Error(`EACCES: permission denied, open '${file}'`), { code: 'EACCES' })
@@ -1561,12 +1651,16 @@ describe('/forum saved defaults', () => {
     assert.equal(untrusted.h.types.at(-1), 'info')
     assert.equal(untrusted.h.runtime.state.status, 'on')
     assert.equal(untrusted.h.env.PI_FORUM_DIR, untrusted.dir('s-1'))
-    assert.equal(untrusted.h.runtime.binding.project, undefined)
+    assert.equal(untrusted.h.runtime.binding!.project, undefined)
   })
 
   test('status, prompts and reads use the defaults as last read and never touch the files', async () => {
-    const calls = []
-    const spy = new Proxy(nodeFs(), { get: (target, name) => (...args) => (calls.push(name), target[name](...args)) })
+    const calls: (string | symbol)[] = []
+    // Every property the store reads is a node:fs function, called as target[name](...args) would be.
+    const spy = new Proxy(nodeFs(), {
+      get: (target, name) => (...args: unknown[]) => (calls.push(name), (Reflect.get(target, name) as (...args: unknown[]) => unknown).apply(target, args)),
+    })
+    // @ts-expect-error -- a client with only the read this test makes
     const t = await saved({ user: true, fs: spy, createForum: () => ({ resolved: undefined, listTopics: async () => ({ items: [], next_cursor: 'c' }) }) })
     t.h.start('s-1')
     assert.deepEqual(calls, ['readFileSync', 'readFileSync'])
@@ -1588,14 +1682,15 @@ describe('/forum saved defaults', () => {
 
   test('applying a default that stays on keeps a healthy binding, its text read and browser; off keeps them too', async () => {
     const settle = () => new Promise(setImmediate)
-    const clients = []
-    const opened = []
+    const clients: TopicsRead[][] = []
+    const opened: OpenBrowserRequest[] = []
     const t = await saved({
       user: true,
+      // @ts-expect-error -- every read is the topics stand-in, which is the only read this test makes
       createForum: () => {
-        const calls = []
+        const calls: TopicsRead[] = []
         clients.push(calls)
-        const read = (options) => new Promise((resolve) => calls.push({ options, resolve }))
+        const read = (options: RuntimeReadOptions) => new Promise<Page<Topic>>((resolve) => calls.push({ options, resolve }))
         return { resolved: undefined, listTopics: read, listMessages: read, getMessage: read }
       },
       openBrowser: async (request) => {
@@ -1610,7 +1705,7 @@ describe('/forum saved defaults', () => {
     await settle()
     const reading = t.h.runtime.command('topics', tui)
     await settle()
-    const [{ browser, signal }] = opened
+    const { browser, signal } = opened[0]!
     const binding = t.h.runtime.binding
     const env = { ...t.h.env }
     for (const args of ['on user', 'reset project']) {
@@ -1627,7 +1722,7 @@ describe('/forum saved defaults', () => {
     assert.deepEqual(t.h.env, { PATH: BASE_PATH })
     assert.equal(browser.closed, false)
     assert.equal(signal.aborted, false)
-    clients[0][1].resolve({ items: [], next_cursor: 'c' })
+    clients[0]![1]!.resolve({ items: [], next_cursor: 'c' })
     await reading
     assert.equal(t.h.texts.length, 1)
     assert.equal(clients.length, 1)
@@ -1652,15 +1747,16 @@ describe('/forum reading', () => {
   }
 
   // A forum directory holding one topic with an initial message.
-  async function seededForum(dir) {
+  async function seededForum(dir: string) {
     const { topic, message } = await createForum({ forumDir: dir }).createTopic({ title: 'Seeded', author: 'a', body: 'hello' })
-    return { topic, message }
+    // Created with a body, so the topic has its initial message.
+    return { topic, message: message! }
   }
 
   // The shared API, recording each client it binds.
   function recordingFactory() {
-    const clients = []
-    const factory = (config) => {
+    const clients: { config: ReaderConfig; forum: Forum }[] = []
+    const factory = (config: ReaderConfig) => {
       const forum = createForum(config)
       clients.push({ config, forum })
       return forum
@@ -1668,10 +1764,13 @@ describe('/forum reading', () => {
     return { clients, factory }
   }
 
+  // A request as recordingOpener keeps it, with what the requested view's read returned.
+  type RecordedRequest = OpenBrowserRequest & { result?: Page<Topic> | Page<Message> | Message }
+
   // An opener that records each request and reads the requested view through its client.
   function recordingOpener() {
-    const requests = []
-    const open = async (request) => {
+    const requests: RecordedRequest[] = []
+    const open = async (request: RecordedRequest) => {
       requests.push(request)
       const { forum, view } = request
       if (view.kind === 'topics') request.result = await forum.listTopics()
@@ -1693,7 +1792,7 @@ describe('/forum reading', () => {
       const before = snapshot(h)
       const why = supplied === undefined ? '' : ' The forum is unavailable: PI_FORUM_DIR must be a nonempty absolute path, got "relative".'
       for (const args of [...TEXT, ...UI]) {
-        for (const mode of ['tui', 'rpc', 'print', 'json']) {
+        for (const mode of ['tui', 'rpc', 'print', 'json'] as const) {
           assert.deepEqual(await h.browse(args, mode), [
             [`No forum is selected in this session.${why} Run /forum on to select one, then read it.`, 'warning'],
           ])
@@ -1715,8 +1814,10 @@ describe('/forum reading', () => {
       openBrowser: () => assert.fail('text reads open no browser'),
     })
     h.start('s-1')
-    const target = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
-    const page = (items) => ({ items, next_cursor: undefined })
+    const target: ForumTarget = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
+    // Pages shorter than a full one never show their cursor, so the expected texts leave it out.
+    // @ts-expect-error -- a page without the cursor a forum read always returns
+    const page = <T>(items: T[]): Page<T> => ({ items, next_cursor: undefined })
 
     // On: one page through the selection's read-only client.
     let before = snapshot(h)
@@ -1740,12 +1841,12 @@ describe('/forum reading', () => {
     h.forum('on')
     h.env.PI_FORUM_DIR = '/elsewhere/forum'
     const reason = `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere/forum"`
-    const drifted = { ...target, status: 'unavailable', warning: reason }
+    const drifted: ForumTarget = { ...target, status: 'unavailable', warning: reason }
     const count = h.texts.length
     assert.deepEqual(await h.browse(`read ${message.id}`), [[formatTarget({ ...drifted, resolved: undefined }), 'warning']])
     assert.equal(h.texts.length, count + 1)
     assert.equal(h.texts.at(-1), formatMessage({ target: drifted, message }))
-    assert.match(h.texts.at(-1), /\nWarning: the forum is unavailable \(PI_FORUM_DIR changed .*\); reading the last selected directory\.\n/)
+    assert.match(h.texts.at(-1)!, /\nWarning: the forum is unavailable \(PI_FORUM_DIR changed .*\); reading the last selected directory\.\n/)
     assert.equal(h.runtime.binding, null)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
@@ -1756,24 +1857,24 @@ describe('/forum reading', () => {
     const dir = await tempDir()
     const forumDir = path.join(dir, 'paged')
     const forum = createForum({ forumDir })
-    const topics = []
+    const topics: Topic[] = []
     for (let i = 0; i < 21; i++) topics.push((await forum.createTopic({ title: `Topic ${i}`, author: 'a', body: `Body ${i}` })).topic)
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
     h.start('s-1')
 
     const first = await h.text('topics')
     assert.deepEqual([...first.matchAll(/^\d+\. (.*)$/gm)].map((m) => m[1]), topics.slice(0, 20).map((t) => t.title))
-    const [, next] = first.match(/20 shown; there may be more\. Next page: (\/forum topics --after \S+)$/)
+    const [, next] = first.match(/20 shown; there may be more\. Next page: (\/forum topics --after \S+)$/)!
     // Repeating the command starts over; only the copied cursor continues.
     assert.equal(await h.text('topics'), first)
-    const second = await h.text(next.slice('/forum '.length))
+    const second = await h.text(next!.slice('/forum '.length))
     assert.deepEqual([...second.matchAll(/^\d+\. (.*)$/gm)].map((m) => m[1]), ['Topic 20'])
     assert.match(second, /^Forum topics · after cursor \S+\n/)
     assert.match(second, /\nYou are caught up\.$/)
 
     // Messages across topics page the same way, with --after=CURSOR accepted too.
     const all = await h.text('messages')
-    const [, cursor] = all.match(/Next page: \/forum messages --after (\S+)$/)
+    const [, cursor] = all.match(/Next page: \/forum messages --after (\S+)$/)!
     const rest = await h.text(`messages --after=${cursor}`)
     assert.match(rest, /\n1\. a · .*\n {3}Message \S+ · topic \S+\n {3}Body 20\n\nYou are caught up\.$/)
     // Past the end, an empty page is caught up.
@@ -1781,7 +1882,7 @@ describe('/forum reading', () => {
     assert.match(await h.text(`messages --after ${end}`), /\nNo newer messages\.\n\nYou are caught up\.$/)
 
     // A topic's own messages carry its ID into the next-page command.
-    assert.match(await h.text(`messages ${topics[3].id}`), new RegExp(`^Forum messages in topic ${topics[3].id} · from the start\\n[^]*\\nYou are caught up\\.$`))
+    assert.match(await h.text(`messages ${topics[3]!.id}`), new RegExp(`^Forum messages in topic ${topics[3]!.id} · from the start\\n[^]*\\nYou are caught up\\.$`))
   })
 
   test('a fresh forum reads as empty, and reading never creates or recreates the directory', async () => {
@@ -1797,13 +1898,13 @@ describe('/forum reading', () => {
     await fs.rm(path.join(agentDir, 'forums'), { recursive: true })
     const count = h.texts.length
     for (const args of [...TEXT, ...UI]) {
-      const [[message, type]] = await h.browse(args)
+      const [message, type] = (await h.browse(args))[0]!
       assert.equal(type, 'error')
       const verb = args.startsWith('ui') ? 'browse' : 'read'
       assert.ok(message.startsWith(`Could not ${verb} ${forumDir}: forum directory ${forumDir} is unavailable: ENOENT`), message)
     }
     h.forum('off')
-    const [[message]] = await h.browse('topics')
+    const [message] = (await h.browse('topics'))[0]!
     assert.match(message, /is unavailable: ENOENT/)
     assert.equal(h.texts.length, count)
     await assert.rejects(fs.stat(forumDir), { code: 'ENOENT' })
@@ -1817,18 +1918,18 @@ describe('/forum reading', () => {
     const forum = createForum({ forumDir })
     const { topic, message } = await forum.createTopic({ title: 'Plan \u001b[31mred', author: 'a', body: 'first' })
     const body = ['# Heading', '', '\tindented\u001b[2J', `${'é'.repeat(200)}`, '* item **bold** ‮end', ...Array.from({ length: 300 }, (_, i) => `line ${i}`)].join('\n')
-    const reply = await forum.postMessage({ topicId: topic.id, author: 'b\u0007', body, replyTo: message.id, originSessionId: 'sess-9' })
+    const reply = await forum.postMessage({ topicId: topic.id, author: 'b\u0007', body, replyTo: message!.id, originSessionId: 'sess-9' })
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir } })
     h.start('s-1')
     const text = await h.text(`read ${reply.id}`)
-    const target = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
+    const target: ForumTarget = { forumDir, generated: false, resolved: forumDir, status: 'on', warning: null }
     assert.equal(text, formatMessage({ target, message: reply }))
     for (const line of [
       `Message: ${reply.id}`,
       `Topic: ${topic.id}`,
       'Author: b␇',
       `Created: ${reply.created_at}`,
-      `Reply to: ${message.id}`,
+      `Reply to: ${message!.id}`,
       'Origin session: sess-9',
       'Body (305 lines):',
       '# Heading',
@@ -1843,7 +1944,7 @@ describe('/forum reading', () => {
     assert.doesNotMatch(text, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f‮]/)
     assert.match(await h.text('topics'), /\n1\. Plan ␛\[31mred\n/)
 
-    const [[missing, type]] = await h.browse('read nope')
+    const [missing, type] = (await h.browse('read nope'))[0]!
     assert.equal(type, 'error')
     assert.equal(missing, `Could not read ${forumDir}: message nope not found.`)
   })
@@ -1858,7 +1959,7 @@ describe('/forum reading', () => {
     assert.deepEqual(await h.browse('topics --after bogus'), [
       [`Could not read ${forumDir}: cursor is not valid. Run /forum topics to start from the first page.`, 'error'],
     ])
-    const [[error]] = await h.browse(`messages ${topic.id} --after=e30`, 'rpc')
+    const [error] = (await h.browse(`messages ${topic.id} --after=e30`, 'rpc'))[0]!
     assert.equal(error, `Could not read ${forumDir}: cursor version is not supported. Run /forum messages ${topic.id} to start from the first page.`)
     assert.deepEqual(h.texts, [])
     assert.deepEqual(snapshot(h), before)
@@ -1869,41 +1970,41 @@ describe('/forum reading', () => {
     const dir = await tempDir()
     const forumDir = path.join(dir, 'imported')
     await fs.mkdir(forumDir)
-    const lines = []
-    const posted = {}
+    const lines: object[] = []
+    const posted: Record<string, string[]> = {}
     let clock = 0
     const at = () => `2026-01-01T00:00:${String(clock++).padStart(2, '0')}.000Z`
     const special = { '-odd': ['--after=y', '--', '-m'], '--after=x': [], '--': [] }
     for (const [topicId, ids] of Object.entries(special)) {
       lines.push({ type: 'topic_created', id: topicId, title: `Topic ${topicId}`, created_by: 'a', created_at: at() })
       posted[topicId] = Array.from({ length: 21 }, (_, i) => ids[i] ?? `${topicId}#${i}`)
-      for (const id of posted[topicId]) lines.push({ type: 'message_posted', id, topic_id: topicId, author: 'a', body: `body of ${id}`, created_at: at() })
+      for (const id of posted[topicId]!) lines.push({ type: 'message_posted', id, topic_id: topicId, author: 'a', body: `body of ${id}`, created_at: at() })
     }
     await fs.writeFile(path.join(forumDir, 'events.jsonl'), lines.map((line) => `${JSON.stringify(line)}\n`).join(''))
 
-    const calls = []
-    const recording = (config) => {
+    const calls: unknown[][] = []
+    const recording = (config: ReaderConfig): BrowserForum => {
       const forum = createForum(config)
       return {
         get resolved() {
           return forum.resolved
         },
-        listTopics: (options) => (calls.push(['topics', options.after]), forum.listTopics(options)),
-        listMessages: (options) => (calls.push(['messages', options.topicId, options.after]), forum.listMessages(options)),
-        getMessage: (id, options) => (calls.push(['read', id]), forum.getMessage(id, options)),
+        listTopics: (options: ListOptions) => (calls.push(['topics', options.after]), forum.listTopics(options)),
+        listMessages: (options: ListMessagesOptions) => (calls.push(['messages', options.topicId, options.after]), forum.listMessages(options)),
+        getMessage: (id: string, options: ReadCallOptions) => (calls.push(['read', id]), forum.getMessage(id, options)),
       }
     }
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir }, createForum: recording, openBrowser: () => assert.fail('no browser') })
     h.start('s-1')
-    const run = (command) => {
+    const run = (command: string) => {
       assert.ok(command.startsWith('/forum '), command)
       return h.text(command.slice('/forum '.length))
     }
-    const guidance = async (args) => {
-      const [[message]] = await h.browse(args, 'rpc')
-      return message.match(/read it as text with: (.+)$/)[1]
+    const guidance = async (args: string) => {
+      const [message] = (await h.browse(args, 'rpc'))[0]!
+      return message.match(/read it as text with: (.+)$/)![1]!
     }
-    const ids = (text) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
+    const ids = (text: string) => [...text.matchAll(/^ {3}Message (.+) · topic /gm)].map((m) => m[1])
 
     for (const topicId of Object.keys(special)) {
       // /forum ui outside the terminal points to a text command that lists exactly this topic.
@@ -1911,12 +2012,12 @@ describe('/forum reading', () => {
       assert.equal(command, `/forum messages -- ${topicId}`)
       calls.length = 0
       const first = await run(command)
-      assert.deepEqual(ids(first), posted[topicId].slice(0, 20))
+      assert.deepEqual(ids(first), posted[topicId]!.slice(0, 20))
       const cursor = (await createForum({ forumDir }).listMessages({ topicId, limit: 20 })).next_cursor
-      const next = first.match(/Next page: (.+)$/)[1]
+      const next = first.match(/Next page: (.+)$/)![1]!
       assert.equal(next, `/forum messages --after ${cursor} -- ${topicId}`)
       const rest = await run(next)
-      assert.deepEqual(ids(rest), posted[topicId].slice(20))
+      assert.deepEqual(ids(rest), posted[topicId]!.slice(20))
       assert.match(rest, /\nYou are caught up\.$/)
       assert.deepEqual(calls, [
         ['messages', topicId, undefined],
@@ -1924,9 +2025,9 @@ describe('/forum reading', () => {
       ])
 
       // An unusable cursor names the first-page command, which still reaches the same topic.
-      const [[error, type]] = await h.browse(`messages --after not-a-cursor -- ${topicId}`)
+      const [error, type] = (await h.browse(`messages --after not-a-cursor -- ${topicId}`))[0]!
       assert.equal(type, 'error')
-      const restart = error.match(/Run (.+) to start from the first page\.$/)[1]
+      const restart = error.match(/Run (.+) to start from the first page\.$/)![1]!
       assert.equal(restart, command)
       assert.equal(await run(restart), first)
     }
@@ -1947,23 +2048,24 @@ describe('/forum reading', () => {
   })
 
   test('a cursor starting with "-" continues and restarts through --after=CURSOR', async () => {
-    const calls = []
+    const calls: unknown[][] = []
     const items = Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, topic_id: '-odd', author: 'a', created_at: 'now', body: 'b' }))
     const client = {
       resolved: undefined,
-      async listMessages({ topicId, after }) {
+      async listMessages({ topicId, after }: RuntimeReadOptions): Promise<Page<Message>> {
         calls.push([topicId, after])
         if (after === '-bad') throw Object.assign(new Error('cursor is not valid'), { code: 'INVALID_CURSOR' })
         return after === undefined ? { items, next_cursor: '-c1' } : { items: [], next_cursor: after }
       },
     }
+    // @ts-expect-error -- a client with only the read this test makes
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
     h.start('s-1')
     const first = await h.text('messages -- -odd')
-    const next = first.match(/Next page: (.+)$/)[1]
+    const next = first.match(/Next page: (.+)$/)![1]!
     assert.equal(next, '/forum messages --after=-c1 -- -odd')
     assert.match(await h.text(next.slice('/forum '.length)), /\nNo newer messages\.\n\nYou are caught up\.$/)
-    const [[error]] = await h.browse('messages --after=-bad -- -odd')
+    const [error] = (await h.browse('messages --after=-bad -- -odd'))[0]!
     assert.equal(error, 'Could not read /shared/forum: cursor is not valid. Run /forum messages -- -odd to start from the first page.')
     assert.deepEqual(calls, [
       ['-odd', undefined],
@@ -1979,12 +2081,13 @@ describe('/forum reading', () => {
         throw Object.assign(new Error('cursor is not valid'), { code: 'INVALID_CURSOR' })
       },
     }
+    // @ts-expect-error -- a client with only the read this test makes
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
     h.start('s-1')
-    const [[guided]] = await h.browse('ui read m؜1', 'rpc')
+    const [guided] = (await h.browse('ui read m؜1', 'rpc'))[0]!
     assert.ok(guided.endsWith('read it as text with /forum read; this ID cannot be typed back as shown'), guided)
     assert.doesNotMatch(guided, /؜/)
-    const [[error]] = await h.browse('messages t\u001b1 --after c')
+    const [error] = (await h.browse('messages t\u001b1 --after c'))[0]!
     assert.equal(error, 'Could not read /shared/forum: cursor is not valid. Run it again without --after to start from the first page.')
   })
 
@@ -1992,12 +2095,13 @@ describe('/forum reading', () => {
     let warned = 0
     const client = {
       resolved: '/shared/forum',
-      async listTopics({ onWarning }) {
+      async listTopics({ onWarning }: RuntimeReadOptions) {
         for (let i = 0; i < 5000; i++) onWarning(`bad record ${i}\u001b`)
         warned++
         return { items: [], next_cursor: 'c' }
       },
     }
+    // @ts-expect-error -- a client with only the read this test makes
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
     h.start('s-1')
     const text = await h.text('topics')
@@ -2019,15 +2123,17 @@ describe('/forum reading', () => {
     let before = snapshot(h)
     assert.deepEqual(await h.browse('ui'), [])
     assert.deepEqual(snapshot(h), before)
-    const [first] = opener.requests
+    const first = opener.requests[0]!
     assert.deepEqual(first.view, { kind: 'topics' })
     assert.deepEqual(first.target, { forumDir, generated: false, resolved: undefined, status: 'on', warning: null })
-    assert.equal(first.ctx.mode, 'tui')
+    // The runtime gives the opener the command's whole context, of which openers use only ui.custom.
+    assert.equal((first.ctx as RuntimeContext).mode, 'tui')
     assert.equal(first.signal.aborted, false)
     assert.equal(typeof first.report, 'function')
-    assert.deepEqual(first.result.items, [topic])
+    // A topics view, whose read returned a page of topics.
+    assert.deepEqual((first.result as Page<Topic>).items, [topic])
     assert.deepEqual(recorded.clients.map((client) => client.config), [{ forumDir, createOnRead: false }])
-    assert.equal(first.forum, recorded.clients[0].forum)
+    assert.equal(first.forum, recorded.clients[0]!.forum)
 
     // Text reads share the client; off keeps it, and browsing leaves the forum off.
     await h.text('topics')
@@ -2036,23 +2142,24 @@ describe('/forum reading', () => {
     assert.deepEqual(await h.browse('ui messages ' + topic.id), [])
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
-    const second = opener.requests[1]
+    const second = opener.requests[1]!
     assert.equal(second.forum, first.forum)
     assert.deepEqual(second.view, { kind: 'messages', topicId: topic.id })
     assert.deepEqual(second.target, { forumDir, generated: false, resolved: forumDir, status: 'off', warning: null })
-    assert.deepEqual(second.result.items, [message])
+    // A messages view, whose read returned a page of messages.
+    assert.deepEqual((second.result as Page<Message>).items, [message])
 
     // Unavailable after drift: the last selected directory, with a visible warning.
     h.forum('on')
     h.env.PI_FORUM_DIR = '/elsewhere/forum'
     const reason = `PI_FORUM_DIR changed from ${JSON.stringify(forumDir)} to "/elsewhere/forum"`
-    const third = { forumDir, generated: false, resolved: undefined, status: 'unavailable', warning: reason }
+    const third: ForumTarget = { forumDir, generated: false, resolved: undefined, status: 'unavailable', warning: reason }
     assert.deepEqual(await h.browse('ui read ' + message.id), [[formatTarget(third), 'warning']])
     assert.equal(h.runtime.state.status, 'unavailable')
     assert.equal(h.runtime.binding, null)
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
-    assert.deepEqual(opener.requests[2].target, third)
-    assert.deepEqual(opener.requests[2].result, message)
+    assert.deepEqual(opener.requests[2]!.target, third)
+    assert.deepEqual(opener.requests[2]!.result, message)
     assert.deepEqual(recorded.clients.map((client) => client.config.forumDir), [forumDir, forumDir])
     assert.equal(h.texts.length, 1)
   })
@@ -2073,15 +2180,15 @@ describe('/forum reading', () => {
     await h.browse('ui topics')
     assert.match(await h.text('topics'), new RegExp(`Forum directory: ${link} \\(supplied PI_FORUM_DIR\\), resolved to ${a}\\n[^]*\\n1\\. Seeded\\n`))
     assert.equal(recorded.clients.length, 1)
-    assert.equal(recorded.clients[0].forum.resolved, a)
+    assert.equal(recorded.clients[0]!.forum.resolved, a)
 
     // A retargeted link is refused by the pinned client, and is not followed silently.
     await fs.rm(link)
     await fs.symlink(b, link)
-    const [[refused, type]] = await h.browse('ui topics')
+    const [refused, type] = (await h.browse('ui topics'))[0]!
     assert.equal(type, 'error')
     assert.match(refused, new RegExp(`^Could not browse ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
-    const [[text]] = await h.browse('topics')
+    const [text] = (await h.browse('topics'))[0]!
     assert.match(text, new RegExp(`^Could not read ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
     assert.equal(recorded.clients.length, 1)
 
@@ -2093,7 +2200,7 @@ describe('/forum reading', () => {
     assert.equal(recorded.clients.length, 1)
 
     // A successful on discards the client and its signal; the new client follows the link.
-    const signal = opener.requests[0].signal
+    const signal = opener.requests[0]!.signal
     h.env.PI_FORUM_DIR = link
     h.forum('on')
     assert.equal(signal.aborted, true)
@@ -2137,7 +2244,7 @@ describe('/forum reading', () => {
       'ui read --after=x': '/forum read -- --after=x',
       'ui read --': '/forum read -- --',
     }
-    for (const mode of ['rpc', 'print', 'json']) {
+    for (const mode of ['rpc', 'print', 'json'] as const) {
       for (const [args, command] of Object.entries(expected)) {
         assert.deepEqual(await h.browse(args, mode), [
           [`${target}\nThe forum browser needs the terminal UI; read it as text with: ${command}`, 'info'],
@@ -2145,7 +2252,7 @@ describe('/forum reading', () => {
       }
     }
     h.env.PI_FORUM_DIR = '/elsewhere'
-    const [[warned, type]] = await h.browse('ui', 'rpc')
+    const [warned, type] = (await h.browse('ui', 'rpc'))[0]!
     assert.equal(type, 'warning')
     assert.ok(warned.startsWith('Forum directory: /shared/forum (supplied PI_FORUM_DIR)\nWarning: the forum is unavailable (PI_FORUM_DIR changed'))
     assert.ok(warned.endsWith('read it as text with: /forum topics'))
@@ -2155,21 +2262,23 @@ describe('/forum reading', () => {
   test('text results go to the entry callback in every mode, and also to notify in RPC and stderr in print and JSON', async (t) => {
     const stderr = t.mock.method(console, 'error', () => {})
     const stdout = [t.mock.method(console, 'log', () => {}), t.mock.method(console, 'info', () => {})]
-    const notices = []
-    const texts = []
-    const ui = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('text reads open no UI') }
+    const notices: [string, NotifyType | undefined][] = []
+    const texts: [string, RuntimeContext['mode']][] = []
+    const ui: TestUI = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('text reads open no UI') }
     const client = { resolved: undefined, listTopics: async () => ({ items: [], next_cursor: 'c' }) }
     const runtime = createForumRuntime({
       binDir: BIN_DIR,
       getAgentDir: () => AGENT_DIR,
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       mkdir: () => {},
+      // @ts-expect-error -- a client with only the read this test makes
       createForum: () => client,
       openBrowser: () => assert.fail('text reads open no browser'),
       onText: (text, context) => texts.push([text, context.mode]),
       preferences: noPreferences(),
     })
     runtime.sessionStart(ctx('s-1'))
+    // @ts-expect-error -- a page without the cursor a forum read always returns; an empty page never shows it
     const text = formatTopicList({ target: { forumDir: '/shared/forum', generated: false, status: 'on', warning: null }, page: { items: [] } })
     assert.equal(await runtime.command('topics', ctx('s-1', ui, 'tui')), undefined)
     assert.deepEqual(texts, [[text, 'tui']])
@@ -2178,7 +2287,7 @@ describe('/forum reading', () => {
     assert.deepEqual(texts.at(-1), [text, 'rpc'])
     assert.deepEqual(notices, [[text, 'info']])
     assert.equal(stderr.mock.callCount(), 0)
-    for (const mode of ['print', 'json']) await runtime.command('topics', ctx('s-1', undefined, mode))
+    for (const mode of ['print', 'json'] as const) await runtime.command('topics', ctx('s-1', undefined, mode))
     assert.deepEqual(texts.map(([, mode]) => mode), ['tui', 'rpc', 'print', 'json'])
     assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[text], [text]])
     for (const spy of stdout) assert.equal(spy.mock.callCount(), 0)
@@ -2189,6 +2298,7 @@ describe('/forum reading', () => {
       getAgentDir: () => AGENT_DIR,
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       mkdir: () => {},
+      // @ts-expect-error -- a client with only the read this test makes
       createForum: () => client,
       onText: () => {
         throw new Error('no session')
@@ -2204,15 +2314,23 @@ describe('/forum reading', () => {
   })
 })
 
+// A read the runtime made: its arguments, the options it passed last, and how the test settles it.
+interface PendingRead {
+  args: unknown[]
+  options: RuntimeReadOptions
+  resolve: (value: Page<Topic> | Page<Message> | Message) => void
+  reject: (reason: unknown) => void
+}
+
 // Browsers here stay open until closed, so a lifecycle regression fails by timeout rather than hanging.
 describe('/forum browser lifecycle', { timeout: 10000 }, () => {
-  const tui = (ui = { notify: () => assert.fail('reports go through report') }) => ctx('s-1', ui, 'tui')
+  const tui = (ui: TestUI = { notify: () => assert.fail('reports go through report') }) => ctx('s-1', ui, 'tui')
   const settle = () => new Promise(setImmediate)
 
   // A long-lived opener, like the terminal browser: starts loading and stays open until closed.
   function longLived() {
-    const opened = []
-    const open = async (request) => {
+    const opened: OpenBrowserRequest[] = []
+    const open = async (request: OpenBrowserRequest) => {
       opened.push(request)
       request.browser.start()
       await request.browser.done
@@ -2224,9 +2342,14 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
 
   // A client whose reads stay pending until the test settles them, whatever their signal does.
   function pendingClient() {
-    const calls = []
-    const read = (...args) => new Promise((resolve, reject) => calls.push({ args, options: args.at(-1), resolve, reject }))
-    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } }
+    const calls: PendingRead[] = []
+    // Generic, so it stands in for each read with that read's result type. It is recorded as a read of
+    // any kind, which the test settles with that read's result; the runtime passes its options last.
+    const read = <T>(...args: unknown[]) =>
+      new Promise<T>((resolve, reject) =>
+        calls.push({ args, options: args.at(-1) as RuntimeReadOptions, resolve: resolve as PendingRead['resolve'], reject }),
+      )
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } satisfies BrowserForum }
   }
 
   test('one browser is open per runtime; Esc closes it and another may open', async () => {
@@ -2237,7 +2360,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     const first = h.runtime.command('ui', tui())
     await settle()
     assert.equal(opener.opened.length, 1)
-    const { browser, view, target, signal } = opener.opened[0]
+    const { browser, view, target, signal } = opener.opened[0]!
     assert.deepEqual(view, { kind: 'topics' })
     assert.deepEqual(browser.state.view, { kind: 'topics' })
     assert.equal(browser.state.target.forumDir, target.forumDir)
@@ -2255,31 +2378,31 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     const second = h.runtime.command('ui messages', tui())
     await settle()
     assert.equal(opener.opened.length, 2)
-    assert.notEqual(opener.opened[1].browser, browser)
+    assert.notEqual(opener.opened[1]!.browser, browser)
     // The same selection keeps its client and lifetime signal.
-    assert.equal(opener.opened[1].forum, opener.opened[0].forum)
-    assert.equal(opener.opened[1].signal, signal)
-    opener.opened[1].browser.back()
+    assert.equal(opener.opened[1]!.forum, opener.opened[0]!.forum)
+    assert.equal(opener.opened[1]!.signal, signal)
+    opener.opened[1]!.browser.back()
     await second
     assert.equal(h.reports.length, 1)
   })
 
   test('off leaves the browser open; a failed on keeps it; a successful on closes it silently mid-load', async () => {
     const opener = longLived()
-    const clients = []
+    const clients: ReturnType<typeof pendingClient>[] = []
     const h = host({
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       createForum: () => {
         clients.push(pendingClient())
-        return clients.at(-1).forum
+        return clients.at(-1)!.forum
       },
       openBrowser: opener.open,
     })
     h.start('s-1')
     const pending = h.runtime.command('ui', tui())
     await settle()
-    const { browser } = opener.opened[0]
-    const [load] = clients[0].calls
+    const { browser } = opener.opened[0]!
+    const load = clients[0]!.calls[0]!
 
     h.forum('off')
     assert.equal(browser.closed, false)
@@ -2295,18 +2418,19 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     h.forum('on')
     assert.equal(browser.closeReason, 'discarded')
     assert.equal(load.options.signal.aborted, true)
+    // @ts-expect-error -- a stand-in topic with only an ID: the discarded browser never shows it
     load.resolve({ items: [{ id: 'late' }], next_cursor: 'c' })
     assert.equal(await pending, undefined)
     await settle()
     assert.deepEqual(h.reports.slice(reports), ['Forum is on: /other/forum (supplied PI_FORUM_DIR)'])
-    assert.deepEqual(browser.state.page.items, [])
+    assert.deepEqual(browser.state.page!.items, [])
 
     // The new selection opens a new browser on a new client.
     const next = h.runtime.command('ui', tui())
     await settle()
     assert.equal(clients.length, 2)
-    assert.equal(opener.opened[1].target.forumDir, '/other/forum')
-    opener.opened[1].browser.close()
+    assert.equal(opener.opened[1]!.target.forumDir, '/other/forum')
+    opener.opened[1]!.browser.close()
     await next
   })
 
@@ -2317,11 +2441,11 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     h.start('s-1')
     const pending = h.runtime.command('ui messages t-1', tui())
     await settle()
-    const { browser } = opener.opened[0]
+    const { browser } = opener.opened[0]!
     h.quit()
     h.quit()
     assert.equal(browser.closeReason, 'discarded')
-    client.calls[0].resolve({ items: [], next_cursor: 'c' })
+    client.calls[0]!.resolve({ items: [], next_cursor: 'c' })
     assert.equal(await pending, undefined)
     await settle()
     assert.deepEqual(h.reports, [])
@@ -2329,7 +2453,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
   })
 
   test('opener failures are reported while open and dropped once the selection is discarded', async () => {
-    let fail
+    let fail: string | undefined
     const h = host({
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       createForum: () => pendingClient().forum,
@@ -2363,7 +2487,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     h.forum('on')
-    assert.equal(opener.opened[0].browser.closeReason, 'discarded')
+    assert.equal(opener.opened[0]!.browser.closeReason, 'discarded')
     await pending
     assert.ok(h.prompt()[SECTION_NAME])
   })
@@ -2375,19 +2499,24 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
   const BUSY = 'A forum read is still running; wait for it to finish before starting another.'
 
   function pendingClient() {
-    const calls = []
-    const read = (...args) => new Promise((resolve, reject) => calls.push({ args, options: args.at(-1), resolve, reject }))
-    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } }
+    const calls: PendingRead[] = []
+    // Generic, so it stands in for each read with that read's result type. It is recorded as a read of
+    // any kind, which the test settles with that read's result; the runtime passes its options last.
+    const read = <T>(...args: unknown[]) =>
+      new Promise<T>((resolve, reject) =>
+        calls.push({ args, options: args.at(-1) as RuntimeReadOptions, resolve: resolve as PendingRead['resolve'], reject }),
+      )
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } satisfies BrowserForum }
   }
 
   function setup() {
-    const clients = []
-    const opened = []
+    const clients: ReturnType<typeof pendingClient>[] = []
+    const opened: OpenBrowserRequest[] = []
     const h = host({
       env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' },
       createForum: () => {
         clients.push(pendingClient())
-        return clients.at(-1).forum
+        return clients.at(-1)!.forum
       },
       openBrowser: async (request) => {
         opened.push(request)
@@ -2408,21 +2537,21 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
       assert.deepEqual(await h.browse(args), [[BUSY, 'warning']])
     }
     assert.deepEqual(await h.browse('messages', 'rpc'), [[BUSY, 'warning']])
-    assert.equal(clients[0].calls.length, 1)
+    assert.equal(clients[0]!.calls.length, 1)
     assert.deepEqual(snapshot(h), before)
-    clients[0].calls[0].resolve({ items: [], next_cursor: 'c' })
+    clients[0]!.calls[0]!.resolve({ items: [], next_cursor: 'c' })
     assert.equal(await first, undefined)
     assert.equal(h.texts.length, 1)
     // The slot is free again; a failed read frees it too.
     const second = h.runtime.command('read m-1', tui())
     await settle()
-    clients[0].calls[1].reject(Object.assign(new Error('boom'), { code: 'READ_FAILED' }))
+    clients[0]!.calls[1]!.reject(Object.assign(new Error('boom'), { code: 'READ_FAILED' }))
     await second
     assert.deepEqual(h.reports.slice(-1), ['Could not read /shared/forum: boom.'])
     const third = h.runtime.command('topics', tui())
     await settle()
-    assert.equal(clients[0].calls.length, 3)
-    clients[0].calls[2].resolve({ items: [], next_cursor: 'c' })
+    assert.equal(clients[0]!.calls.length, 3)
+    clients[0]!.calls[2]!.resolve({ items: [], next_cursor: 'c' })
     await third
     assert.equal(h.texts.length, 2)
     assert.equal(clients.length, 1)
@@ -2434,11 +2563,12 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     await settle()
     const reading = h.runtime.command('messages t-1', tui())
     await settle()
-    const [load, read] = clients[0].calls
-    assert.deepEqual(read.args, [{ signal: opened[0].signal, onWarning: read.options.onWarning, after: undefined, limit: 20, topicId: 't-1' }])
+    const load = clients[0]!.calls[0]!
+    const read = clients[0]!.calls[1]!
+    assert.deepEqual(read.args, [{ signal: opened[0]!.signal, onWarning: read.options.onWarning, after: undefined, limit: 20, topicId: 't-1' }])
     // A browser may still open while the text read runs; it is the browser that is limited to one.
     assert.deepEqual(await h.browse('ui read m-1'), [['The forum browser is already open; close it with Esc before opening another view.', 'warning']])
-    opened[0].browser.close()
+    opened[0]!.browser.close()
     await browsing
     assert.equal(load.options.signal.aborted, true)
     assert.equal(read.options.signal.aborted, false)
@@ -2448,9 +2578,9 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     read.resolve({ items: [], next_cursor: 'c' })
     await reading
     assert.equal(h.texts.length, 1)
-    assert.match(h.texts[0], /^Forum messages in topic t-1 · from the start\n/)
-    assert.equal(opened[1].browser.closed, false)
-    opened[1].browser.close()
+    assert.match(h.texts[0]!, /^Forum messages in topic t-1 · from the start\n/)
+    assert.equal(opened[1]!.browser.closed, false)
+    opened[1]!.browser.close()
     await again
     assert.deepEqual(h.reports, ['The forum browser is already open; close it with Esc before opening another view.'])
   })
@@ -2462,13 +2592,13 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     h.forum('off')
     h.env.PI_FORUM_DIR = 'relative'
     h.forum('on')
-    const [read] = clients[0].calls
+    const read = clients[0]!.calls[0]!
     assert.equal(read.options.signal.aborted, false)
     read.resolve({ id: 'm-1', topic_id: 't-1', author: 'a', created_at: 'now', body: 'kept' })
     await reading
     assert.equal(h.texts.length, 1)
     // The target is as it was when the read started.
-    assert.match(h.texts[0], /\nForum is on for agents\.\n[^]*\nkept$/)
+    assert.match(h.texts[0]!, /\nForum is on for agents\.\n[^]*\nkept$/)
   })
 
   for (const end of ['reselect', 'shutdown']) {
@@ -2477,7 +2607,7 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
         const { h, clients } = setup()
         const reading = h.runtime.command('topics', tui())
         await settle()
-        const [read] = clients[0].calls
+        const read = clients[0]!.calls[0]!
         const reports = h.reports.length
         if (end === 'shutdown') h.quit()
         else {
@@ -2499,9 +2629,10 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
           const next = h.runtime.command('topics', tui())
           await settle()
           assert.equal(clients.length, 2)
-          clients[1].calls[0].resolve({ items: [], next_cursor: 'c' })
+          clients[1]!.calls[0]!.resolve({ items: [], next_cursor: 'c' })
           await next
-          assert.match(h.texts[0], /^Forum topics · from the start\nForum directory: \/other\/forum /)
+          // The texts as they are now, not as the assertion above narrowed them.
+          assert.match((h.texts as string[])[0]!, /^Forum topics · from the start\nForum directory: \/other\/forum /)
         }
       })
     }
@@ -2515,28 +2646,46 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     await settle()
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
-    clients[0].calls[0].resolve({ items: [], next_cursor: 'c' })
+    clients[0]!.calls[0]!.resolve({ items: [], next_cursor: 'c' })
     await reading
     assert.deepEqual(snapshot(h), before)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
   })
 })
 
+// What the extension entry registers, as these tests call it: handlers with only the event fields the
+// extension reads and the runtime's part of Pi's context, which is all it passes on; /forum with that
+// context too; and an entry renderer with partial entries and an empty theme, which it never reads.
+type EntryHandler = (event: object, ctx: RuntimeContext) => unknown
+interface EntryCommand {
+  description: string
+  getArgumentCompletions: (prefix: string) => AutocompleteItem[]
+  handler: (args: string, ctx: RuntimeContext) => Promise<void>
+}
+type DrawEntry = (entry: Partial<CustomEntry>, options: EntryRenderOptions, theme: object) => Text | undefined
+
+// The part of Pi's extension API the entry registers through, as these tests stand in for it. Its
+// methods return nothing the entry uses, and it appends only its text entries.
+interface EntryHost {
+  on(name: string, handler: EntryHandler): unknown
+  registerCommand(name: string, options: EntryCommand): unknown
+  registerEntryRenderer(type: string, renderer: DrawEntry): unknown
+  appendEntry(type: string, data: OutputEntryData): unknown
+}
+
 describe('extension entry', () => {
-  // Stand in for the host packages, which are not installed in this repository. The terminal
-  // helpers are never called here: the overlay itself is tested in browser-ui.test.js.
-  const HOST_MODULES = {
-    '@earendil-works/pi-coding-agent': 'export const getAgentDir = () => globalThis.piForumTestAgentDir',
-    '@earendil-works/pi-tui': [
-      ...['matchesKey', 'truncateToWidth', 'wrapTextWithAnsi'].map((name) => `export const ${name} = () => { throw new Error('${name} is not stubbed') }`),
-      'export const visibleWidth = (text) => [...text].length * 2',
-      'export class Text { constructor(...args) { this.args = args } }',
-    ].join('\n'),
-  }
+  // Stand in for the host packages with fixtures, so the entry reads the agent directory the test
+  // sets and measures with widths of its own. The terminal helpers are never called here: the
+  // overlay itself is tested in browser-ui.test.ts.
+  const HOST_MODULES = new Map([
+    ['@earendil-works/pi-coding-agent', new URL('./fixtures/extension-host.ts', import.meta.url).href],
+    ['@earendil-works/pi-tui', new URL('./fixtures/extension-tui.ts', import.meta.url).href],
+  ])
   registerHooks({
     resolve(specifier, context, nextResolve) {
-      if (!Object.hasOwn(HOST_MODULES, specifier)) return nextResolve(specifier, context)
-      return { url: `data:text/javascript,${encodeURIComponent(HOST_MODULES[specifier])}`, shortCircuit: true }
+      const url = HOST_MODULES.get(specifier)
+      if (url === undefined) return nextResolve(specifier, context)
+      return { url, shortCircuit: true }
     },
   })
 
@@ -2555,43 +2704,45 @@ describe('extension entry', () => {
     globalThis.piForumTestAgentDir = agentDir
 
     const { default: factory } = await import('../extension/index.js')
-    const handlers = new Map()
-    const commands = new Map()
-    const renderers = new Map()
-    const entries = []
+    const handlers = new Map<string, EntryHandler>()
+    const commands = new Map<string, EntryCommand>()
+    const renderers = new Map<string, DrawEntry>()
+    const entries: [string, OutputEntryData][] = []
     // Only these methods exist, so sending messages, triggering turns or any other call would throw.
-    const result = factory({
+    const pi: EntryHost = {
       on: (name, handler) => handlers.set(name, handler),
       registerCommand: (name, options) => commands.set(name, options),
       registerEntryRenderer: (type, renderer) => renderers.set(type, renderer),
       appendEntry: (type, data) => entries.push([type, data]),
-    })
+    }
+    // @ts-expect-error -- registers through EntryHost, which is not Pi's whole extension API
+    const result = factory(pi)
     assert.equal(result, undefined)
     assert.deepEqual([...renderers.keys()], ['pi-forum.output'])
     assert.deepEqual([...handlers.keys()], ['session_start', 'before_agent_start', 'session_shutdown'])
     assert.deepEqual([...commands.keys()], ['forum'])
-    const forum = commands.get('forum')
+    const forum = commands.get('forum')!
     assert.deepEqual(Object.keys(forum).sort(), ['description', 'getArgumentCompletions', 'handler'])
     assert.equal(typeof forum.description, 'string')
     assert.deepEqual(forum.getArgumentCompletions('o'), [{ value: 'on', label: 'on' }, { value: 'off', label: 'off' }])
     assert.equal(process.env.PATH, BASE_PATH)
     assert.equal(process.env.PI_FORUM_DIR, undefined)
 
-    await handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx('s-9'))
+    await handlers.get('session_start')!({ type: 'session_start', reason: 'startup' }, ctx('s-9'))
     assert.equal(process.env.PI_FORUM_DIR, undefined)
     assert.equal(process.env.PATH, BASE_PATH)
     const event = { systemPromptOptions: { sections: { cwd: 'c', [SECTION_NAME]: 'stale' } } }
-    await handlers.get('before_agent_start')(event, ctx('s-9'))
+    await handlers.get('before_agent_start')!(event, ctx('s-9'))
     assert.deepEqual(event.systemPromptOptions.sections, { cwd: 'c' })
 
-    const notices = []
-    const ui = { notify: (message, type) => notices.push([message, type]) }
+    const notices: [string, NotifyType | undefined][] = []
+    const ui: TestUI = { notify: (message, type) => notices.push([message, type]) }
     await forum.handler('on', ctx('s-9', ui))
     assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', agentDir))
-    assert.deepEqual(await fs.readdir(process.env.PI_FORUM_DIR), [])
+    assert.deepEqual(await fs.readdir(process.env.PI_FORUM_DIR!), [])
     assert.equal(process.env.PATH, withBin())
-    await fs.access(path.join(process.env.PATH.split(path.delimiter)[0], 'pi-forum'), fs.constants.X_OK)
-    await handlers.get('before_agent_start')(event, ctx('s-9'))
+    await fs.access(path.join(process.env.PATH!.split(path.delimiter)[0]!, 'pi-forum'), fs.constants.X_OK)
+    await handlers.get('before_agent_start')!(event, ctx('s-9'))
     assert.deepEqual(Object.keys(event.systemPromptOptions.sections), ['cwd', SECTION_NAME])
 
     const pending = forum.handler(' off ', ctx('s-9', ui))
@@ -2599,27 +2750,28 @@ describe('extension entry', () => {
     assert.equal(await pending, undefined)
     assert.equal(process.env.PATH, BASE_PATH)
     assert.equal(process.env.PI_FORUM_DIR, undefined)
-    await handlers.get('before_agent_start')(event, ctx('s-9'))
+    await handlers.get('before_agent_start')!(event, ctx('s-9'))
     assert.deepEqual(event.systemPromptOptions.sections, { cwd: 'c' })
     await forum.handler('on', ctx('s-9', ui))
     assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-9', agentDir))
     assert.equal(process.env.PATH, withBin())
     assert.deepEqual(notices.map(([, type]) => type), ['info', 'info', 'info'])
-    assert.equal(notices[2][0], `Forum is on: ${defaultDir('s-9', agentDir)} (session default)`)
+    assert.equal(notices[2]![0], `Forum is on: ${defaultDir('s-9', agentDir)} (session default)`)
 
     // Text reads are wired to the selected forum: one session entry per result, even an empty one.
     // The terminal UI shows only the entry; RPC also notifies, and print and JSON write stderr.
     const dir = defaultDir('s-9', agentDir)
+    // @ts-expect-error -- a page without the cursor a forum read always returns; an empty page never shows it
     const empty = formatTopicList({ target: { forumDir: dir, generated: true, resolved: dir, status: 'on' }, page: { items: [] } })
-    const terminal = (ui) => ({ ...ctx('s-9', ui), mode: 'tui' })
+    const terminal = (ui: TestUI): RuntimeContext => ({ ...ctx('s-9', ui), mode: 'tui' })
     const count = notices.length
     assert.equal(await forum.handler('topics', terminal({ ...ui, custom: () => assert.fail('text reads open no UI') })), undefined)
     assert.deepEqual(entries, [['pi-forum.output', { text: empty }]])
     assert.equal(notices.length, count)
-    const rpc = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
+    const rpc: RuntimeContext = { ...ctx('s-9', { ...ui, custom: () => assert.fail('no custom UI in RPC') }), mode: 'rpc' }
     await forum.handler('messages', rpc)
     assert.equal(entries.length, 2)
-    assert.deepEqual(notices.slice(count), [[entries[1][1].text, 'info']])
+    assert.deepEqual(notices.slice(count), [[entries[1]![1].text, 'info']])
     const stderr = t.mock.method(console, 'error', () => {})
     await forum.handler('topics', ctx('s-9', undefined, 'print'))
     assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[empty]])
@@ -2627,22 +2779,22 @@ describe('extension entry', () => {
     assert.equal(entries.length, 3)
 
     // The renderer draws a stored entry as plain text, whatever was stored.
-    const render = renderers.get('pi-forum.output')
+    const render = renderers.get('pi-forum.output')!
     const drawn = render({ type: 'custom', customType: 'pi-forum.output', data: { text: `${empty}\n\u001b[2Jx` } }, { expanded: false }, {})
-    assert.deepEqual(drawn.args, [`${empty}\n␛[2Jx`, 1, 0])
+    assert.deepEqual(drawn!.args, [`${empty}\n␛[2Jx`, 1, 0])
     // Every Bidi_Control character (ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI).
     const bidi = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
     const stored = render({ data: { text: bidi.map((code) => String.fromCodePoint(code)).join('\n') } }, { expanded: true }, {})
-    assert.deepEqual(stored.args[0].split('\n'), bidi.map((code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`))
+    assert.deepEqual(stored!.args[0]!.split('\n'), bidi.map((code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`))
     assert.equal(render({ type: 'custom', customType: 'pi-forum.output', data: null }, { expanded: true }, {}), undefined)
 
     // /forum ui in RPC points to the text command; the terminal UI opens one overlay, and ending its
     // interaction ends the command.
     assert.equal(await forum.handler('ui', rpc), undefined)
-    assert.equal(notices.at(-1)[0], `${formatTarget({ forumDir: dir, generated: true, status: 'on' })}\nThe forum browser needs the terminal UI; read it as text with: /forum topics`)
+    assert.equal(notices.at(-1)![0], `${formatTarget({ forumDir: dir, generated: true, status: 'on' })}\nThe forum browser needs the terminal UI; read it as text with: /forum topics`)
     assert.equal(process.env.PI_FORUM_DIR, dir)
-    const shown = []
-    const custom = (factory, options) => {
+    const shown: Parameters<NonNullable<TestUI['custom']>>[1][] = []
+    const custom: TestUI['custom'] = (factory, options) => {
       shown.push(options)
       return Promise.resolve(undefined)
     }
@@ -2652,12 +2804,12 @@ describe('extension entry', () => {
 
     // Tab stops use the host's visibleWidth, here two columns per character: "ab" ends at column 4.
     const { topic } = await createForum({ forumDir: dir }).createTopic({ title: 'T', author: 'a', body: 'ab\tc' })
-    const { items: [message] } = await createForum({ forumDir: dir }).listMessages()
+    const message = (await createForum({ forumDir: dir }).listMessages()).items[0]!
     await forum.handler(`read ${message.id}`, terminal(ui))
-    assert.ok(entries.at(-1)[1].text.endsWith('\nab    c'), entries.at(-1)[1].text)
+    assert.ok(entries.at(-1)![1].text.endsWith('\nab    c'), entries.at(-1)![1].text)
     assert.equal(message.topic_id, topic.id)
 
-    await handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, ctx('s-9'))
+    await handlers.get('session_shutdown')!({ type: 'session_shutdown', reason: 'quit' }, ctx('s-9'))
     assert.equal(process.env.PATH, BASE_PATH)
     assert.equal(process.env.PI_FORUM_DIR, undefined)
   })
@@ -2680,18 +2832,20 @@ describe('extension entry', () => {
     const { default: factory } = await import('../extension/index.js')
     // Like Pi, each session start gets a fresh runtime from the factory.
     const launch = () => {
-      const handlers = new Map()
-      const commands = new Map()
-      factory({
+      const handlers = new Map<string, EntryHandler>()
+      const commands = new Map<string, EntryCommand>()
+      const pi: EntryHost = {
         on: (name, handler) => handlers.set(name, handler),
         registerCommand: (name, options) => commands.set(name, options),
         registerEntryRenderer: () => {},
         appendEntry: () => assert.fail('control commands add no entries'),
-      })
-      return { handlers, forum: commands.get('forum') }
+      }
+      // @ts-expect-error -- registers through EntryHost, which is not Pi's whole extension API
+      factory(pi)
+      return { handlers, forum: commands.get('forum')! }
     }
-    const notices = []
-    const context = (id) => ctx(id, { notify: (message, type) => notices.push([message, type]) }, 'tui', { cwd: project })
+    const notices: [string, NotifyType | undefined][] = []
+    const context = (id: string) => ctx(id, { notify: (message, type) => notices.push([message, type]) }, 'tui', { cwd: project })
 
     let pi = launch()
     assert.match(pi.forum.description, /save or reset whether new sessions start with it for this project or user/)
@@ -2699,7 +2853,7 @@ describe('extension entry', () => {
       { value: 'reset project', label: 'reset project' },
       { value: 'reset user', label: 'reset user' },
     ])
-    await pi.handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, context('s-1'))
+    await pi.handlers.get('session_start')!({ type: 'session_start', reason: 'startup' }, context('s-1'))
     assert.equal(process.env.PI_FORUM_DIR, undefined)
     await pi.forum.handler('on user', context('s-1'))
     assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-1', agentDir))
@@ -2708,21 +2862,21 @@ describe('extension entry', () => {
     assert.equal(process.env.PI_FORUM_DIR, undefined)
     assert.deepEqual(JSON.parse(await fs.readFile(path.join(project, '.pi', 'forum.json'), 'utf8')), { enabled: false })
     assert.deepEqual(notices.map(([, type]) => type), ['info', 'info'])
-    await pi.handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, context('s-1'))
+    await pi.handlers.get('session_shutdown')!({ type: 'session_shutdown', reason: 'quit' }, context('s-1'))
 
     // A new launch in another directory has only the user default, and starts on.
     pi = launch()
-    await pi.handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx('s-2', undefined, undefined, { cwd: root }))
+    await pi.handlers.get('session_start')!({ type: 'session_start', reason: 'startup' }, ctx('s-2', undefined, undefined, { cwd: root }))
     assert.equal(process.env.PI_FORUM_DIR, defaultDir('s-2', agentDir))
     assert.equal(process.env.PATH, withBin())
-    await pi.handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, context('s-2'))
+    await pi.handlers.get('session_shutdown')!({ type: 'session_shutdown', reason: 'quit' }, context('s-2'))
     assert.equal(process.env.PI_FORUM_DIR, undefined)
     assert.equal(process.env.PATH, BASE_PATH)
 
     // Back in the project, its saved off wins.
     pi = launch()
-    await pi.handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, context('s-3'))
+    await pi.handlers.get('session_start')!({ type: 'session_start', reason: 'startup' }, context('s-3'))
     assert.equal(process.env.PI_FORUM_DIR, undefined)
-    await pi.handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, context('s-3'))
+    await pi.handlers.get('session_shutdown')!({ type: 'session_shutdown', reason: 'quit' }, context('s-3'))
   })
 })

@@ -14,10 +14,12 @@ import {
   printable,
   textCommand,
 } from '../extension/output.js'
+import type { ForumTarget, ForumView } from '../extension/types.js'
 import { createForum } from '../src/forum.js'
-import { fakeAdapter } from './fake-adapter.js'
+import type { Message, Topic } from '../src/types.js'
+import { fakeAdapter } from './fake-adapter.ts'
 
-const TARGET = { forumDir: '/forums/shared', generated: false, status: 'on', warning: null }
+const TARGET: ForumTarget = { forumDir: '/forums/shared', generated: false, status: 'on', warning: null }
 // Every Bidi_Control character, listed by code point as Unicode's PropList.txt names them rather than
 // taken from the sanitizer: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI and PDI.
 const BIDI_CONTROLS = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
@@ -25,19 +27,25 @@ const BIDI = BIDI_CONTROLS.map((code) => String.fromCodePoint(code)).join('')
 const BIDI_SHOWN = BIDI_CONTROLS.map((code) => `⟨U+${code.toString(16).toUpperCase().padStart(4, '0')}⟩`).join('')
 const RAW_CONTROLS = new RegExp(`[\\u0000-\\u0009\\u000b-\\u001f\\u007f-\\u009f${BIDI}]`, 'u')
 
-async function seeded({ topics = 1, messages = 0, body = (t, m) => `T${t} message ${m}` } = {}) {
+interface SeedOptions {
+  topics?: number
+  messages?: number
+  body?: (t: number, m: number) => string
+}
+
+async function seeded({ topics = 1, messages = 0, body = (t, m) => `T${t} message ${m}` }: SeedOptions = {}) {
   const forum = createForum({ forumDir: '/forums/shared', adapter: fakeAdapter() })
-  const created = []
+  const created: { topic: Topic; messages: Message[] }[] = []
   for (let t = 0; t < topics; t++) {
     const { topic } = await forum.createTopic({ title: `Topic ${t}`, author: 'alice', originSessionId: 'session-a' })
-    const posted = []
+    const posted: Message[] = []
     for (let m = 0; m < messages; m++) posted.push(await forum.postMessage({ topicId: topic.id, author: `bob${m}`, body: body(t, m) }))
     created.push({ topic, messages: posted })
   }
   return { forum, created }
 }
 
-const lastLine = (text) => text.split('\n').at(-1)
+const lastLine = (text: string) => text.split('\n').at(-1)
 
 describe('target', () => {
   test('names the directory, its origin, where it resolved and whether agents use it', () => {
@@ -71,9 +79,9 @@ describe('topic lists', () => {
         'Forum is on for agents.',
         '',
         '1. Topic 0',
-        `   Topic ${a.id} · by alice · ${a.created_at}`,
+        `   Topic ${a!.id} · by alice · ${a!.created_at}`,
         '2. Topic 1',
-        `   Topic ${b.id} · by alice · ${b.created_at}`,
+        `   Topic ${b!.id} · by alice · ${b!.created_at}`,
         '',
         'You are caught up.',
       ].join('\n'),
@@ -84,7 +92,7 @@ describe('topic lists', () => {
     const { forum } = await seeded({ topics: LIST_PAGE_SIZE + 1 })
     const page = await forum.listTopics({ limit: LIST_PAGE_SIZE })
     const text = formatTopicList({ target: TARGET, page })
-    assert.equal(text.match(/^\d+\. Topic \d+$/gm).length, LIST_PAGE_SIZE)
+    assert.equal(text.match(/^\d+\. Topic \d+$/gm)!.length, LIST_PAGE_SIZE)
     assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum topics --after ${page.next_cursor}`)
 
     const after = page.next_cursor
@@ -99,14 +107,14 @@ describe('topic lists', () => {
     const empty = { items: [], next_cursor: 'c1' }
     assert.match(formatTopicList({ target: TARGET, page: empty }), /\n\nNo topics yet\.\n\nYou are caught up\.$/)
     assert.match(formatTopicList({ target: TARGET, page: empty, after: 'c0' }), /\n\nNo newer topics\.\n\nYou are caught up\.$/)
-    const short = { items: [{ id: 't', title: 'x', created_by: 'a', created_at: 'now' }], next_cursor: 'c2' }
+    const short = { items: [{ id: 't', title: 'x', created_by: 'a', created_at: 'now' } satisfies Topic], next_cursor: 'c2' }
     const text = formatTopicList({ target: TARGET, page: short })
     assert.doesNotMatch(text, /--after|c2|more/)
   })
 
   test('titles, IDs and authors are shown in full with controls made visible', () => {
     const title = `\x1b]0;pwned\x07 ${'長'.repeat(200)} **bold** ‮evil‬`
-    const topic = { id: 'id‏', title, created_by: 'x\ty', created_at: '2026-01-01T00:00:00.000Z' }
+    const topic: Topic = { id: 'id‏', title, created_by: 'x\ty', created_at: '2026-01-01T00:00:00.000Z' }
     const text = formatTopicList({ target: TARGET, page: { items: [topic], next_cursor: 'c' } })
     assert.ok(text.includes(`1. ␛]0;pwned␇ ${'長'.repeat(200)} **bold** ⟨U+202E⟩evil⟨U+202C⟩`))
     assert.ok(text.includes('   Topic id⟨U+200F⟩ · by x␉y · 2026-01-01T00:00:00.000Z'))
@@ -117,8 +125,8 @@ describe('topic lists', () => {
 describe('message lists', () => {
   test('rows show author, timestamp, message and topic IDs, reply target and a first-line excerpt', async () => {
     const { forum, created } = await seeded({ messages: 2, body: (t, m) => (m === 0 ? 'only line' : '\n\n  # Heading\nsecond') })
-    const { topic, messages } = created[0]
-    const reply = await forum.postMessage({ topicId: topic.id, author: 'carol', body: 're', replyTo: messages[0].id })
+    const { topic, messages } = created[0]!
+    const reply = await forum.postMessage({ topicId: topic.id, author: 'carol', body: 're', replyTo: messages[0]!.id })
     const page = await forum.listMessages({ topicId: topic.id, limit: LIST_PAGE_SIZE })
     const text = formatMessageList({ target: TARGET, topicId: topic.id, page })
     assert.equal(
@@ -128,14 +136,14 @@ describe('message lists', () => {
         'Forum directory: /forums/shared (supplied PI_FORUM_DIR)',
         'Forum is on for agents.',
         '',
-        `1. bob0 · ${messages[0].created_at}`,
-        `   Message ${messages[0].id} · topic ${topic.id}`,
+        `1. bob0 · ${messages[0]!.created_at}`,
+        `   Message ${messages[0]!.id} · topic ${topic.id}`,
         '   only line',
-        `2. bob1 · ${messages[1].created_at}`,
-        `   Message ${messages[1].id} · topic ${topic.id}`,
+        `2. bob1 · ${messages[1]!.created_at}`,
+        `   Message ${messages[1]!.id} · topic ${topic.id}`,
         '   # Heading…',
         `3. carol · ${reply.created_at}`,
-        `   Message ${reply.id} · topic ${topic.id} · reply to ${messages[0].id}`,
+        `   Message ${reply.id} · topic ${topic.id} · reply to ${messages[0]!.id}`,
         '   re',
         '',
         'You are caught up.',
@@ -154,7 +162,7 @@ describe('message lists', () => {
 
   test('a full page of one topic pages with its topic ID; untypable IDs get the cursor without a command', async () => {
     const { forum, created } = await seeded({ messages: LIST_PAGE_SIZE })
-    const { topic } = created[0]
+    const { topic } = created[0]!
     const page = await forum.listMessages({ topicId: topic.id, limit: LIST_PAGE_SIZE })
     const text = formatMessageList({ target: TARGET, topicId: topic.id, page })
     assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum messages ${topic.id} --after ${page.next_cursor}`)
@@ -172,6 +180,8 @@ describe('message lists', () => {
       const shown = formatMessageList({ target: TARGET, topicId, page })
       assert.equal(lastLine(shown), `20 shown; there may be more after cursor ${page.next_cursor}.`)
     }
+    // A page without a cursor, which the forum never returns, still reads as possibly incomplete.
+    // @ts-expect-error -- next_cursor is always a string in a forum page
     const noCursor = formatMessageList({ target: TARGET, page: { items: page.items, next_cursor: null } })
     assert.equal(lastLine(noCursor), '20 shown; there may be more.')
   })
@@ -191,9 +201,9 @@ describe('message lists', () => {
 describe('message reads', () => {
   test('show all metadata and the complete body with its lines, indentation and Markdown kept', async () => {
     const { forum, created } = await seeded({ messages: 1 })
-    const { topic, messages } = created[0]
+    const { topic, messages } = created[0]!
     const body = '# Title\n\n```js\nif (x) {\n\treturn `y`\n}\n```\n\n  - indented *item*\n'
-    const posted = await forum.postMessage({ topicId: topic.id, author: 'carol', body, originSessionId: 'session-c', replyTo: messages[0].id })
+    const posted = await forum.postMessage({ topicId: topic.id, author: 'carol', body, originSessionId: 'session-c', replyTo: messages[0]!.id })
     const message = await forum.getMessage(posted.id)
     const text = formatMessage({ target: TARGET, message })
     assert.equal(
@@ -207,7 +217,7 @@ describe('message reads', () => {
         `Topic: ${topic.id}`,
         'Author: carol',
         `Created: ${posted.created_at}`,
-        `Reply to: ${messages[0].id}`,
+        `Reply to: ${messages[0]!.id}`,
         'Origin session: session-c',
         '',
         'Body (10 lines):',
@@ -226,7 +236,7 @@ describe('message reads', () => {
   })
 
   test('omit absent reply target and origin session', () => {
-    const message = { id: 'm', topic_id: 't', author: 'a', body: 'one', created_at: 'c' }
+    const message: Message = { id: 'm', topic_id: 't', author: 'a', body: 'one', created_at: 'c' }
     const text = formatMessage({ target: TARGET, message })
     assert.doesNotMatch(text, /Reply to|Origin session/)
     assert.match(text, /\nBody \(1 line\):\none$/)
@@ -236,13 +246,13 @@ describe('message reads', () => {
     const lines = Array.from({ length: 3000 }, (_, i) => `${' '.repeat(i % 8)}line ${i} ${'x'.repeat(i % 50)}`)
     lines[1234] = '\x1b[2J\x1b]8;;http://e\x07link\x1b]8;;\x07 ⁦iso⁩ \x9b31m del\x7f cr\r'
     const body = lines.join('\n')
-    const message = { id: 'm', topic_id: 't', author: 'a\x00', body, created_at: 'c', reply_to: 'r‎', origin_session_id: 's\x85' }
+    const message: Message = { id: 'm', topic_id: 't', author: 'a\x00', body, created_at: 'c', reply_to: 'r‎', origin_session_id: 's\x85' }
     const text = formatMessage({ target: TARGET, message })
     assert.doesNotMatch(text, RAW_CONTROLS)
     assert.ok(text.includes('\nAuthor: a␀\n'))
     assert.ok(text.includes('\nReply to: r⟨U+200E⟩\n'))
     assert.ok(text.includes('\nOrigin session: s⟨U+0085⟩\n'))
-    const shown = text.split('\nBody (3000 lines):\n')[1].split('\n')
+    const shown = text.split('\nBody (3000 lines):\n')[1]!.split('\n')
     assert.equal(shown.length, 3000)
     assert.equal(shown[1234], '␛[2J␛]8;;http://e␇link␛]8;;␇ ⟨U+2066⟩iso⟨U+2069⟩ ⟨U+009B⟩31m del␡ cr␍')
     lines.forEach((line, i) => i === 1234 || assert.equal(shown[i], line))
@@ -253,7 +263,7 @@ describe('message reads', () => {
     assert.equal(expandTabs('ab\u0007\tc'), 'ab\u0007 c')
     assert.equal(expandTabs('日本\tx'), '日本  x')
     assert.equal(expandTabs('日本\tx', (text) => [...text].reduce((n, c) => n + (c > '⺀' ? 2 : 1), 0)), '日本    x')
-    const message = { id: 'm', topic_id: 't', author: 'a', body: 'a\tb', created_at: 'c' }
+    const message: Message = { id: 'm', topic_id: 't', author: 'a', body: 'a\tb', created_at: 'c' }
     assert.ok(formatMessage({ target: TARGET, message }).endsWith('\na   b'))
   })
 })
@@ -265,7 +275,7 @@ describe('damaged records', () => {
     const page = { items: [], next_cursor: 'c' }
     assert.ok(formatTopicList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
     assert.ok(formatMessageList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
-    const message = { id: 'm', topic_id: 't', author: 'a', body: 'b', created_at: 'c' }
+    const message: Message = { id: 'm', topic_id: 't', author: 'a', body: 'b', created_at: 'c' }
     assert.ok(formatMessage({ target: TARGET, message, warnings }).includes(`\n${expected}\n`))
     assert.doesNotMatch(formatTopicList({ target: TARGET, page }), /damaged/)
   })
@@ -300,8 +310,8 @@ describe('bidirectional controls', () => {
   })
 
   test('every formatted field shows them, and nothing raw remains', () => {
-    const topic = { id: `t${BIDI}`, title: `title ${BIDI}`, created_by: `by${BIDI}`, created_at: `at${BIDI}` }
-    const message = {
+    const topic: Topic = { id: `t${BIDI}`, title: `title ${BIDI}`, created_by: `by${BIDI}`, created_at: `at${BIDI}` }
+    const message: Message = {
       id: `m${BIDI}`,
       topic_id: `t${BIDI}`,
       author: `a${BIDI}`,
@@ -310,7 +320,7 @@ describe('bidirectional controls', () => {
       origin_session_id: `s${BIDI}`,
       body: `${BIDI} first\n\t${BIDI}\n**${BIDI}**`,
     }
-    const target = { forumDir: `/f${BIDI}`, generated: false, resolved: `/r${BIDI}`, status: 'unavailable', warning: `w${BIDI}` }
+    const target: ForumTarget = { forumDir: `/f${BIDI}`, generated: false, resolved: `/r${BIDI}`, status: 'unavailable', warning: `w${BIDI}` }
     const page = { items: Array(LIST_PAGE_SIZE).fill(topic), next_cursor: `c${BIDI}` }
     const texts = [
       formatTarget(target),
@@ -324,15 +334,15 @@ describe('bidirectional controls', () => {
       assert.doesNotMatch(text, RAW_CONTROLS)
       assert.ok(text.includes(BIDI_SHOWN), text)
     }
-    assert.ok(texts[3].endsWith(`\nBody (3 lines):\n${BIDI_SHOWN} first\n    ${BIDI_SHOWN}\n**${BIDI_SHOWN}**`))
+    assert.ok(texts[3]!.endsWith(`\nBody (3 lines):\n${BIDI_SHOWN} first\n    ${BIDI_SHOWN}\n**${BIDI_SHOWN}**`))
     // A cursor holding one is not offered as a command.
-    assert.equal(lastLine(texts[1]), `20 shown; there may be more after cursor c${BIDI_SHOWN}.`)
+    assert.equal(lastLine(texts[1]!), `20 shown; there may be more after cursor c${BIDI_SHOWN}.`)
   })
 })
 
 describe('text commands', () => {
   test('options come first; IDs starting with "-" follow "--"; such cursors use --after=', () => {
-    const table = [
+    const table: [ForumView, string][] = [
       [{ kind: 'topics' }, '/forum topics'],
       [{ kind: 'topics', after: 'c1' }, '/forum topics --after c1'],
       [{ kind: 'topics', after: '-c1' }, '/forum topics --after=-c1'],

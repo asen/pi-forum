@@ -1,6 +1,8 @@
 // Type-regression fixture: how a consumer of the installed package uses its public types, compiled
-// by test/types.test.js against the packed declarations (node_modules/pi-forum), never the sources.
-// The plain statements must compile. Each @ts-expect-error marks a use the declarations must reject;
+// by test/types.test.ts against the packed declarations (node_modules/pi-forum), never the sources.
+// It imports pi-forum by package name, so it is the one file under test/ that npm run typecheck
+// leaves out (see tsconfig.tooling.json); the test compiles it instead. The plain statements must
+// compile. Each @ts-expect-error marks a use the declarations must reject;
 // if a type widened (to any, say), the unused directive fails the compile.
 import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from '@earendil-works/pi-coding-agent'
 import { matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'

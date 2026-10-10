@@ -9,15 +9,24 @@ import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
 
+// The content hash, mode and modification time of a file, or null for a file that does not exist.
+export type FileState = { sha256: string; mode: number; mtimeMs: number } | null
+export type Snapshot = Record<string, FileState>
+
+export interface Inventory {
+  sources: string[]
+  generated: string[]
+}
+
 export const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 // The production directories whose X.ts each own a generated X.js and X.d.ts next to it.
-export const SOURCE_DIRS = ['src', 'src/backends', 'extension']
+export const SOURCE_DIRS: readonly string[] = ['src', 'src/backends', 'extension']
 
 // The files a commit of the working tree would hold, as Git would clone them: tracked files that still
 // exist and untracked files that are not ignored, sorted. node_modules and other ignored files are left
 // out.
-export async function checkoutFiles(root = ROOT) {
+export async function checkoutFiles(root = ROOT): Promise<string[]> {
   const { stdout } = await exec('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: root })
   const files = [...new Set(stdout.split('\0').filter(Boolean))].sort()
   const present = await Promise.all(files.map((file) => fs.lstat(path.join(root, file)).then((stat) => stat.isFile(), () => false)))
@@ -25,7 +34,7 @@ export async function checkoutFiles(root = ROOT) {
 }
 
 // Copies those files, with their modes, into dest; returns the copied list.
-export async function copyCheckout(dest, root = ROOT) {
+export async function copyCheckout(dest: string, root = ROOT): Promise<string[]> {
   const files = await checkoutFiles(root)
   for (const file of files) {
     await fs.mkdir(path.dirname(path.join(dest, file)), { recursive: true })
@@ -36,8 +45,8 @@ export async function copyCheckout(dest, root = ROOT) {
 }
 
 // POSIX paths of the files under dir, sorted, skipping the named entries (such as a linked node_modules).
-export async function listFiles(dir, { skip = [] } = {}, prefix = '') {
-  const files = []
+export async function listFiles(dir: string, { skip = [] }: { skip?: readonly string[] } = {}, prefix = ''): Promise<string[]> {
+  const files: string[] = []
   for (const entry of await fs.readdir(path.join(dir, prefix), { withFileTypes: true })) {
     const name = path.posix.join(prefix, entry.name)
     if (skip.includes(name)) continue
@@ -49,8 +58,8 @@ export async function listFiles(dir, { skip = [] } = {}, prefix = '') {
 
 // Content hash, mode and modification time of every file under dir (or of the given files), so a
 // comparison catches a rewrite even when it wrote the same bytes.
-export async function snapshot(dir, { files, skip = [] } = {}) {
-  const result = {}
+export async function snapshot(dir: string, { files, skip = [] }: { files?: readonly string[]; skip?: readonly string[] } = {}): Promise<Snapshot> {
+  const result: Snapshot = {}
   for (const file of files ?? (await listFiles(dir, { skip }))) {
     const full = path.join(dir, file)
     const stat = await fs.stat(full).catch(() => null)
@@ -64,8 +73,8 @@ export async function snapshot(dir, { files, skip = [] } = {}) {
 }
 
 // Production TypeScript sources and the generated files they own, from the given tree.
-export async function generatedInventory(root = ROOT) {
-  const sources = []
+export async function generatedInventory(root = ROOT): Promise<Inventory> {
+  const sources: string[] = []
   for (const dir of SOURCE_DIRS) {
     for (const name of await fs.readdir(path.join(root, dir))) {
       if (name.endsWith('.ts') && !name.endsWith('.d.ts')) sources.push(`${dir}/${name}`)

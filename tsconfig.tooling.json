@@ -1,0 +1,19 @@
+{
+  // Authored TypeScript outside production: build tooling under scripts/ and tests, their helpers and
+  // fixtures under test/. Node runs these files directly by stripping their types, so they are only
+  // ever checked (npm run typecheck), never emitted, and use only syntax Node can erase. Relative
+  // imports between them name the .ts file itself.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["scripts/**/*.ts", "scripts/**/*.mts", "test/**/*.ts", "test/**/*.mts"],
+  // Production declarations are generated, not inputs. test/types/consumer.ts compiles only against
+  // the packed package, in a scratch project of test/types.test.ts. Declarations authored under test/
+  // stay included.
+  "exclude": ["src/**/*.d.ts", "extension/**/*.d.ts", "test/types/consumer.ts"]
+}

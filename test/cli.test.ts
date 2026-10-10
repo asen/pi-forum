@@ -6,12 +6,25 @@ import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { main } from '../src/cli.js'
+import type { Environment, ForumFactory } from '../src/cli.js'
 import { createForum } from '../src/forum.js'
 import { createTopic, postMessage } from '../src/storage.js'
-import { fakeAdapter } from './fake-adapter.js'
+import type {
+  CreateForumOptions,
+  CreateTopicResult,
+  Forum,
+  Message,
+  Page,
+  ReadCallOptions,
+  Topic,
+  WriteCallOptions,
+} from '../src/types.js'
+import { fakeAdapter } from './fake-adapter.ts'
+import type { FakeAdapter } from './fake-adapter.ts'
 
 const BIN = fileURLToPath(new URL('../bin/pi-forum', import.meta.url))
-const roots = []
+const FAIL_MESSAGE_APPEND = fileURLToPath(new URL('./fixtures/fail-message-append.mts', import.meta.url))
+const roots: string[] = []
 
 after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
@@ -27,16 +40,41 @@ async function tempForum() {
   return path.join(await tempRoot(), 'forum')
 }
 
+interface RunOptions {
+  env?: Environment
+  input?: string
+  cwd?: string
+  nodeArgs?: string[]
+}
+
+interface RunResult {
+  code: number | null
+  stdout: string
+  stderr: string
+}
+
+// What each command prints on success, by its two command words, as the help documents.
+interface Responses {
+  topic: { create: CreateTopicResult; get: { topic: Topic }; list: Page<Topic> }
+  message: { post: { message: Message }; get: { message: Message }; list: Page<Message> }
+}
+
+// The arguments of a command that prints a response: its two command words, then the rest.
+type CommandArgs<G extends keyof Responses, V extends keyof Responses[G] & string> = readonly [G, V, ...string[]]
+
+// One line of the log as stored: an event's type beside its record's fields.
+type StoredEvent = (Topic & { type: 'topic_created' }) | (Message & { type: 'message_posted' })
+
 // Runs the executable with only PATH plus the given environment, so the caller's Pi variables never leak in.
-function run(args, { env = {}, input, cwd, nodeArgs } = {}) {
+function run(args: readonly string[], { env = {}, input, cwd, nodeArgs }: RunOptions = {}): Promise<RunResult> {
   const fullEnv = { PATH: process.env.PATH, ...env }
   const [file, argv] = nodeArgs ? [process.execPath, [...nodeArgs, BIN, ...args]] : [BIN, args]
   return new Promise((resolve, reject) => {
     const child = spawn(file, argv, { env: fullEnv, cwd })
-    const stdout = []
-    const stderr = []
-    child.stdout.on('data', (chunk) => stdout.push(chunk))
-    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
     child.on('error', reject)
     child.on('close', (code) => {
       resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') })
@@ -45,8 +83,12 @@ function run(args, { env = {}, input, cwd, nodeArgs } = {}) {
   })
 }
 
-// Runs a command expected to succeed and returns its single JSON result.
-async function ok(args, options) {
+// Runs a command expected to succeed and returns its single JSON result. Parsing it as the command's
+// documented response is the only unchecked step; the tests assert the fields they use.
+async function ok<G extends keyof Responses, V extends keyof Responses[G] & string>(
+  args: CommandArgs<G, V>,
+  options?: RunOptions,
+): Promise<Responses[G][V]> {
   const result = await run(args, options)
   assert.equal(result.stderr, '')
   assert.equal(result.code, 0)
@@ -56,7 +98,7 @@ async function ok(args, options) {
 }
 
 // Runs a command expected to fail and returns its stderr.
-async function fails(args, options, pattern) {
+async function fails(args: readonly string[], options: RunOptions, pattern?: RegExp) {
   const result = await run(args, options)
   assert.equal(result.code, 1)
   assert.equal(result.stdout, '')
@@ -65,13 +107,14 @@ async function fails(args, options, pattern) {
   return result.stderr
 }
 
-const forumEnv = (dir, extra = {}) => ({ env: { PI_FORUM_DIR: dir, ...extra } })
-const logPath = (dir) => path.join(dir, 'events.jsonl')
-const readLog = (dir) => fs.readFile(logPath(dir), 'utf8').catch((err) => (err.code === 'ENOENT' ? null : Promise.reject(err)))
+const forumEnv = (dir: string, extra: Environment = {}) => ({ env: { PI_FORUM_DIR: dir, ...extra } })
+const logPath = (dir: string) => path.join(dir, 'events.jsonl')
+const readLog = (dir: string) =>
+  fs.readFile(logPath(dir), 'utf8').catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? null : Promise.reject(err)))
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
-async function readAll(args, options, cursor) {
-  const items = []
+async function readAll<G extends keyof Responses>(args: CommandArgs<G, 'list'>, options: RunOptions, cursor?: string) {
+  const items: Responses[G]['list']['items'][number][] = []
   for (;;) {
     const page = await ok([...args, ...(cursor ? ['--after', cursor] : [])], options)
     assert.deepEqual(Object.keys(page), ['items', 'next_cursor'])
@@ -154,7 +197,7 @@ describe('help and binding', () => {
   test('help-like option values and invalid flags are errors even with help', async () => {
     const dir = await tempForum()
     const ambiguous = /Option '--[a-z-]+' argument is ambiguous/
-    const cases = [
+    const cases: [string[], RegExp][] = [
       [['topic', 'create', 'Example', '--body', '--help'], ambiguous],
       [['topic', 'create', 'Example', '--body', '-h'], ambiguous],
       [['topic', 'create', 'Example', '--body-file', '--help'], ambiguous],
@@ -196,7 +239,7 @@ describe('help and binding', () => {
     const { topic, message } = await ok(['topic', 'create', '--body=--help', '--author=-h', '--', '--help'], forumEnv(dir))
     assert.equal(topic.title, '--help')
     assert.equal(topic.created_by, '-h')
-    assert.equal(message.body, '--help')
+    assert.equal(message!.body, '--help')
     assert.equal((await ok(['topic', 'create', '--', '-h'], forumEnv(dir))).topic.title, '-h')
     const fromFile = await ok(['message', 'post', '--body-file=--help', '--', topic.id], { cwd, ...forumEnv(dir) })
     assert.equal(fromFile.message.body, 'from a dash file\n')
@@ -231,10 +274,10 @@ describe('topic commands', () => {
     assert.equal(topic.title, title)
     assert.equal(topic.created_by, ' reviewer ')
     assert.equal(topic.origin_session_id, 'sess-2')
-    assert.equal(message.topic_id, topic.id)
-    assert.equal(message.body, body)
-    assert.equal(message.author, ' reviewer ')
-    assert.equal(message.origin_session_id, 'sess-2')
+    assert.equal(message!.topic_id, topic.id)
+    assert.equal(message!.body, body)
+    assert.equal(message!.author, ' reviewer ')
+    assert.equal(message!.origin_session_id, 'sess-2')
     assert.deepEqual((await ok(['message', 'list'], forumEnv(dir))).items, [message])
   })
 
@@ -245,14 +288,14 @@ describe('topic commands', () => {
     await fs.mkdir(path.join(cwd, 'notes'))
     await fs.writeFile(path.join(cwd, 'notes', 'body.md'), body)
     const { message } = await ok(['topic', 'create', 'From file', '--body-file', 'notes/body.md'], { cwd, ...forumEnv(dir) })
-    assert.equal(message.body, body)
+    assert.equal(message!.body, body)
   })
 
   test('create reads --body-stdin exactly', async () => {
     const dir = await tempForum()
     const body = '﻿  stdin 本文\n\n'
     const { message } = await ok(['topic', 'create', 'From stdin', '--body-stdin'], { input: body, ...forumEnv(dir) })
-    assert.equal(message.body, body)
+    assert.equal(message!.body, body)
   })
 
   test('callers without session metadata are external with no origin', async () => {
@@ -260,9 +303,9 @@ describe('topic commands', () => {
     for (const env of [{}, { PI_SESSION_ID: '' }, { PI_SESSION_ID: '  \t' }]) {
       const { topic, message } = await ok(['topic', 'create', 'Manual', '--body', 'hi'], forumEnv(dir, env))
       assert.equal(topic.created_by, 'external')
-      assert.equal(message.author, 'external')
+      assert.equal(message!.author, 'external')
       assert.equal('origin_session_id' in topic, false)
-      assert.equal('origin_session_id' in message, false)
+      assert.equal('origin_session_id' in message!, false)
     }
     const { topic } = await ok(['topic', 'create', 'Labelled', '--author', 'human'], forumEnv(dir))
     assert.deepEqual(Object.keys(topic), ['id', 'title', 'created_by', 'created_at'])
@@ -313,11 +356,11 @@ describe('topic commands', () => {
 })
 
 describe('message commands', () => {
-  async function seededTopic(dir) {
+  async function seededTopic(dir: string) {
     return (await createTopic(dir, { title: 'Topic', author: 'seed' })).topic
   }
 
-  function seededMessage(dir, topic) {
+  function seededMessage(dir: string, topic: Topic) {
     return postMessage(dir, { topicId: topic.id, author: 'seed', body: 'seed' })
   }
 
@@ -374,7 +417,7 @@ describe('message commands', () => {
     const dir = await tempForum()
     const a = await seededTopic(dir)
     const b = await seededTopic(dir)
-    for (const [topic, body] of [[a, 'a1'], [b, 'b1'], [a, 'a2 🚀'], [b, 'b2'], [a, 'a3']]) {
+    for (const [topic, body] of [[a, 'a1'], [b, 'b1'], [a, 'a2 🚀'], [b, 'b2'], [a, 'a3']] as const) {
       await ok(['message', 'post', topic.id, '--body', body], forumEnv(dir))
     }
     const all = await readAll(['message', 'list', '--limit', '2'], forumEnv(dir))
@@ -416,7 +459,7 @@ describe('message commands', () => {
       assert.deepEqual(result, { message: posted })
       assert.equal(result.message.body, body)
     }
-    assert.equal(Buffer.byteLength(bodies[2]), 64 * 1024)
+    assert.equal(Buffer.byteLength(bodies[2]!), 64 * 1024)
     const reply = await ok(['message', 'post', topic.id, '--body', 'r', '--reply-to', (await seededMessage(dir, topic)).id], forumEnv(dir))
     assert.deepEqual(await ok(['message', 'get', '--', reply.message.id], forumEnv(dir)), reply)
   })
@@ -449,7 +492,7 @@ describe('input errors', () => {
     await fs.writeFile(path.join(cwd, 'bad.txt'), Buffer.from([0x68, 0xff, 0x69]))
     const before = await readLog(dir)
     const env = { cwd, ...forumEnv(dir, { PI_SESSION_ID: 's' }) }
-    const cases = [
+    const cases: [string[], RegExp][] = [
       [['topic', 'create'], /missing TITLE for topic create/],
       [['topic', 'create', 'A', 'B'], /unexpected argument "B" for topic create/],
       [['topic', 'create', '   '], /title must be a non-blank string/],
@@ -546,27 +589,16 @@ describe('storage conditions', () => {
 
   test('a partial topic creation names the created topic and prints no result', async () => {
     const dir = await tempForum()
-    const preload = path.join(await tempRoot(), 'fail-message-append.mjs')
-    await fs.writeFile(
-      preload,
-      `import fs from 'node:fs/promises'
-const appendFile = fs.appendFile
-fs.appendFile = async (file, data, ...rest) => {
-  if (String(data).includes('"message_posted"')) throw new Error('EIO: simulated failure')
-  return appendFile(file, data, ...rest)
-}
-`,
-    )
     const stderr = await fails(
       ['topic', 'create', 'Partial', '--body', 'lost'],
-      { nodeArgs: ['--import', preload], ...forumEnv(dir) },
+      { nodeArgs: ['--import', FAIL_MESSAGE_APPEND], ...forumEnv(dir) },
       /simulated failure/,
     )
-    const [event] = (await readLog(dir)).trim().split('\n').map((line) => JSON.parse(line))
-    assert.equal(event.type, 'topic_created')
-    assert.match(stderr, new RegExp(`topic ${event.id} was created, but its initial message may be missing`))
-    assert.match(stderr, new RegExp(`pi-forum message list --topic ${event.id}`))
-    await ok(['topic', 'get', event.id], forumEnv(dir))
+    const [event] = (await readLog(dir))!.trim().split('\n').map((line): StoredEvent => JSON.parse(line))
+    assert.equal(event!.type, 'topic_created')
+    assert.match(stderr, new RegExp(`topic ${event!.id} was created, but its initial message may be missing`))
+    assert.match(stderr, new RegExp(`pi-forum message list --topic ${event!.id}`))
+    await ok(['topic', 'get', event!.id], forumEnv(dir))
   })
 })
 
@@ -575,18 +607,24 @@ fs.appendFile = async (file, data, ...rest) => {
 describe('dispatch through the shared API', () => {
   const FORUM_DIR = path.join(os.tmpdir(), 'pi-forum-cli-dispatch-never-created')
 
-  function recordingFactory(adapter = fakeAdapter()) {
-    const configs = []
-    const calls = []
-    const factory = (config) => {
+  // The client's methods, and one call a method received with its arguments.
+  type Method = { [K in keyof Forum]: Forum[K] extends (...args: never[]) => unknown ? K : never }[keyof Forum]
+  type Call = { [K in Method]: { name: K; args: Parameters<Forum[K]> } }[Method]
+
+  function recordingFactory(adapter: FakeAdapter = fakeAdapter()) {
+    const configs: CreateForumOptions[] = []
+    const calls: Call[] = []
+    const factory: ForumFactory = (config) => {
       configs.push(config)
       const client = createForum({ ...config, adapter })
       return new Proxy(client, {
+        // The trap sees property names and values untyped; the functions it wraps are the client's
+        // methods, so each call is recorded as a Call.
         get(target, name) {
-          const value = target[name]
+          const value: unknown = Reflect.get(target, name)
           if (typeof value !== 'function') return value
-          return (...args) => {
-            calls.push({ name, args })
+          return (...args: unknown[]) => {
+            calls.push({ name, args } as Call)
             return value(...args)
           }
         },
@@ -596,10 +634,10 @@ describe('dispatch through the shared API', () => {
   }
 
   // Runs main with captured output streams.
-  async function invoke(argv, env, factory) {
-    const out = []
-    const err = []
-    const stream = (chunks) => ({ write: (chunk) => chunks.push(chunk) > 0 })
+  async function invoke(argv: readonly string[], env: Environment, factory: ForumFactory) {
+    const out: string[] = []
+    const err: string[] = []
+    const stream = (chunks: string[]) => ({ write: (chunk: string) => chunks.push(chunk) > 0 })
     const code = await main(argv, env, { createForum: factory, stdout: stream(out), stderr: stream(err) })
     return { code, stdout: out.join(''), stderr: err.join('') }
   }
@@ -608,7 +646,9 @@ describe('dispatch through the shared API', () => {
     const recording = recordingFactory()
     const env = { PI_FORUM_DIR: FORUM_DIR, PI_SESSION_ID: 'sess' }
     // Runs one command and returns its JSON result and the client calls it made.
-    const command = async (argv) => {
+    const command = async <G extends keyof Responses, V extends keyof Responses[G] & string>(
+      argv: CommandArgs<G, V>,
+    ): Promise<{ json: Responses[G][V]; calls: unknown[][] }> => {
       const configs = recording.configs.length
       const calls = recording.calls.length
       const result = await invoke(argv, env, recording.factory)
@@ -617,7 +657,8 @@ describe('dispatch through the shared API', () => {
       assert.deepEqual(recording.configs.slice(configs), [{ forumDir: FORUM_DIR, createOnRead: true }])
       // Every call passes the CLI's warning reporter in its final options; the rest is compared exactly.
       const made = recording.calls.slice(calls).map(({ name, args }) => {
-        const { onWarning, ...options } = args.at(-1)
+        // Every client method takes its options last.
+        const { onWarning, ...options } = args.at(-1) as ReadCallOptions | WriteCallOptions
         assert.equal(typeof onWarning, 'function')
         return [name, ...args.slice(0, -1), options]
       })
@@ -629,7 +670,7 @@ describe('dispatch through the shared API', () => {
     assert.deepEqual(created.calls, [
       ['createTopic', { title: 'T', body: '  b  ', author: 'sess', originSessionId: 'sess' }, {}],
     ])
-    assert.equal(message.topic_id, topic.id)
+    assert.equal(message!.topic_id, topic.id)
 
     const topics = await command(['topic', 'list', '--limit', '5'])
     assert.deepEqual(topics.json.items, [topic])
@@ -640,11 +681,11 @@ describe('dispatch through the shared API', () => {
     assert.deepEqual(gotTopic.json, { topic })
     assert.deepEqual(gotTopic.calls, [['getTopic', topic.id, {}]])
 
-    const posted = await command(['message', 'post', topic.id, '--body', 'r', '--reply-to', message.id, '--author', 'bot'])
+    const posted = await command(['message', 'post', topic.id, '--body', 'r', '--reply-to', message!.id, '--author', 'bot'])
     assert.deepEqual(posted.calls, [
-      ['postMessage', { topicId: topic.id, body: 'r', replyTo: message.id, author: 'bot', originSessionId: 'sess' }, {}],
+      ['postMessage', { topicId: topic.id, body: 'r', replyTo: message!.id, author: 'bot', originSessionId: 'sess' }, {}],
     ])
-    assert.equal(posted.json.message.reply_to, message.id)
+    assert.equal(posted.json.message.reply_to, message!.id)
 
     const listed = await command(['message', 'list', '--topic', topic.id, '--after', topics.json.next_cursor])
     // The topic list's cursor is past the initial message, so only the later post follows it.
@@ -677,7 +718,7 @@ describe('dispatch through the shared API', () => {
       [['message', 'get', 'a', 'b'], env],
       [['message', 'get', 'x'], {}],
       [['message', 'get', 'x'], { PI_FORUM_DIR: 'relative' }],
-    ]) {
+    ] as const) {
       const result = await invoke(argv, argEnv, recording.factory)
       assert.equal(result.code, 1)
       assert.equal(result.stdout, '')
@@ -708,8 +749,8 @@ describe('dispatch through the shared API', () => {
     recording.adapter.failAppends(() => false)
     assert.equal(partial.code, 1)
     assert.equal(partial.stdout, '')
-    const [{ events }] = recording.adapter.forums.values()
-    const id = events[0].data.id
+    const [forum] = recording.adapter.forums.values()
+    const id = forum!.events[0]!.data.id
     assert.equal(
       partial.stderr,
       `pi-forum: error: topic ${id} was created, but its initial message may be missing (fake append failed).\n` +

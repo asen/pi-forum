@@ -1,9 +1,9 @@
 {
   // Production TypeScript under src/ and extension/. Each X.ts owns the tracked X.js and X.d.ts next
-  // to it; scripts/build.mjs emits them (npm run build) and checks them (npm run check-generated).
-  // Tests stay JavaScript and are not part of this project. This config never emits by itself:
-  // npm run typecheck only checks, and the build runner overrides noEmit and outDir to a staging
-  // directory.
+  // to it; scripts/build.ts emits them (npm run build) and checks them (npm run check-generated).
+  // Tooling and tests are checked by tsconfig.tooling.json, which extends these options. This config
+  // never emits by itself: npm run typecheck only checks, and the build runner overrides noEmit and
+  // outDir to a staging directory.
   "compilerOptions": {
     "target": "ES2023",
     // ES2024.String types String.prototype.isWellFormed, which records validation relies on and every

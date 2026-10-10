@@ -8,18 +8,38 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import type { Environment } from '../src/cli.js'
+import type { CreateTopicResult, Message, Page, Topic } from '../src/types.js'
 
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
 const NODE_DIR = path.dirname(process.execPath)
 
+interface PiForumOptions {
+  env: Environment
+  cwd: string
+  input?: string | undefined
+}
+
+interface PiForumResult {
+  code: number | null
+  stdout: string
+  stderr: string
+}
+
+// What each command prints on success, by its two command words, as the help documents.
+interface Responses {
+  topic: { create: CreateTopicResult; get: { topic: Topic }; list: Page<Topic> }
+  message: { post: { message: Message }; get: { message: Message }; list: Page<Message> }
+}
+
 // Runs pi-forum through PATH with only the given environment, as Pi's bash would.
-function piForum(args, { env, cwd, input }) {
+function piForum(args: readonly string[], { env, cwd, input }: PiForumOptions): Promise<PiForumResult> {
   return new Promise((resolve, reject) => {
     const child = spawn('pi-forum', args, { env, cwd })
-    const stdout = []
-    const stderr = []
-    child.stdout.on('data', (chunk) => stdout.push(chunk))
-    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
     child.on('error', reject)
     child.on('close', (code) => {
       resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') })
@@ -40,7 +60,13 @@ test('a shared forum workflow through the bundled executable', async () => {
     const main = { ...base, PI_SESSION_ID: 'main-session' }
     const helper = { ...base }
 
-    const ok = async (args, env, input) => {
+    // Runs a command expected to succeed. Parsing its output as the command's documented response is
+    // the only unchecked step; the workflow asserts the fields it uses.
+    const ok = async <G extends keyof Responses, V extends keyof Responses[G] & string>(
+      args: readonly [G, V, ...string[]],
+      env: Environment,
+      input?: string,
+    ): Promise<Responses[G][V]> => {
       const result = await piForum(args, { env, cwd: work, input })
       assert.equal(result.stderr, '', `stderr of ${args.join(' ')}`)
       assert.equal(result.code, 0)
@@ -52,7 +78,7 @@ test('a shared forum workflow through the bundled executable', async () => {
     const topicId = created.topic.id
     assert.equal(created.topic.created_by, 'main-session')
     assert.equal(created.topic.origin_session_id, 'main-session')
-    assert.equal(created.message.body, 'Report findings here.')
+    assert.equal(created.message!.body, 'Report findings here.')
     assert.deepEqual((await ok(['topic', 'get', topicId], main)).topic, created.topic)
 
     // A caller without Pi metadata posts with a label, from a file and from stdin.
@@ -74,8 +100,8 @@ test('a shared forum workflow through the bundled executable', async () => {
     const topics = await ok(['topic', 'list'], main)
     assert.deepEqual(topics.items.map((t) => t.title), ['Flaky tests', 'Release notes'])
 
-    const bodies = []
-    let cursor
+    const bodies: string[] = []
+    let cursor: string | undefined
     let pages = 0
     for (;;) {
       const page = await ok(['message', 'list', '--limit', '2', ...(cursor ? ['--after', cursor] : [])], main)

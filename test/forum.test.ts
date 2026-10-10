@@ -4,11 +4,25 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
+import type { TestContext } from 'node:test'
 import { jsonlAdapter } from '../src/backends/jsonl.js'
+import type { CursorData } from '../src/cursor.js'
 import { ForumError, createForum } from '../src/forum.js'
-import { fakeAdapter } from './fake-adapter.js'
+import type {
+  CreateForumOptions,
+  Forum,
+  ForumAdapter,
+  ForumErrorCode,
+  ForumEvent,
+  ForumEventType,
+  ListMessagesOptions,
+  Message,
+  Page,
+  Topic,
+} from '../src/types.js'
+import { fakeAdapter } from './fake-adapter.ts'
 
-const roots = []
+const roots: string[] = []
 
 after(async () => {
   await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })))
@@ -16,8 +30,24 @@ after(async () => {
 
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const forumError = (code) => (err) => err instanceof ForumError && err.code === code
+const forumError = (code: ForumErrorCode) => (err: unknown) => err instanceof ForumError && err.code === code
 const quiet = { onWarning() {} }
+
+// A rejection as the predicates that use this view read it. Thrown values are unknown; reading their
+// fields through this type is the only unchecked step, and the predicates assert each field they use.
+interface Rejection extends ForumError {
+  cause: Rejection
+  topic: Topic
+}
+const rejection = (check: (err: Rejection) => boolean) => (thrown: unknown) => check(thrown as Rejection)
+
+// How the contract creates forums of one adapter and makes its appends fail.
+interface Setup {
+  adapter: ForumAdapter
+  forumDir(): Promise<string>
+  exists(forumDir: string): Promise<boolean>
+  failAppends(t: TestContext, type: ForumEventType): void
+}
 
 const jsonlSetup = {
   adapter: jsonlAdapter,
@@ -26,17 +56,17 @@ const jsonlSetup = {
     roots.push(root)
     return path.join(root, 'forum')
   },
-  exists: (forumDir) => fs.stat(forumDir).then(() => true, () => false),
-  failAppends(t, type) {
+  exists: (forumDir: string) => fs.stat(forumDir).then(() => true, () => false),
+  failAppends(t: TestContext, type: ForumEventType) {
     const appendFile = fs.appendFile
-    t.mock.method(fs, 'appendFile', async (...args) => {
+    t.mock.method(fs, 'appendFile', async (...args: Parameters<typeof fs.appendFile>) => {
       if (JSON.parse(String(args[1])).type === type) throw new Error('EIO: injected')
       return appendFile(...args)
     })
   },
-}
+} satisfies Setup
 
-function fakeSetup() {
+function fakeSetup(): Setup {
   const adapter = fakeAdapter()
   return {
     adapter,
@@ -49,9 +79,9 @@ function fakeSetup() {
   }
 }
 
-async function readAll(fn, options) {
-  const items = []
-  let cursor
+async function readAll<T>(fn: (options: ListMessagesOptions) => Promise<Page<T>>, options?: ListMessagesOptions) {
+  const items: T[] = []
+  let cursor: string | undefined
   for (;;) {
     const page = await fn({ ...options, after: cursor })
     assert.equal(typeof page.next_cursor, 'string')
@@ -62,15 +92,15 @@ async function readAll(fn, options) {
 }
 
 // The public contract every adapter must satisfy through createForum.
-function contract(name, setup) {
+function contract(name: string, setup: Setup) {
   describe(`forum contract: ${name}`, () => {
-    async function open(options) {
+    async function open(options?: Partial<CreateForumOptions>) {
       return createForum({ forumDir: await setup.forumDir(), adapter: setup.adapter, ...options })
     }
 
     // Asserts that fn leaves every listed record in place and appends nothing. Cursors are opaque
     // and need not repeat, so only records are compared.
-    async function assertUnchanged(forum, fn) {
+    async function assertUnchanged(forum: Forum, fn: () => Promise<void>) {
       const records = async () => [
         ...(await readAll(forum.listTopics, quiet)).items,
         ...(await readAll(forum.listMessages, quiet)).items,
@@ -97,11 +127,12 @@ function contract(name, setup) {
         originSessionId: 'sess-1',
       })
       assert.equal(topic.origin_session_id, 'sess-1')
-      assert.deepEqual(Object.keys(message), ['id', 'topic_id', 'author', 'body', 'created_at', 'origin_session_id'])
-      assert.equal(message.topic_id, topic.id)
-      assert.equal(message.body, body)
+      // createTopic returns a message whenever it is given a body.
+      assert.deepEqual(Object.keys(message!), ['id', 'topic_id', 'author', 'body', 'created_at', 'origin_session_id'])
+      assert.equal(message!.topic_id, topic.id)
+      assert.equal(message!.body, body)
       assert.deepEqual(await forum.getTopic(topic.id), topic)
-      assert.deepEqual(await forum.getMessage(message.id), message)
+      assert.deepEqual(await forum.getMessage(message!.id), message)
       assert.deepEqual((await forum.listTopics()).items, [plain.topic, topic])
     })
 
@@ -134,8 +165,9 @@ function contract(name, setup) {
       await assert.rejects(forum.getMessage('nope'), { code: 'NOT_FOUND', message: 'message nope not found' })
       // Topic and message IDs are separate.
       await assert.rejects(forum.getMessage(topic.id), forumError('NOT_FOUND'))
-      await assert.rejects(forum.getTopic(message.id), forumError('NOT_FOUND'))
+      await assert.rejects(forum.getTopic(message!.id), forumError('NOT_FOUND'))
       await assert.rejects(forum.getMessage(''), forumError('INVALID_INPUT'))
+      // @ts-expect-error -- a non-string ID, rejected at run time
       await assert.rejects(forum.getMessage(42), forumError('INVALID_INPUT'))
       await assert.rejects(forum.getTopic(' '), forumError('INVALID_INPUT'))
     })
@@ -154,7 +186,7 @@ function contract(name, setup) {
           message: 'message missing not found',
         })
         await assert.rejects(
-          forum.postMessage({ topicId: other.id, author: 'a', body: 'x', replyTo: message.id }),
+          forum.postMessage({ topicId: other.id, author: 'a', body: 'x', replyTo: message!.id }),
           forumError('INVALID_INPUT'),
         )
         await assert.rejects(
@@ -180,6 +212,7 @@ function contract(name, setup) {
           { title: 'T', author: 'a', originSessionId: ' ' },
           { title: 'T\uD800', author: 'a' },
         ]) {
+          // @ts-expect-error -- deliberately invalid inputs, rejected at run time
           await assert.rejects(forum.createTopic(input), forumError('INVALID_INPUT'), JSON.stringify(input))
         }
         for (const input of [
@@ -189,19 +222,25 @@ function contract(name, setup) {
           { topicId: topic.id, author: 'a', body: 'b', replyTo: '' },
           { topicId: topic.id, author: 'a', body: '€'.repeat(21846) },
         ]) {
+          // @ts-expect-error -- deliberately invalid inputs, rejected at run time
           await assert.rejects(forum.postMessage(input), forumError('INVALID_INPUT'), JSON.stringify(input).slice(0, 80))
         }
         for (const limit of [0, 101, 1.5, '5', -1, Number.NaN]) {
+          // @ts-expect-error -- deliberately invalid limits, rejected at run time
           await assert.rejects(forum.listTopics({ limit }), forumError('INVALID_INPUT'), String(limit))
+          // @ts-expect-error -- deliberately invalid limits, rejected at run time
           await assert.rejects(forum.listMessages({ limit }), forumError('INVALID_INPUT'), String(limit))
         }
         await assert.rejects(forum.listMessages({ topicId: ' ' }), forumError('INVALID_INPUT'))
         for (const after of ['', 42, {}, 'not a cursor!', 'abc']) {
+          // @ts-expect-error -- deliberately invalid cursors, rejected at run time
           await assert.rejects(forum.listTopics({ after }), forumError('INVALID_CURSOR'), String(after))
+          // @ts-expect-error -- deliberately invalid cursors, rejected at run time
           await assert.rejects(forum.listMessages({ after }), forumError('INVALID_CURSOR'), String(after))
         }
       })
       for (const forumDir of ['relative/forum', '', undefined, 42]) {
+        // @ts-expect-error -- deliberately invalid directories, rejected at run time
         assert.throws(() => createForum({ forumDir, adapter: setup.adapter }), forumError('INVALID_INPUT'))
       }
     })
@@ -220,13 +259,13 @@ function contract(name, setup) {
 
     test('paginates in append order and picks up later appends', async () => {
       const forum = await open()
-      const topics = []
+      const topics: Topic[] = []
       for (const title of ['Ünïcödé', '日本語', '🧪 tests']) {
         topics.push((await forum.createTopic({ title, author: 'ä', body: `${title} 🚀` })).topic)
       }
-      const messages = []
+      const messages: Message[] = []
       for (let i = 0; i < 7; i++) {
-        messages.push(await forum.postMessage({ topicId: topics[i % 3].id, author: 'β', body: `${i}: 👋\n✓` }))
+        messages.push(await forum.postMessage({ topicId: topics[i % 3]!.id, author: 'β', body: `${i}: 👋\n✓` }))
       }
       const allTopics = await readAll(forum.listTopics, { limit: 2 })
       assert.deepEqual(allTopics.items, topics)
@@ -234,7 +273,7 @@ function contract(name, setup) {
       assert.equal(allMessages.items.length, 10)
       assert.deepEqual(allMessages.items.slice(3), messages)
 
-      const target = topics[1]
+      const target = topics[1]!
       const filtered = await readAll(forum.listMessages, { topicId: target.id, limit: 1 })
       assert.deepEqual(filtered.items, allMessages.items.filter((m) => m.topic_id === target.id))
 
@@ -301,22 +340,23 @@ function contract(name, setup) {
     test('aborted reads report ABORTED and return nothing', async () => {
       const writer = await open()
       const { topic, message } = await writer.createTopic({ title: 'T', author: 'a', body: 'b' })
-      const reads = (forum, signal) => [
-        forum.listTopics({ signal }),
-        forum.listMessages({ topicId: topic.id, signal }),
-        forum.getTopic(topic.id, { signal }),
-        forum.getMessage(message.id, { signal }),
-      ]
+      const reads = (forum: Forum, signal: AbortSignal) =>
+        [
+          forum.listTopics({ signal }),
+          forum.listMessages({ topicId: topic.id, signal }),
+          forum.getTopic(topic.id, { signal }),
+          forum.getMessage(message!.id, { signal }),
+        ] as const
       // Settles all the reads together, so none rejects before a handler is attached, and checks
       // that each was rejected as expected.
-      const assertAllRejected = async (promises, check) => {
+      const assertAllRejected = async (promises: readonly Promise<unknown>[], check: (err: unknown) => boolean) => {
         const results = await Promise.allSettled(promises)
         for (const result of results) {
           assert.equal(result.status, 'rejected')
           assert.ok(check(result.reason))
         }
       }
-      const aborted = (reason) => (err) => {
+      const aborted = (reason: unknown) => (err: unknown) => {
         assert.ok(err instanceof ForumError)
         assert.equal(err.code, 'ABORTED')
         assert.equal(err.cause, reason)
@@ -336,6 +376,7 @@ function contract(name, setup) {
       assert.equal(reader.resolved, undefined)
 
       for (const signal of ['abort', {}, 1]) {
+        // @ts-expect-error -- deliberately invalid signals, rejected at run time
         await assertAllRejected(reads(reader, signal), forumError('INVALID_INPUT'))
       }
       const [topics, messages, gotTopic, gotMessage] = await Promise.all(reads(reader, new AbortController().signal))
@@ -365,15 +406,18 @@ function contract(name, setup) {
     test('a failed initial message reports the created topic', async (t) => {
       const forum = await open()
       setup.failAppends(t, 'message_posted')
-      let created
-      await assert.rejects(forum.createTopic({ title: 'Partial', author: 'a', body: 'lost' }), (err) => {
-        assert.ok(err instanceof ForumError)
-        assert.equal(err.code, 'PARTIAL_WRITE')
-        assert.equal(err.cause.code, 'WRITE_FAILED')
-        assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
-        created = err.topic
-        return true
-      })
+      let created!: Topic
+      await assert.rejects(
+        forum.createTopic({ title: 'Partial', author: 'a', body: 'lost' }),
+        rejection((err) => {
+          assert.ok(err instanceof ForumError)
+          assert.equal(err.code, 'PARTIAL_WRITE')
+          assert.equal(err.cause.code, 'WRITE_FAILED')
+          assert.match(err.message, new RegExp(`topic ${err.topic.id} was created`))
+          created = err.topic
+          return true
+        }),
+      )
       assert.deepEqual(await forum.getTopic(created.id), created)
       assert.deepEqual((await forum.listMessages()).items, [])
     })
@@ -405,7 +449,7 @@ describe('jsonl adapter through createForum', () => {
     const forum = createForum({ forumDir })
     const page = await forum.listTopics()
     assert.deepEqual(page.items, [topic])
-    const cursor = JSON.parse(Buffer.from(page.next_cursor, 'base64url').toString('utf8'))
+    const cursor: CursorData = JSON.parse(Buffer.from(page.next_cursor, 'base64url').toString('utf8'))
     assert.deepEqual(Object.keys(cursor), ['v', 'forum', 'offset'])
     assert.equal(cursor.offset, Buffer.byteLength(log))
     assert.deepEqual(await forum.getMessage('m1'), message)
@@ -421,30 +465,50 @@ describe('jsonl adapter through createForum', () => {
     const offset = (await fs.stat(path.join(forumDir, 'events.jsonl'))).size
     await fs.appendFile(path.join(forumDir, 'events.jsonl'), 'not json\n')
     const message = await forum.postMessage({ topicId: topic.id, author: 'a', body: 'b' }, quiet)
-    const warnings = []
-    const onWarning = (warning) => warnings.push(warning)
+    const warnings: string[] = []
+    const onWarning = (warning: string) => warnings.push(warning)
     assert.deepEqual(await forum.getMessage(message.id, { onWarning }), message)
     assert.equal(warnings.length, 1)
-    assert.match(warnings[0], new RegExp(`^skipping malformed record at byte offset ${offset}:`))
+    assert.match(warnings[0]!, new RegExp(`^skipping malformed record at byte offset ${offset}:`))
     await assert.rejects(forum.getMessage('missing', quiet), forumError('NOT_FOUND'))
   })
 })
 
 describe('client identity', () => {
+  // The adapter and the controls and records of switchingAdapter.
+  interface SwitchingState {
+    identity: string
+    fail: boolean
+    opened: (string | undefined)[]
+    appended: ForumEvent[]
+    adapter: ForumAdapter
+  }
+
   // An adapter whose forum identity the test controls; it leaves pin checks to the facade.
   function switchingAdapter() {
-    const state = { identity: 'A', fail: false, opened: [], appended: [] }
-    state.adapter = {
-      async open({ identity }) {
-        state.opened.push(identity)
-        if (state.fail) throw new ForumError('FORUM_UNAVAILABLE', 'unreachable')
-        return {
-          identity: state.identity,
-          async read() {
-            return 'cursor'
-          },
-          write: (options, fn) => fn({ read() {}, append: async (event) => state.appended.push(event) }),
-        }
+    const state: SwitchingState = {
+      identity: 'A',
+      fail: false,
+      opened: [],
+      appended: [],
+      adapter: {
+        async open({ identity }) {
+          state.opened.push(identity)
+          if (state.fail) throw new ForumError('FORUM_UNAVAILABLE', 'unreachable')
+          return {
+            identity: state.identity,
+            async read() {
+              return 'cursor'
+            },
+            write: (options, fn) =>
+              fn({
+                async read() {},
+                append: async (event) => {
+                  state.appended.push(event)
+                },
+              }),
+          }
+        },
       },
     }
     return state
@@ -489,7 +553,7 @@ describe('client identity', () => {
 
 describe('a custom adapter append that throws a non-Error', () => {
   // An adapter that appends a topic and then throws thrown, as a custom adapter may.
-  function throwingAdapter(thrown) {
+  function throwingAdapter(thrown: unknown): ForumAdapter {
     return {
       async open({ forumDir }) {
         return {
@@ -499,7 +563,7 @@ describe('a custom adapter append that throws a non-Error', () => {
           },
           write: (options, fn) =>
             fn({
-              read() {},
+              async read() {},
               async append(event) {
                 if (event.type === 'message_posted') throw thrown
               },
@@ -508,7 +572,7 @@ describe('a custom adapter append that throws a non-Error', () => {
       },
     }
   }
-  const createWith = (thrown) =>
+  const createWith = (thrown: unknown) =>
     createForum({ forumDir: '/forum', adapter: throwingAdapter(thrown) }).createTopic({ title: 'T', author: 'a', body: 'b' })
 
   // The partial write's message reads thrown.message as JavaScript does, so null and undefined fail
@@ -536,13 +600,16 @@ describe('a custom adapter append that throws a non-Error', () => {
     ['a number', 42, 'undefined'],
   ]) {
     test(`${name} is a partial write with its message`, async () => {
-      await assert.rejects(createWith(thrown), (err) => {
-        assert.ok(err instanceof ForumError)
-        assert.equal(err.code, 'PARTIAL_WRITE')
-        assert.equal(err.cause, thrown)
-        assert.equal(err.message, `topic ${err.topic.id} was created but its initial message was not appended: ${message}`)
-        return true
-      })
+      await assert.rejects(
+        createWith(thrown),
+        rejection((err) => {
+          assert.ok(err instanceof ForumError)
+          assert.equal(err.code, 'PARTIAL_WRITE')
+          assert.equal(err.cause, thrown)
+          assert.equal(err.message, `topic ${err.topic.id} was created but its initial message was not appended: ${message}`)
+          return true
+        }),
+      )
     })
   }
 })
@@ -551,9 +618,10 @@ describe('read cancellation', () => {
   // An adapter whose single event is read by a store that records its options and can abort the
   // caller's controller once it has visited the event.
   function recordingAdapter(onRead = () => {}) {
-    const seen = []
-    const event = { type: 'topic_created', data: { id: 't', title: 'T', created_by: 'a', created_at: 'z' } }
-    const adapter = {
+    const seen: (AbortSignal | undefined)[] = []
+    const event: ForumEvent = { type: 'topic_created', data: { id: 't', title: 'T', created_by: 'a', created_at: 'z' } }
+    const adapter: ForumAdapter = {
+      // @ts-expect-error -- a store without write: these tests only read
       async open() {
         return {
           identity: 'forum',

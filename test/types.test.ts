@@ -4,23 +4,55 @@
 // (npm ci).
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import type { ExecFileException } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { promisify } from 'node:util'
-import { ROOT, generatedInventory } from './checkout.js'
+import { ROOT, generatedInventory } from './checkout.ts'
 
 const exec = promisify(execFile)
 const require = createRequire(import.meta.url)
-let temp
-let consumer
+let temp: string
+let consumer: string
+
+// Compiler options as a tsconfig.json holds them.
+type CompilerOptions = Record<string, unknown>
+
+// One tsc run as execFile reports it. code is the exit status, or for a run that never started the
+// error code execFile gives instead (such as 'EPERM'). The reader's own tests also pass runs with a
+// missing or null code, which it must refuse.
+interface CompilerRun {
+  code: ExecFileException['code']
+  signal?: NodeJS.Signals | null
+  stdout?: string
+  stderr?: string
+}
+
+// One diagnostic tsc printed; file, line and column are null for one without a location.
+interface Diagnostic {
+  file: string | null
+  line: number | null
+  column: number | null
+  code: string
+  message: string
+  text: string
+}
+
+interface CompilerResult {
+  code: number
+  diagnostics: Diagnostic[]
+}
+
+// What execFile rejects with: a run that failed to start or exited nonzero, with what it printed.
+type ExecFailure = ExecFileException & { stdout?: string; stderr?: string }
 
 // The checkout's compiler options, minus its file selection and emit settings.
-async function compilerOptions(overrides) {
+async function compilerOptions(overrides: CompilerOptions): Promise<CompilerOptions> {
   const text = await fs.readFile(path.join(ROOT, 'tsconfig.json'), 'utf8')
-  const { compilerOptions: options } = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ''))
+  const { compilerOptions: options } = JSON.parse(text.replace(/^\s*\/\/.*$/gm, '')) as { compilerOptions: CompilerOptions }
   for (const key of ['rootDir', 'declaration', 'noEmitOnError', 'sourceMap', 'newLine']) delete options[key]
   return { ...options, noEmit: true, ...overrides }
 }
@@ -31,7 +63,7 @@ before(async () => {
     cwd: ROOT,
     env: { ...process.env, npm_config_cache: path.join(temp, 'npm-cache'), npm_config_update_notifier: 'false' },
   })
-  const [{ filename }] = JSON.parse(stdout)
+  const [{ filename }] = JSON.parse(stdout) as [{ filename: string }]
   consumer = path.join(temp, 'consumer')
   const modules = path.join(consumer, 'node_modules')
   await fs.mkdir(modules, { recursive: true })
@@ -53,20 +85,21 @@ after(async () => {
 // contradicts the output, or any other output) throws with the whole output, so a test cannot pass
 // on a compiler that did not check. Resolves to { code, diagnostics }, each diagnostic
 // { file, line, column, code, message, text }; file is null for a diagnostic without a location.
-function compilerResult({ code, signal = null, stdout = '', stderr = '' }) {
+function compilerResult({ code, signal = null, stdout = '', stderr = '' }: CompilerRun): CompilerResult {
   const output = `exit ${code}, signal ${signal}\n--- stdout\n${stdout}--- stderr\n${stderr}`
   if (signal !== null) throw new Error(`tsc was terminated by ${signal}\n${output}`)
-  if (!Number.isInteger(code)) throw new Error(`tsc did not run: ${code}\n${output}`)
+  if (typeof code !== 'number' || !Number.isInteger(code)) throw new Error(`tsc did not run: ${code}\n${output}`)
   if (stderr !== '') throw new Error(`tsc wrote to stderr\n${output}`)
-  const diagnostics = []
+  const diagnostics: Diagnostic[] = []
   for (const line of stdout.split('\n')) {
     if (line === '') continue
     const header = /^(?:(.+)\((\d+),(\d+)\): )?error (TS\d+): (.*)$/.exec(line)
     if (header) {
+      // The location's three groups match together or not at all; the code and message always match.
       const [, file = null, row, column, diagnostic, message] = header
-      diagnostics.push({ file, line: file && Number(row), column: file && Number(column), code: diagnostic, message, text: line })
+      diagnostics.push({ file, line: file === null ? null : Number(row), column: file === null ? null : Number(column), code: diagnostic!, message: message!, text: line })
     } else if (/^\s+\S/.test(line) && diagnostics.length > 0) {
-      const last = diagnostics.at(-1)
+      const last = diagnostics.at(-1)!
       last.message += `\n${line.trim()}`
       last.text += `\n${line}`
     } else {
@@ -80,12 +113,12 @@ function compilerResult({ code, signal = null, stdout = '', stderr = '' }) {
 }
 
 // Runs this checkout's tsc on a consumer project; resolves to compilerResult() of the run.
-async function tsc(project) {
+async function tsc(project: string): Promise<CompilerResult> {
   const manifest = require.resolve('typescript/package.json')
-  const bin = path.join(path.dirname(manifest), require(manifest).bin.tsc)
+  const bin = path.join(path.dirname(manifest), (require(manifest) as { bin: { tsc: string } }).bin.tsc)
   const run = await exec(process.execPath, [bin, '-p', project, '--pretty', 'false'], { cwd: consumer }).then(
-    (done) => ({ code: 0, signal: null, ...done }),
-    (err) => ({ code: err.code, signal: err.signal ?? null, stdout: err.stdout ?? '', stderr: err.stderr ?? '' }),
+    (done): CompilerRun => ({ code: 0, signal: null, ...done }),
+    (err: ExecFailure): CompilerRun => ({ code: err.code, signal: err.signal ?? null, stdout: err.stdout ?? '', stderr: err.stderr ?? '' }),
   )
   return compilerResult(run)
 }
@@ -93,7 +126,7 @@ async function tsc(project) {
 // The diagnostics Pi 1.1.0's own declarations report under NodeNext without skipLibCheck, which is
 // why tsconfig.json skips library checks. A path is matched from its last node_modules/ on.
 const GENAI = /^@google\/genai\/dist\/node\/node\.d\.ts$/
-const VENDOR_DIAGNOSTICS = [
+const VENDOR_DIAGNOSTICS: { file: RegExp; code: RegExp; message: RegExp }[] = [
   // pi-ai imports its model tables as JSON without a type attribute.
   {
     file: /^@earendil-works\/pi-ai\/dist\/providers\/[\w.-]+\.models\.d\.ts$/,
@@ -106,14 +139,14 @@ const VENDOR_DIAGNOSTICS = [
   { file: GENAI, code: /^TS(2304|2552)$/, message: /^Cannot find name '(RequestInfo|ErrorEvent|CloseEvent|HeadersInit)'\./ },
 ]
 
-function isVendorDiagnostic({ file, code, message }) {
+function isVendorDiagnostic({ file, code, message }: Pick<Diagnostic, 'file' | 'code' | 'message'>): boolean {
   const at = file?.lastIndexOf('node_modules/') ?? -1
-  if (at < 0) return false
+  if (file === null || at < 0) return false
   const vendored = file.slice(at + 'node_modules/'.length)
   return VENDOR_DIAGNOSTICS.some((known) => known.file.test(vendored) && known.code.test(code) && known.message.test(message))
 }
 
-async function writeProject(name, options, files) {
+async function writeProject(name: string, options: CompilerOptions, files: readonly string[]): Promise<string> {
   const project = path.join(consumer, name)
   await fs.writeFile(project, JSON.stringify({ compilerOptions: await compilerOptions(options), files }, null, 2))
   return project
@@ -145,7 +178,7 @@ test('the published declarations check cleanly without skipLibCheck', async () =
   const { generated } = await generatedInventory()
   const declarations = generated.filter((file) => file.endsWith('.d.ts')).map((file) => `node_modules/pi-forum/${file}`)
   const result = await tsc(await writeProject('tsconfig.lib.json', { skipLibCheck: false }, declarations))
-  const texts = (diagnostics) => diagnostics.map((diagnostic) => diagnostic.text)
+  const texts = (diagnostics: readonly Diagnostic[]) => diagnostics.map((diagnostic) => diagnostic.text)
   assert.deepEqual(texts(result.diagnostics.filter((diagnostic) => diagnostic.file?.startsWith('node_modules/pi-forum/'))), [])
   // The rest are exactly the known vendor errors. They also show that library files were checked; if
   // a Pi update fixes them, skipLibCheck can go.
@@ -172,16 +205,17 @@ test('a tsc exit status must agree with its diagnostics', () => {
 })
 
 test('output from tsc other than diagnostics fails, and is kept in the error', () => {
-  for (const run of [
+  const runs: CompilerRun[] = [
     { code: 0, stdout: 'Segmentation fault\n' },
     { code: 2, stdout: `${DIAGNOSTIC}\nFound 1 error.\n` },
     { code: 1, stdout: '  an indented line before any diagnostic\n' },
     { code: 0, stdout: '', stderr: 'warning: something\n' },
     { code: 2, stdout: `${DIAGNOSTIC}\n`, stderr: 'warning: something\n' },
-  ]) {
+  ]
+  for (const run of runs) {
     assert.throws(
       () => compilerResult(run),
-      (err) => err.message.includes(`--- stdout\n${run.stdout}--- stderr\n${run.stderr ?? ''}`),
+      (err: Error) => err.message.includes(`--- stdout\n${run.stdout}--- stderr\n${run.stderr ?? ''}`),
       JSON.stringify(run),
     )
   }
@@ -207,7 +241,8 @@ test('diagnostics are read with their location, code, continuation lines and glo
 })
 
 test('only the known vendor diagnostics are allowed in the declaration check', () => {
-  const diagnostic = (file, code, message) => compilerResult({ code: 2, stdout: `${file}(1,1): error ${code}: ${message}\n` }).diagnostics[0]
+  // One diagnostic line reads as exactly one diagnostic.
+  const diagnostic = (file: string, code: string, message: string) => compilerResult({ code: 2, stdout: `${file}(1,1): error ${code}: ${message}\n` }).diagnostics[0]!
   const vendor = '../../../repo/node_modules/'
   const json = `Importing a JSON file into an ECMAScript module requires a 'type: "json"' import attribute when 'module' is set to 'NodeNext'.`
   for (const allowed of [
