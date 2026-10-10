@@ -11,7 +11,7 @@ import { parse } from '@babel/parser'
 import type { ParserPlugin } from '@babel/parser'
 import type { CustomEntry, EntryRenderOptions } from '@earendil-works/pi-coding-agent'
 import type { Component } from '@earendil-works/pi-tui'
-import type { Message, Page, Topic } from '../src/types.d.mts'
+import type { Message, Page, SearchHit, Topic } from '../src/types.d.mts'
 import { ROOT, TYPE_ONLY, checkoutFiles, copyCheckout, listFiles, sidecarOf, snapshot, sourceInventory } from './checkout.ts'
 import type { Inventory, Snapshot } from './checkout.ts'
 
@@ -30,6 +30,13 @@ type Manifest = Record<string, unknown> & { scripts?: Record<string, string>; de
 
 // An entry renderer as the renderer test calls it, with only the entry fields it reads and no theme.
 type DrawEntry = (entry: Partial<CustomEntry>, options: EntryRenderOptions, theme: object) => Component | undefined
+
+// A failed execFile call, as far as these tests read it: its exit status and output.
+interface ExecFailure {
+  code: number
+  stdout: string
+  stderr: string
+}
 
 // What the CLI prints for topic create.
 interface CreatedTopic {
@@ -422,7 +429,9 @@ test('the tarball contains exactly the authored runtime sources, their declarati
   }
   assert.match(await fs.readFile(path.join(pkg, 'LICENSE'), 'utf8'), /^MIT License\n\nCopyright \(c\) \d{4} \S/)
   const runtime = [EXTENSION_ENTRY, 'extension/runtime.ts', 'extension/preferences.ts', 'extension/output.ts', 'extension/entry-renderer.ts', 'extension/types.ts']
-  for (const file of [...runtime, 'src/cli.mjs', 'src/forum.mjs', 'src/backends/jsonl.mjs', 'src/forum.d.mts', 'src/backends/jsonl.d.mts', 'src/types.d.mts']) {
+  const core = ['src/cli.mjs', 'src/forum.mjs', 'src/search-query.mjs', 'src/backends/jsonl.mjs']
+  const declarations = ['src/forum.d.mts', 'src/search-query.d.mts', 'src/backends/jsonl.d.mts', 'src/types.d.mts']
+  for (const file of [...runtime, ...core, ...declarations]) {
     assert.ok(files.includes(file), file)
   }
 })
@@ -621,7 +630,7 @@ test('the packaged manifest keeps its entry points, peers and install contract',
 test('the packaged text output and session entry renderer load from the tarball', async () => {
   const load = (file: string) => import(pathToFileURL(path.join(pkg, 'extension', file)).href)
   const { ENTRY_TYPE, createEntryRenderer, entryData }: typeof import('../extension/entry-renderer.ts') = await load('entry-renderer.ts')
-  const { LIST_PAGE_SIZE, formatTopicList }: typeof import('../extension/output.ts') = await load('output.ts')
+  const { LIST_PAGE_SIZE, formatSearchResults, formatTopicList, textCommand }: typeof import('../extension/output.ts') = await load('output.ts')
   assert.equal(ENTRY_TYPE, 'pi-forum.output')
   assert.deepEqual(entryData('text'), { text: 'text' })
   assert.equal(LIST_PAGE_SIZE, 20)
@@ -630,6 +639,13 @@ test('the packaged text output and session entry renderer load from the tarball'
     page: { items: [{ id: 't1', title: 'Plan', created_by: 'ralph', created_at: '2026-01-01T00:00:00.000Z' }], next_cursor: 'c1' },
   })
   assert.equal(text.split('\n').at(-1), 'You are caught up.')
+  const found = formatSearchResults({
+    target: { forumDir: '/forum', generated: false, status: 'on' },
+    query: '"release plan" OR (kickoff AND NOT x)',
+    page: { items: [{ type: 'message', message: { id: 'm1', topic_id: 't1', author: 'ralph', body: 'Kickoff', created_at: '2026-01-01T00:00:00.000Z' } }], next_cursor: 'c1' },
+  })
+  assert.deepEqual(found.split('\n').slice(3), ['Query: "release plan" OR (kickoff AND NOT x)', '', '1. Message by ralph · 2026-01-01T00:00:00.000Z', '   Message m1 · topic t1', '   Kickoff', '', 'You are caught up.'])
+  assert.equal(textCommand({ kind: 'search', query: '-x "a  b"', after: 'c1' }), '/forum search --after c1 -- -x "a  b"')
   class Text {
     constructor(shown: string, paddingX: number, paddingY: number) {
       Object.assign(this, { shown, paddingX, paddingY })
@@ -691,7 +707,18 @@ test('the packaged executable runs by direct path, through PATH and through a sy
 
   const viaLink = await exec('pi-forum', ['message', 'list', '--topic', topic.id], options([links]))
   assert.deepEqual((JSON.parse(viaLink.stdout) as Page<Message>).items.map((m) => m.body), ['hi', 'via PATH'])
-  for (const result of [help, created, viaPath, viaLink]) assert.equal(result.stderr, '')
+  // A search, its query one argument: a phrase and a group, matching a topic title and a message body.
+  const searched = await exec('pi-forum', ['search', '"via PATH" OR (packaged AND NOT hi)', '--limit', '5'], options([links]))
+  const hits = (JSON.parse(searched.stdout) as Page<SearchHit>).items
+  assert.deepEqual(hits.map((hit) => (hit.type === 'topic' ? ['topic', hit.topic.title] : ['message', hit.message.body])), [['topic', 'Packaged'], ['message', 'via PATH']])
+  assert.match(help.stdout, /\n {2}pi-forum search QUERY \[--after CURSOR\] \[--limit N\]\n/)
+  for (const result of [help, created, viaPath, viaLink, searched]) assert.equal(result.stderr, '')
+  // A malformed query fails with its offset and prints nothing.
+  const failed = await exec(path.join(pkg, 'bin', 'pi-forum'), ['search', 'a AND'], options([])).then(
+    () => assert.fail('a malformed query succeeded'),
+    (err: ExecFailure) => err,
+  )
+  assert.deepEqual([failed.code, failed.stdout, failed.stderr], [1, '', 'pi-forum: error: search query expects a term, phrase or group at offset 5\n'])
 })
 
 // Runs an installed pi-forum executable once, with Node's type stripping off: creates a topic in a new
@@ -703,6 +730,8 @@ async function runInstalled(bin: string, label: string): Promise<void> {
   assert.equal(created.stderr, '')
   const listed = await exec(bin, ['topic', 'list'], { cwd: temp, env })
   assert.deepEqual((JSON.parse(listed.stdout) as Page<Topic>).items.map((t) => [t.title, t.created_by]), [[label, label]])
+  const searched = await exec(bin, ['search', `"${label}" OR installed`], { cwd: temp, env })
+  assert.deepEqual((JSON.parse(searched.stdout) as Page<SearchHit>).items.map((hit) => hit.type), ['topic', 'message'])
 }
 
 // Imports an installed copy's core with plain Node and writes and reads a forum through it.
@@ -712,6 +741,11 @@ async function useInstalledCore(dir: string, label: string): Promise<void> {
   const forumDir = path.join(temp, `core-${label}`)
   const { topic } = await createForum({ forumDir }).createTopic({ title: label, author: label })
   assert.deepEqual((await listTopics(forumDir)).items, [topic])
+  // Search through the installed API and its query compiler.
+  const { compileSearchQuery, MAX_QUERY_BYTES }: typeof import('../src/search-query.mjs') = await import(pathToFileURL(path.join(dir, 'src', 'search-query.mjs')).href)
+  assert.equal(MAX_QUERY_BYTES, 4096)
+  assert.equal(compileSearchQuery(`"${label}" AND NOT x`)(label), true)
+  assert.deepEqual((await createForum({ forumDir }).search(`"${label}"`)).items, [{ type: 'topic', topic }])
 }
 
 // As Pi installs an npm source: npm install <spec> --prefix <root> --legacy-peer-deps into a root

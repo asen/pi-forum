@@ -33,7 +33,7 @@ export default function piForum(pi: ForumExtensionAPI): void {
     description:
       'Turn the pi-forum binding for this session on or off, save or reset whether new sessions start with it for this project or user ' +
       '(project on shares .pi/forum; user on only enables by default), ' +
-      'show its status, read its topics and messages as text, or browse them with /forum ui',
+      'show its status, read or search its topics and messages as text, or browse them with /forum ui',
     getArgumentCompletions: forumCompletions,
     handler: async (args, ctx) => runtime.command(args, ctx),
   })

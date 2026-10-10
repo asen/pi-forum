@@ -18,6 +18,7 @@ import type {
   ListMessagesOptions,
   Message,
   Page,
+  SearchHit,
   Topic,
 } from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
@@ -40,6 +41,9 @@ interface Rejection extends ForumError {
   topic: Topic
 }
 const rejection = (check: (err: Rejection) => boolean) => (thrown: unknown) => check(thrown as Rejection)
+
+const topicHit = (topic: Topic): SearchHit => ({ type: 'topic', topic })
+const messageHit = (message: Message): SearchHit => ({ type: 'message', message })
 
 // How the contract creates forums of one adapter and makes its appends fail.
 interface Setup {
@@ -230,6 +234,8 @@ function contract(name: string, setup: Setup) {
           await assert.rejects(forum.listTopics({ limit }), forumError('INVALID_INPUT'), String(limit))
           // @ts-expect-error -- deliberately invalid limits, rejected at run time
           await assert.rejects(forum.listMessages({ limit }), forumError('INVALID_INPUT'), String(limit))
+          // @ts-expect-error -- deliberately invalid limits, rejected at run time
+          await assert.rejects(forum.search('T', { limit }), forumError('INVALID_INPUT'), String(limit))
         }
         await assert.rejects(forum.listMessages({ topicId: ' ' }), forumError('INVALID_INPUT'))
         for (const after of ['', 42, {}, 'not a cursor!', 'abc']) {
@@ -237,6 +243,8 @@ function contract(name: string, setup: Setup) {
           await assert.rejects(forum.listTopics({ after }), forumError('INVALID_CURSOR'), String(after))
           // @ts-expect-error -- deliberately invalid cursors, rejected at run time
           await assert.rejects(forum.listMessages({ after }), forumError('INVALID_CURSOR'), String(after))
+          // @ts-expect-error -- deliberately invalid cursors, rejected at run time
+          await assert.rejects(forum.search('T', { after }), forumError('INVALID_CURSOR'), String(after))
         }
       })
       for (const forumDir of ['relative/forum', '', undefined, 42]) {
@@ -255,6 +263,10 @@ function contract(name: string, setup: Setup) {
       assert.equal((await forum.listTopics({ limit: 1 })).items.length, 1)
       assert.equal((await forum.listMessages({ limit: 100 })).items.length, 100)
       assert.equal((await forum.listMessages({ limit: null })).items.length, 50)
+      assert.equal((await forum.search('NOT absent')).items.length, 20)
+      assert.equal((await forum.search('NOT absent', { limit: 1 })).items.length, 1)
+      assert.equal((await forum.search('NOT absent', { limit: 100 })).items.length, 100)
+      assert.equal((await forum.search('NOT absent', { limit: null })).items.length, 20)
     })
 
     test('paginates in append order and picks up later appends', async () => {
@@ -301,6 +313,7 @@ function contract(name: string, setup: Setup) {
       await b.createTopic({ title: 'B', author: 'a' })
       const { next_cursor } = await a.listTopics({ limit: 1 })
       await assert.rejects(b.listTopics({ after: next_cursor }), forumError('INVALID_CURSOR'))
+      await assert.rejects(b.search('A OR B', { after: next_cursor }), forumError('INVALID_CURSOR'))
       assert.deepEqual((await a.listTopics({ after: next_cursor })).items, [])
     })
 
@@ -312,6 +325,7 @@ function contract(name: string, setup: Setup) {
       await assert.rejects(forum.listMessages(), unavailable)
       await assert.rejects(forum.getTopic('t'), unavailable)
       await assert.rejects(forum.getMessage('m'), unavailable)
+      await assert.rejects(forum.search('t'), unavailable)
       assert.equal(await setup.exists(forumDir), false)
 
       const creating = createForum({ forumDir, adapter: setup.adapter, createOnRead: true })
@@ -320,7 +334,16 @@ function contract(name: string, setup: Setup) {
       assert.equal(await setup.exists(forumDir), true)
       // An existing empty forum is readable without createOnRead.
       assert.deepEqual((await forum.listMessages({ after: empty.next_cursor })).items, [])
+      assert.deepEqual((await forum.search('NOT t', { after: empty.next_cursor })).items, [])
       await assert.rejects(forum.getTopic('t'), forumError('NOT_FOUND'))
+
+      // A search creates an absent forum only when asked to, as the other reads do.
+      const searchDir = await setup.forumDir()
+      await assert.rejects(createForum({ forumDir: searchDir, adapter: setup.adapter }).search('t'), unavailable)
+      assert.equal(await setup.exists(searchDir), false)
+      const searching = createForum({ forumDir: searchDir, adapter: setup.adapter, createOnRead: true })
+      assert.deepEqual((await searching.search('t')).items, [])
+      assert.equal(await setup.exists(searchDir), true)
     })
 
     test('a client reports its directory and pins the forum on first successful access', async () => {
@@ -335,6 +358,11 @@ function contract(name: string, setup: Setup) {
       const { resolved } = forum
       await forum.listTopics()
       assert.equal(forum.resolved, resolved)
+
+      // A search is an access like any other read.
+      const searcher = createForum({ forumDir, adapter: setup.adapter })
+      await searcher.search('T')
+      assert.equal(searcher.resolved, resolved)
     })
 
     test('aborted reads report ABORTED and return nothing', async () => {
@@ -346,6 +374,7 @@ function contract(name: string, setup: Setup) {
           forum.listMessages({ topicId: topic.id, signal }),
           forum.getTopic(topic.id, { signal }),
           forum.getMessage(message!.id, { signal }),
+          forum.search('T OR b', { signal }),
         ] as const
       // Settles all the reads together, so none rejects before a handler is attached, and checks
       // that each was rejected as expected.
@@ -379,11 +408,205 @@ function contract(name: string, setup: Setup) {
         // @ts-expect-error -- deliberately invalid signals, rejected at run time
         await assertAllRejected(reads(reader, signal), forumError('INVALID_INPUT'))
       }
-      const [topics, messages, gotTopic, gotMessage] = await Promise.all(reads(reader, new AbortController().signal))
+      const [topics, messages, gotTopic, gotMessage, hits] = await Promise.all(reads(reader, new AbortController().signal))
       assert.deepEqual(topics.items, [topic])
       assert.deepEqual(messages.items, [message])
       assert.deepEqual(gotTopic, topic)
       assert.deepEqual(gotMessage, message)
+      assert.deepEqual(hits.items, [topicHit(topic), messageHit(message!)])
+    })
+
+    // Records whose titles, bodies, authors, IDs and session IDs overlap, in append order.
+    async function searchForum() {
+      const forum = await open()
+      const { topic: flaky, message: report } = await forum.createTopic({
+        title: 'Flaky tests in CI',
+        author: 'alice',
+        body: 'The runner times out',
+        originSessionId: 'sess-deploy',
+      })
+      const { topic: deploy } = await forum.createTopic({ title: 'Deploy', author: 'flaky-bot', originSessionId: 'sess-flaky' })
+      const repeated = await forum.postMessage({ topicId: deploy.id, author: 'bob', body: 'Flaky again: FLAKY tests, flaky deploy' })
+      const quoted = await forum.postMessage({
+        topicId: flaky.id,
+        author: 'carol',
+        body: 'Saw "timeout (x2)" in C:\\ci\\path\nthen retry',
+        replyTo: report!.id,
+        originSessionId: 'sess-flaky',
+      })
+      return { forum, flaky, report: report!, deploy, repeated, quoted }
+    }
+
+    test('search matches each topic title and message body on its own', async () => {
+      const { forum, flaky, report, deploy, repeated, quoted } = await searchForum()
+      const search = async (query: string) => (await forum.search(query)).items
+
+      // Each matching record is listed once, as its full record, in append order.
+      const hits = await search('flaky')
+      assert.deepEqual(hits, [topicHit(flaky), messageHit(repeated)])
+      assert.deepEqual(hits.map((hit) => Object.keys(hit)), [['type', 'topic'], ['type', 'message']])
+      assert.deepEqual(hits[0], topicHit(await forum.getTopic(flaky.id)))
+      assert.deepEqual(hits[1], messageHit(await forum.getMessage(repeated.id)))
+      assert.deepEqual(await search('FLAKY Tests'), [topicHit(flaky), messageHit(repeated)])
+      assert.deepEqual(await search('flaky OR runner OR deploy'), [
+        topicHit(flaky),
+        messageHit(report),
+        topicHit(deploy),
+        messageHit(repeated),
+      ])
+
+      // Terms must match within one record: a topic's title and its messages are not joined.
+      assert.deepEqual(await search('flaky AND runner'), [])
+      assert.deepEqual(await search('ci times'), [])
+
+      // Phrases and literal punctuation, against the stored text.
+      assert.deepEqual(await search('"timeout (x2)"'), [messageHit(quoted)])
+      assert.deepEqual(await search('"\\"timeout"'), [messageHit(quoted)])
+      assert.deepEqual(await search('C:\\ci\\path'), [messageHit(quoted)])
+      assert.deepEqual(await search('"path\nthen"'), [messageHit(quoted)])
+      assert.deepEqual(await search('"timeout x2"'), [])
+
+      // Authors, IDs, references, session IDs, timestamps and event types are never matched.
+      for (const query of [
+        'alice',
+        'bob',
+        'sess',
+        flaky.id,
+        report.id,
+        deploy.id,
+        flaky.created_at.slice(0, 10),
+        'topic_created',
+        'message_posted',
+        'reply_to',
+        'title',
+        'body',
+      ]) {
+        assert.deepEqual(await search(query), [], query)
+      }
+    })
+
+    test('search exclusions and negative-only queries match individual records', async () => {
+      const { forum, flaky, report, deploy, repeated, quoted } = await searchForum()
+      const search = async (query: string) => (await forum.search(query)).items
+      assert.deepEqual(await search('flaky NOT deploy'), [topicHit(flaky)])
+      assert.deepEqual(await search('flaky AND NOT tests'), [])
+      // The deploy topic's author and session ID name flaky, but its title does not.
+      assert.deepEqual(await search('NOT flaky'), [messageHit(report), topicHit(deploy), messageHit(quoted)])
+      assert.deepEqual(await search('NOT (flaky OR timeout)'), [messageHit(report), topicHit(deploy)])
+      assert.deepEqual(await search('NOT NOT flaky'), await search('flaky'))
+      assert.deepEqual(await search('NOT absent'), [
+        topicHit(flaky),
+        messageHit(report),
+        topicHit(deploy),
+        messageHit(repeated),
+        messageHit(quoted),
+      ])
+      assert.deepEqual(await search('NOT e'), [])
+    })
+
+    test('search pages through hits and resumes from its scan position', async () => {
+      const forum = await open()
+      const records: SearchHit[] = []
+      const topics: Topic[] = []
+      for (let i = 0; i < 4; i++) {
+        const { topic, message } = await forum.createTopic({ title: `needle ${i}`, author: 'a', body: i % 2 ? `needle body ${i}` : 'hay' })
+        topics.push(topic)
+        records.push(topicHit(topic), messageHit(message!))
+      }
+      records.push(messageHit(await forum.postMessage({ topicId: topics[0]!.id, author: 'a', body: 'hay' })))
+      const text = (hit: SearchHit) => (hit.type === 'topic' ? hit.topic.title : hit.message.body)
+      const needles = records.filter((hit) => text(hit).includes('needle'))
+      const hays = records.filter((hit) => text(hit) === 'hay')
+      assert.equal(needles.length, 6)
+
+      for (const limit of [1, 2, 5, 6, 100]) {
+        const all = await readAll((options) => forum.search('needle', options), { limit })
+        assert.deepEqual(all.items, needles, `limit ${limit}`)
+      }
+      // A full page may be the last one: the next page is empty.
+      const full = await forum.search('needle', { limit: 6 })
+      assert.deepEqual(full.items, needles)
+      assert.deepEqual((await forum.search('needle', { after: full.next_cursor })).items, [])
+
+      // The cursor is a position after every record the page read, matching or not, and is not bound
+      // to its query: another query resumes there, and omitting after starts over.
+      const first = await forum.search('needle', { limit: 2 })
+      assert.deepEqual(first.items, needles.slice(0, 2))
+      assert.deepEqual((await forum.search('hay', { after: first.next_cursor })).items, hays.slice(1))
+      assert.deepEqual((await forum.search('hay')).items, hays)
+      const third = await forum.search('"needle 3"', { limit: 1 })
+      assert.deepEqual((await forum.search('NOT absent', { after: third.next_cursor })).items, records.slice(-2))
+
+      // A list's cursor is the same kind of position: this one is after the second topic.
+      const listed = await forum.listTopics({ limit: 2 })
+      assert.deepEqual(listed.items, topics.slice(0, 2))
+      assert.deepEqual((await forum.search('needle', { after: listed.next_cursor })).items, needles.slice(2))
+
+      // An empty page still returns a cursor that finds later appends.
+      const empty = await forum.search('later')
+      assert.deepEqual(empty.items, [])
+      assert.equal(typeof empty.next_cursor, 'string')
+      const { topic: laterTopic, message: laterMessage } = await forum.createTopic({ title: 'later', author: 'a', body: 'later' })
+      await forum.postMessage({ topicId: laterTopic.id, author: 'a', body: 'hay' })
+      assert.deepEqual((await forum.search('later', { after: empty.next_cursor })).items, [
+        topicHit(laterTopic),
+        messageHit(laterMessage!),
+      ])
+      assert.deepEqual((await forum.search('NOT later', { after: empty.next_cursor })).items.map(text), ['hay'])
+    })
+
+    test('an invalid search touches no storage', async () => {
+      const forumDir = await setup.forumDir()
+      let opened = 0
+      const adapter: ForumAdapter = {
+        open(options) {
+          opened++
+          return setup.adapter.open(options)
+        },
+      }
+      const forum = createForum({ forumDir, adapter, createOnRead: true })
+      for (const query of [
+        '',
+        ' \n\t',
+        'a AND',
+        'OR a',
+        'NOT',
+        '(a',
+        'a)',
+        '()',
+        '""',
+        '"open',
+        'x'.repeat(4097),
+        `${'(('.repeat(9)}a${'))'.repeat(9)}`,
+        'a\uD800',
+        42,
+        null,
+        undefined,
+      ]) {
+        // @ts-expect-error -- deliberately invalid queries, rejected at run time
+        await assert.rejects(forum.search(query), forumError('INVALID_INPUT'), String(query).slice(0, 40))
+      }
+      // An invalid query is reported before anything else is checked.
+      const aborted = new AbortController()
+      aborted.abort()
+      // @ts-expect-error -- deliberately invalid options, rejected at run time
+      await assert.rejects(forum.search('(', { limit: 0, after: 42, signal: aborted.signal }), {
+        code: 'INVALID_INPUT',
+        message: /^search query /,
+      })
+      // Invalid options and an aborted signal are reported before storage is opened, too.
+      await assert.rejects(forum.search('a', { limit: 0 }), forumError('INVALID_INPUT'))
+      await assert.rejects(forum.search('a', { after: '' }), forumError('INVALID_CURSOR'))
+      // @ts-expect-error -- a deliberately invalid signal, rejected at run time
+      await assert.rejects(forum.search('a', { signal: {} }), forumError('INVALID_INPUT'))
+      await assert.rejects(forum.search('a', { signal: aborted.signal }), forumError('ABORTED'))
+      assert.equal(opened, 0)
+      assert.equal(await setup.exists(forumDir), false)
+      assert.equal(forum.resolved, undefined)
+
+      assert.deepEqual((await forum.search('a')).items, [])
+      assert.equal(opened, 1)
+      assert.equal(await setup.exists(forumDir), true)
     })
 
     test('writes create an absent forum', async () => {
@@ -525,6 +748,15 @@ describe('client identity', () => {
     await forum.listTopics()
     assert.equal(forum.resolved, 'B')
     assert.deepEqual(state.opened, [undefined, undefined])
+
+    const searcher = createForum({ forumDir: '/forum', adapter: state.adapter })
+    state.fail = true
+    await assert.rejects(searcher.search('t'), forumError('FORUM_UNAVAILABLE'))
+    assert.equal(searcher.resolved, undefined)
+    state.fail = false
+    state.identity = 'C'
+    assert.deepEqual(await searcher.search('t'), { items: [], next_cursor: 'cursor' })
+    assert.equal(searcher.resolved, 'C')
   })
 
   test('a pinned client refuses another forum, and a new client accepts it', async () => {
@@ -538,6 +770,7 @@ describe('client identity', () => {
     await assert.rejects(forum.listMessages(), moved)
     await assert.rejects(forum.getTopic('t'), moved)
     await assert.rejects(forum.getMessage('m'), moved)
+    await assert.rejects(forum.search('t'), moved)
     await assert.rejects(forum.createTopic({ title: 'T', author: 'a' }), moved)
     await assert.rejects(forum.postMessage({ topicId: 't', author: 'a', body: 'b' }), moved)
     assert.deepEqual(state.appended, [])
@@ -645,8 +878,10 @@ describe('read cancellation', () => {
     await forum.listMessages({ signal })
     await forum.getTopic('t', { signal })
     await assert.rejects(forum.getMessage('m', { signal }), forumError('NOT_FOUND'))
+    await forum.search('T', { signal })
     await forum.listTopics()
-    assert.deepEqual(seen, [signal, signal, signal, signal, undefined])
+    await forum.search('T')
+    assert.deepEqual(seen, [signal, signal, signal, signal, signal, undefined, undefined])
   })
 
   test('an abort while the store reads discards its complete result', async () => {
@@ -661,5 +896,10 @@ describe('read cancellation', () => {
       createForum({ forumDir: '/forum', adapter: other }).getTopic('t', { signal: again.signal }),
       forumError('ABORTED'),
     )
+    const searching = new AbortController()
+    const { adapter: third } = recordingAdapter(() => searching.abort())
+    const searcher = createForum({ forumDir: '/forum', adapter: third })
+    await assert.rejects(searcher.search('T', { signal: searching.signal }), forumError('ABORTED'))
+    assert.equal(searcher.resolved, undefined)
   })
 })

@@ -11,17 +11,18 @@ import { createBrowser, type BrowserForum } from 'pi-forum/extension/browser-sta
 import { createBrowserOpener, type BrowserTui } from 'pi-forum/extension/browser.ts'
 import { createEntryRenderer, ENTRY_TYPE, entryData } from 'pi-forum/extension/entry-renderer.ts'
 import piForum from 'pi-forum/extension/forum.ts'
-import { formatTopicList, textCommand } from 'pi-forum/extension/output.ts'
+import { formatSearchResults, formatTopicList, textCommand } from 'pi-forum/extension/output.ts'
 import { createPreferenceStore } from 'pi-forum/extension/preferences.ts'
 import { createForumRuntime } from 'pi-forum/extension/runtime.ts'
-import type { ForumTarget, ForumView, PromptEvent, RuntimeContext } from 'pi-forum/extension/types.ts'
+import type { ForumTarget, ForumView, PromptEvent, RuntimeContext, SearchView, TextView } from 'pi-forum/extension/types.ts'
 import { jsonlAdapter } from 'pi-forum/src/backends/jsonl.mjs'
 import { main, type Environment, type ForumFactory, type MainOptions, type OutputWriter } from 'pi-forum/src/cli.mjs'
 import { decodeCursor, encodeCursor, type CursorData } from 'pi-forum/src/cursor.mjs'
 import { createForum, ForumError } from 'pi-forum/src/forum.mjs'
 import { canonicalEvent, checkId, MAX_BODY_BYTES, MAX_LABEL_CHARS, newTopic, topicInput, type TopicFields, type Unchecked } from 'pi-forum/src/records.mjs'
+import { compileSearchQuery, MAX_QUERY_BYTES, type SearchPredicate } from 'pi-forum/src/search-query.mjs'
 import * as storage from 'pi-forum/src/storage.mjs'
-import type { CreateTopicInput, Forum, ForumAdapter, ForumErrorCode, ForumEvent, ForumStore, Message, Page, Topic } from 'pi-forum/src/types.d.mts'
+import type { CreateTopicInput, Forum, ForumAdapter, ForumErrorCode, ForumEvent, ForumStore, Message, Page, SearchHit, Topic } from 'pi-forum/src/types.d.mts'
 
 // Pi: the extension is a factory Pi can load, and Pi's own objects fit what pi-forum asks for.
 export const factory: ExtensionFactory = piForum
@@ -74,6 +75,44 @@ export async function useForum(signal: AbortSignal): Promise<Message> {
   void unchecked
   return forum.postMessage({ topicId: topic.id, author: 'agent', body: 'Reply', replyTo: message?.id })
 }
+
+// Search: pages of hits, each a topic or a message narrowed by type.
+export async function search(forum: Forum, signal: AbortSignal): Promise<string[]> {
+  const hits: Page<SearchHit> = await forum.search('plan AND NOT "draft notes"', { limit: 20, signal, onWarning: () => {} })
+  const next: Page<SearchHit> = await forum.search('plan', { after: hits.next_cursor, limit: null })
+  // @ts-expect-error: the query is a string
+  await forum.search({ query: 'plan' })
+  // @ts-expect-error: a search takes list options, without a topic filter
+  await forum.search('plan', { topicId: 't' })
+  // @ts-expect-error: hits are not plain records
+  const records: Page<Topic | Message> = next
+  void records
+  return [...hits.items, ...next.items].map((hit) => {
+    if (hit.type === 'topic') {
+      const found: Topic = hit.topic
+      // @ts-expect-error: a topic hit has no message
+      void hit.message
+      return found.title
+    }
+    const found: Message = hit.message
+    // @ts-expect-error: a message hit has no topic
+    void hit.topic
+    return found.body
+  })
+}
+const messageValue: Message = { id: 'm', topic_id: 't', author: 'agent', body: 'Notes', created_at: '2026-01-01T00:00:00.000Z' }
+export const hits: SearchHit[] = [{ type: 'message', message: messageValue }]
+// @ts-expect-error: a topic hit carries a topic
+hits.push({ type: 'topic', topic: messageValue })
+// @ts-expect-error: a message hit carries its record as message
+hits.push({ type: 'message', topic: messageValue })
+
+// The query compiler behind search: a predicate over one record's text.
+export const matches: SearchPredicate = compileSearchQuery('plan OR "draft notes"')
+export const matched: boolean = matches('Plan')
+export const queryBytes: 4096 = MAX_QUERY_BYTES
+// @ts-expect-error: the predicate takes the text, not a record
+matches(messageValue)
 
 export function errorCode(err: unknown): ForumErrorCode | null {
   if (!(err instanceof ForumError)) return null
@@ -147,10 +186,23 @@ export const command: string | null = textCommand({ kind: 'read', messageId: 'm'
 textCommand({ kind: 'read' })
 // @ts-expect-error: the topic list has no topic
 views.push({ kind: 'topics', topicId: 't' })
+// @ts-expect-error: a search is read only as text, never in the browser
+views.push({ kind: 'search', query: 'plan' })
+// Text reads take the browser's views and searches, whose query is kept as typed.
+export const searchView: SearchView = { kind: 'search', query: '"draft notes" OR plan', after: 'c' }
+export const textViews: TextView[] = [...views, searchView]
+export const searchCommand: string | null = textCommand(searchView)
+// @ts-expect-error: a search has a query
+textCommand({ kind: 'search' })
+// @ts-expect-error: a search has no topic
+export const topicSearch: SearchView = { kind: 'search', query: 'plan', topicId: 't' }
 export const target: ForumTarget = { forumDir: '/abs/forum', generated: false, status: 'on' }
 // @ts-expect-error: only a generated directory is a project pin
 export const pinned: ForumTarget = { forumDir: '/abs/forum', generated: false, project: true, status: 'on' }
 export const listing: string = formatTopicList({ target, page: { items: [topicValue], next_cursor: 'c' } })
+export const searched: string = formatSearchResults({ target, query: 'plan', page: { items: [{ type: 'topic', topic: topicValue }], next_cursor: 'c' } })
+// @ts-expect-error: search results are hits, not plain records
+formatSearchResults({ target, query: 'plan', page: { items: [topicValue], next_cursor: 'c' } })
 export function browse(forum: Forum): void {
   const reader: BrowserForum = forum
   createBrowser({ forum: reader, target, view: { kind: 'messages', topicId: 't' } })

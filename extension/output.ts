@@ -1,6 +1,6 @@
 // Forum text for people: the sanitizing helpers the terminal browser shares, and plain-text
-// formatters for the results of src/forum.mjs reads (a listTopics or listMessages page, or one
-// getMessage record). Forum text is peer data: control characters and bidirectional formatting are
+// formatters for the results of src/forum.mjs reads (a listTopics, listMessages or search page, or
+// one getMessage record). Forum text is peer data: control characters and bidirectional formatting are
 // shown as visible symbols, Markdown stays literal, and nothing is styled, so the text means the same
 // wherever it is shown and no terminal escape is ever interpreted.
 //
@@ -10,15 +10,16 @@
 // { items, omitted } when the caller kept only the first items and counted the rest. The requests
 // and views are typed in types.ts.
 
-import type { Message, Page, Topic } from '../src/types.d.mts'
 import type {
   ForumBinding,
   ForumTarget,
-  ForumView,
   ListView,
   MessageListRequest,
   MessageRequest,
   ReadWarnings,
+  SearchResultsRequest,
+  SearchView,
+  TextView,
   TopicListRequest,
   VisibleWidth,
   WarningSummary,
@@ -99,7 +100,7 @@ export function formatTopicList({ target, page, after, warnings = [] }: TopicLis
     lines.push(printable(`${i + 1}. ${topic.title}`))
     lines.push(printable(`   Topic ${topic.id} · by ${topic.created_by} · ${topic.created_at}`))
   })
-  lines.push(...damaged(warnings), '', paging(page, { kind: 'topics' }))
+  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'topics' }))
   return lines.join('\n')
 }
 
@@ -114,7 +115,29 @@ export function formatMessageList({ target, topicId, page, after, warnings = [] 
     lines.push(printable(`   Message ${message.id} · topic ${message.topic_id}${reply}`))
     lines.push(`   ${excerpt(message.body)}`)
   })
-  lines.push(...damaged(warnings), '', paging(page, { kind: 'messages', topicId }))
+  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'messages', topicId }))
+  return lines.join('\n')
+}
+
+// One page of search hits for query, as typed: each a topic, by its title, or a message, by an
+// excerpt of its body, in the order the forum returned them.
+export function formatSearchResults({ target, query, page, after, warnings = [] }: SearchResultsRequest): string {
+  const lines = [heading('Forum search', after), formatTarget(target), printable(`Query: ${query}`), '']
+  if (page.items.length === 0) lines.push(after ? 'No newer matches.' : 'No matches.')
+  page.items.forEach((hit, i) => {
+    if (hit.type === 'topic') {
+      const { topic } = hit
+      lines.push(printable(`${i + 1}. Topic: ${topic.title}`))
+      lines.push(printable(`   Topic ${topic.id} · by ${topic.created_by} · ${topic.created_at}`))
+    } else {
+      const { message } = hit
+      const reply = message.reply_to ? ` · reply to ${message.reply_to}` : ''
+      lines.push(printable(`${i + 1}. Message by ${message.author} · ${message.created_at}`))
+      lines.push(printable(`   Message ${message.id} · topic ${message.topic_id}${reply}`))
+      lines.push(`   ${excerpt(message.body)}`)
+    }
+  })
+  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'search', query }))
   return lines.join('\n')
 }
 
@@ -147,27 +170,38 @@ function damaged(warnings: ReadWarnings): string[] {
   return [printable(`${count} damaged record(s) skipped${items.length ? `; first: ${items[0]}` : ''}`)]
 }
 
-// A full page may have more after it; only its returned cursor continues. A shorter page is the end.
-function paging(page: Page<Topic> | Page<Message>, view: ListView): string {
-  const count = page.items.length
+// A full page of count items may have more after it; only its returned cursor continues. A shorter
+// page is the end.
+function paging(count: number, cursor: string, view: ListView | SearchView): string {
   if (count < LIST_PAGE_SIZE) return 'You are caught up.'
-  const cursor = page.next_cursor
   const command = cursor && textCommand({ ...view, after: cursor })
   if (command) return `${count} shown; there may be more. Next page: ${command}`
   return printable(`${count} shown; there may be more${cursor ? ` after cursor ${cursor}` : ''}.`)
 }
 
-// The /forum command that reads view ({ kind: 'topics' | 'messages' | 'read', topicId?, messageId?,
-// after? }) as text, or null when an argument would not survive being typed back as one word: empty,
-// with whitespace, or with characters printable() would replace. Options come first; an ID starting
-// with "-" follows a "--" that ends them, and a cursor starting with "-" is written --after=CURSOR.
-export function textCommand({ kind, topicId, messageId, after }: ForumView): string | null {
+// The /forum command that reads view ({ kind: 'topics' | 'messages' | 'read' | 'search', topicId?,
+// messageId?, query?, after? }) as text, or null when an argument would not survive being typed back
+// as one word: empty, with whitespace, or with characters printable() would replace. Options come
+// first; an ID starting with "-" follows a "--" that ends them, and a cursor starting with "-" is
+// written --after=CURSOR.
+//
+// A search query is typed back as it is, after the options, and after a "--" whenever there are
+// options or it starts with "-". It may hold spaces but no other whitespace, so a query on several
+// lines, with tabs, or with characters printable() would replace, has no command.
+export function textCommand(view: TextView): string | null {
+  const { kind, topicId, messageId, after } = view
   const id = kind === 'messages' ? topicId : kind === 'read' ? messageId : undefined
   const args = [id, after].filter((arg) => arg !== undefined)
   if (!args.every((arg) => arg !== '' && /^\S+$/.test(arg) && printable(arg) === arg)) return null
   const words: string[] = [kind]
   const options = after === undefined ? [] : after.startsWith('-') ? [`--after=${after}`] : ['--after', after]
-  if (id === undefined) words.push(...options)
+  if (kind === 'search') {
+    const { query } = view
+    if (query === '' || query.trim() !== query || /[^\S ]/.test(query) || printable(query) !== query) return null
+    words.push(...options)
+    if (after !== undefined || query.startsWith('-')) words.push('--')
+    words.push(query)
+  } else if (id === undefined) words.push(...options)
   else if (id.startsWith('-')) words.push(...options, '--', id)
   else words.push(id, ...options)
   return `/forum ${words.join(' ')}`

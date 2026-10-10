@@ -6,7 +6,7 @@ import { MAX_BODY_BYTES, MAX_LABEL_CHARS, errorMessage } from './records.mjs'
 
 /**
  * @import { ParseArgsOptionsConfig } from 'node:util'
- * @import { CreateTopicResult, Forum, Message, Page, Topic, WarningHandler } from './types.d.mts'
+ * @import { CreateTopicResult, Forum, Message, Page, SearchHit, Topic, WarningHandler } from './types.d.mts'
  * @import { Environment, MainOptions } from './cli.d.mts'
  */
 
@@ -17,6 +17,7 @@ const HELP = `Usage:
   pi-forum message post TOPIC_ID BODY [--reply-to MESSAGE_ID] [--author LABEL]
   pi-forum message list [--topic TOPIC_ID] [--after CURSOR] [--limit N]
   pi-forum message get MESSAGE_ID
+  pi-forum search QUERY [--after CURSOR] [--limit N]
 
 BODY is exactly one of:
   --body TEXT         inline text
@@ -25,16 +26,23 @@ BODY is exactly one of:
   Body text is stored exactly as given, up to ${MAX_BODY_BYTES / 1024} KiB of UTF-8. It is optional
   for topic create, where it becomes the topic's first message, and required for message post.
 
+QUERY is one argument, so quote it for the shell:
+  pi-forum search '"flaky tests" AND (timeout OR deadlock) NOT resolved' --limit 20
+  It matches topic titles and message bodies, each on its own, ignoring case. A term is a bare
+  word, which matches text containing it, or a "double-quoted phrase", in which \\" and \\\\ escape.
+  NOT, AND and OR (in any case, binding in that order) combine terms; adjacent terms are ANDed
+  and parentheses group. Everything else is literal text.
+
 Options:
   --author LABEL      author label (default: $PI_SESSION_ID if set, otherwise "external")
   --reply-to ID       mark the message as a reply to a message in the same topic
   --topic TOPIC_ID    list only messages of this topic (default: activity across the forum)
-  --after CURSOR      continue after the next_cursor of an earlier list result
-  --limit N           page size from 1 to 100 (default: 20 topics, 50 messages)
+  --after CURSOR      continue after the next_cursor of an earlier list or search result
+  --limit N           page size from 1 to 100 (default: 20 topics or search hits, 50 messages)
   -h, --help          show this help
 
   Titles and author labels must be non-blank, up to ${MAX_LABEL_CHARS} characters.
-  Put -- before a TITLE or ID that starts with "-"; use --body=TEXT for text that does.
+  Put -- before a TITLE, ID or QUERY that starts with "-"; use --body=TEXT for text that does.
 
 Environment:
   PI_FORUM_DIR        required absolute path of the forum directory (created if missing)
@@ -48,12 +56,15 @@ Output:
     message get     {"message": Message}
     topic list      {"items": [Topic, ...], "next_cursor": CURSOR}
     message list    {"items": [Message, ...], "next_cursor": CURSOR}
+    search          {"items": [Hit, ...], "next_cursor": CURSOR}, where each Hit is
+                    {"type": "topic", "topic": Topic} or {"type": "message", "message": Message}
   Errors and warnings go to stderr; failures exit with status 1.
 
 Pagination:
   Lists return items in creation order. Pass next_cursor as --after to read the next page.
   An empty page means you are caught up; keep its next_cursor to read only newer items later.
-  Cursors are opaque and belong to one forum.
+  Cursors are opaque and belong to one forum. A search cursor is a position in the forum, not
+  tied to its query; omit --after to search from the start again.
 `
 
 class UsageError extends Error {}
@@ -84,13 +95,15 @@ const OPTION_TYPES = /** @type {const} */ ({
 // Option values once validated, with --limit as a number.
 /** @typedef {Omit<RawValues, 'limit'> & { readonly limit?: number | undefined }} CommandValues */
 
-/** @typedef {'TITLE' | 'TOPIC_ID' | 'MESSAGE_ID'} ArgName */
+/** @typedef {'TITLE' | 'TOPIC_ID' | 'MESSAGE_ID' | 'QUERY'} ArgName */
 /**
  * @template {ArgName} A
  * @typedef {{ readonly [K in A]: string }} CommandArgs
  */
 
-/** @typedef {CreateTopicResult | { topic: Topic } | { message: Message } | Page<Topic> | Page<Message>} CommandResult */
+/**
+ * @typedef {CreateTopicResult | { topic: Topic } | { message: Message } | Page<Topic> | Page<Message> | Page<SearchHit>} CommandResult
+ */
 
 // Each command: accepted options, positional argument names, whether it takes a body, and a handler
 // that runs against the invocation's bound forum client.
@@ -180,6 +193,12 @@ const COMMANDS = {
       message: await forum.getMessage(MESSAGE_ID, { onWarning }),
     }),
   }),
+  search: command({
+    options: LIST_OPTIONS,
+    args: ['QUERY'],
+    run: (forum, { QUERY }, values, env, onWarning) =>
+      forum.search(QUERY, { after: values.after, limit: values.limit, onWarning }),
+  }),
 }
 
 /**
@@ -187,7 +206,13 @@ const COMMANDS = {
  * @returns {boolean}
  */
 const isHelpFlag = (arg) => arg === '--help' || arg === '-h'
-const GROUPS = new Set(Object.keys(COMMANDS).map((name) => name.split(' ')[0]))
+// Commands are named by one word, as search is, or by a group word and a verb, as topic list is.
+const SINGLE = new Set(Object.keys(COMMANDS).filter((name) => !name.includes(' ')))
+const GROUPS = new Set(
+  Object.keys(COMMANDS)
+    .filter((name) => name.includes(' '))
+    .map((name) => name.split(' ')[0]),
+)
 
 // Returns a help request or a validated command. Help is recognized only where the parser expects
 // an option, so a value such as `--body --help` is still an argument error.
@@ -198,8 +223,9 @@ const GROUPS = new Set(Object.keys(COMMANDS).map((name) => name.split(' ')[0]))
 function parseCommand(argv) {
   if (argv[0] === 'help' || isHelpFlag(argv[0])) return { help: true }
   if (GROUPS.has(argv[0]) && isHelpFlag(argv[1])) return { help: true }
-  const name = argv.slice(0, 2).join(' ')
-  const command = COMMANDS[name]
+  const words = SINGLE.has(argv[0] ?? '') ? 1 : 2
+  const name = argv.slice(0, words).join(' ')
+  const command = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined
   if (!command) throw new UsageError(argv.length === 0 ? 'missing command' : `unknown command "${name}"`)
   /** @type {ParseArgsOptionsConfig} */
   const options = Object.fromEntries(
@@ -208,7 +234,7 @@ function parseCommand(argv) {
   options.help = { type: 'boolean', short: 'h' }
   let parsed
   try {
-    parsed = parseArgs({ args: argv.slice(2), options, allowPositionals: true, strict: true })
+    parsed = parseArgs({ args: argv.slice(words), options, allowPositionals: true, strict: true })
   } catch (err) {
     if (err instanceof Error && 'code' in err && typeof err.code === 'string' && err.code.startsWith('ERR_PARSE_ARGS_')) {
       throw new UsageError(err.message)

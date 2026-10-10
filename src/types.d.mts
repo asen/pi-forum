@@ -41,6 +41,9 @@ export interface Page<T> {
   next_cursor: string
 }
 
+// One search result: a topic whose title or a message whose body matched, as its full record.
+export type SearchHit = { type: 'topic'; topic: Topic } | { type: 'message'; message: Message }
+
 // Codes of a ForumError, which reports every expected failure of the forum and its adapters.
 export type ForumErrorCode =
   | 'INVALID_INPUT'
@@ -114,6 +117,7 @@ export interface Forum {
   readonly resolved: string | undefined
   listTopics(options?: ListOptions): Promise<Page<Topic>>
   listMessages(options?: ListMessagesOptions): Promise<Page<Message>>
+  search(query: string, options?: ListOptions): Promise<Page<SearchHit>>
   getTopic(topicId: string, options?: ReadCallOptions): Promise<Topic>
   getMessage(messageId: string, options?: ReadCallOptions): Promise<Message>
   createTopic(input: CreateTopicInput, options?: WriteCallOptions): Promise<CreateTopicResult>

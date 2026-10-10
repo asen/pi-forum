@@ -3,7 +3,7 @@
 // come from the installed Pi as type-only imports, so nothing here loads Pi at runtime.
 
 import type { BeforeAgentStartEvent, ExtensionContext, ExtensionUIContext } from '@earendil-works/pi-coding-agent'
-import type { Message, Page, Topic } from '../src/types.d.mts'
+import type { Message, Page, SearchHit, Topic } from '../src/types.d.mts'
 import type { Browser, BrowserForum } from './browser-state.ts'
 
 // Saved defaults
@@ -160,13 +160,25 @@ export type ReadView = {
   readonly after?: undefined
 }
 export type ListView = TopicsView | MessagesView
+// The views the browser opens; ViewKind names them.
 export type ForumView = ListView | ReadView
 export type ViewKind = ForumView['kind']
+
+// A search, read only as text: one page of the hits of query, exactly as typed, after a cursor.
+export type SearchView = {
+  readonly kind: 'search'
+  readonly query: string
+  readonly topicId?: undefined
+  readonly messageId?: undefined
+  readonly after?: string | undefined
+}
+// What a text read reads: a browser view or a search.
+export type TextView = ForumView | SearchView
 
 // Terminal columns of printable text; one per grapheme unless the host measures it.
 export type VisibleWidth = (text: string) => number
 
-// What the text formatters take: one page of a list read after its cursor, or one message read.
+// What the text formatters take: one page of a list read or a search after its cursor, or one message read.
 export interface TopicListRequest {
   target: ForumTarget
   page: Page<Topic>
@@ -178,6 +190,14 @@ export interface MessageListRequest {
   target: ForumTarget
   topicId?: string | undefined
   page: Page<Message>
+  after?: string | undefined
+  warnings?: ReadWarnings | undefined
+}
+
+export interface SearchResultsRequest {
+  target: ForumTarget
+  query: string
+  page: Page<SearchHit>
   after?: string | undefined
   warnings?: ReadWarnings | undefined
 }

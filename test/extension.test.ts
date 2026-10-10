@@ -11,9 +11,8 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import type { CustomEntry, EntryRenderOptions } from '@earendil-works/pi-coding-agent'
 import type { AutocompleteItem } from '@earendil-works/pi-tui'
-import type { BrowserForum } from '../extension/browser-state.ts'
 import type { OutputEntryData } from '../extension/entry-renderer.ts'
-import { formatMessage, formatMessageList, formatTarget, formatTopicList } from '../extension/output.ts'
+import { formatMessage, formatMessageList, formatSearchResults, formatTarget, formatTopicList } from '../extension/output.ts'
 import { createPreferenceStore } from '../extension/preferences.ts'
 import {
   type CreateReader,
@@ -21,6 +20,7 @@ import {
   type ForumRuntime,
   type ForumRuntimeOptions,
   forumCompletions,
+  type ReadClient,
   type RuntimeReport,
   SECTION_NAME,
   USAGE,
@@ -36,9 +36,10 @@ import type {
   PreferenceStore,
   RuntimeContext,
   ScopeState,
+  TextView,
 } from '../extension/types.ts'
 import { createForum } from '../src/forum.mjs'
-import type { Forum, ListMessagesOptions, ListOptions, Message, Page, ReadCallOptions, Topic, WarningHandler } from '../src/types.d.mts'
+import type { Forum, ListMessagesOptions, ListOptions, Message, Page, ReadCallOptions, SearchHit, Topic, WarningHandler } from '../src/types.d.mts'
 import type { Text } from './fixtures/extension-tui.ts'
 
 const exec = promisify(execFile)
@@ -479,9 +480,13 @@ describe('prompt section', () => {
     const text = h.prompt()[SECTION_NAME]!
     assert.doesNotMatch(text, /<\/?forum>/)
     assert.match(text, new RegExp(`Forum directory: ${defaultDir('s-1')} \\(PI_FORUM_DIR; this session's default forum\\)`))
-    for (const command of ['topic list', 'topic create', 'topic get', 'message post', 'message list']) {
+    for (const command of ['topic list', 'topic create', 'topic get', 'message post', 'message list', 'search']) {
       assert.ok(text.includes(`pi-forum ${command}`), command)
     }
+    assert.ok(text.includes("\n  pi-forum search 'QUERY' [--after CURSOR] [--limit N]\n"))
+    assert.match(text, /\nSearch: Run it yourself when looking for earlier work; nothing searches automatically\. /)
+    assert.match(text, /It matches topic titles and message bodies, each on its own; quote the whole query as one argument, /)
+    assert.ok(text.includes(`e.g. pi-forum search '"flaky tests" AND (timeout OR deadlock) NOT resolved'.\n`))
     assert.match(text, /--body-file PATH or --body-stdin with a quoted heredoc/)
     assert.match(text, /Pass next_cursor as --after to read newer items; an empty page means caught up/)
     assert.match(text, /message list without --topic reads the whole forum/)
@@ -642,6 +647,38 @@ describe('/forum parsing, completion and feedback', () => {
     'reset --',
     'reset -- project',
     'ui on user',
+    'search',
+    'search   ',
+    'search --',
+    'search --  ',
+    'search --after c',
+    'search --after c --',
+    'search --after=c -- \t',
+    'search --after',
+    'search --after -- x',
+    'search --after=',
+    'search --after= x',
+    'search --after= -- x',
+    'search --after -c x',
+    'search --after --help x',
+    'search --after a --after b x',
+    'search --after=a --after=b -- x',
+    'search --after a --after=b x',
+    'search --after a -x',
+    'search -x',
+    'search --limit 5 x',
+    'search --before c x',
+    'search --AFTER c x',
+    'search --help',
+    'search -h',
+    'search -',
+    'Search x',
+    'SEARCH x',
+    'searchx',
+    'searches x',
+    'ui search',
+    'ui search x',
+    'read search x',
   ]) {
     test(`${JSON.stringify(args)} shows the usage and changes nothing`, () => {
       for (const supplied of [undefined, '/shared/forum', 'relative']) {
@@ -660,21 +697,23 @@ describe('/forum parsing, completion and feedback', () => {
     })
   }
 
-  test('the usage names every form, with nested browser views', () => {
+  test('the usage names every form, with nested browser views and no browser search', () => {
     assert.equal(
       USAGE,
       'Usage: /forum [on|off|status] | /forum on|off|reset project|user | /forum topics [--after CURSOR] | ' +
-        '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]',
+        '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum search [--after CURSOR --] QUERY | ' +
+        '/forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]',
     )
   })
 
   test('text and browser forms route to their reads with exactly the given IDs and cursor', async () => {
     const calls: unknown[][] = []
-    const client: BrowserForum = {
+    const client: ReadClient = {
       resolved: undefined,
       listTopics: async ({ after, limit }: ListOptions) => (calls.push(['topics', after, limit]), { items: [], next_cursor: 'c' }),
       listMessages: async ({ topicId, after, limit }: ListMessagesOptions) => (calls.push(['messages', topicId, after, limit]), { items: [], next_cursor: 'c' }),
       getMessage: async (id: string) => (calls.push(['read', id]), { id, topic_id: 't', author: 'a', created_at: 'now', body: 'b' }),
+      search: async (query: string, { after, limit }: ListOptions = {}) => (calls.push(['search', query, after, limit]), { items: [], next_cursor: 'c' }),
     }
     const views: ForumView[] = []
     const h = host({
@@ -716,6 +755,33 @@ describe('/forum parsing, completion and feedback', () => {
       'read m-1 --': ['read', 'm-1'],
       'read -- m-1': ['read', 'm-1'],
       'read ui': ['read', 'ui'],
+      // A search query is the rest of the line as typed, after one optional cursor and "--"; only the
+      // whitespace around it is dropped.
+      'search flaky': ['search', 'flaky', undefined, 20],
+      '  search\t  "flaky  tests" AND (timeout OR deadlock) NOT resolved \n': [
+        'search',
+        '"flaky  tests" AND (timeout OR deadlock) NOT resolved',
+        undefined,
+        20,
+      ],
+      'search "a \\"quoted\\" \\\\ path"  OR\t(x)': ['search', '"a \\"quoted\\" \\\\ path"  OR\t(x)', undefined, 20],
+      'search line one\nOR line two': ['search', 'line one\nOR line two', undefined, 20],
+      'search --after c1 -- x': ['search', 'x', 'c1', 20],
+      'search --after=c=2 -- x': ['search', 'x', 'c=2', 20],
+      'search --after=-c3 -- -x OR y': ['search', '-x OR y', '-c3', 20],
+      'search --after c4 x  y': ['search', 'x  y', 'c4', 20],
+      'search --after=c5 NOT x': ['search', 'NOT x', 'c5', 20],
+      'search -- --after c6': ['search', '--after c6', undefined, 20],
+      'search -- -- x': ['search', '-- x', undefined, 20],
+      'search -- --': ['search', '--', undefined, 20],
+      'search -- -h': ['search', '-h', undefined, 20],
+      'search x --after c7': ['search', 'x --after c7', undefined, 20],
+      'search x -- y': ['search', 'x -- y', undefined, 20],
+      'search search': ['search', 'search', undefined, 20],
+      'search on': ['search', 'on', undefined, 20],
+      'search ui topics': ['search', 'ui topics', undefined, 20],
+      'search 🧵 日本': ['search', '🧵 日本', undefined, 20],
+      'search a AND': ['search', 'a AND', undefined, 20],
     }
     for (const [args, call] of Object.entries(text)) {
       await h.text(args)
@@ -748,7 +814,10 @@ describe('/forum parsing, completion and feedback', () => {
 
   test('completions are the actions, or the scopes after on, off and reset and the browser views after ui', () => {
     const items = (...values: string[]) => values.map((value) => ({ value, label: value }))
-    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'ui'))
+    assert.deepEqual(forumCompletions(''), items('on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'search', 'ui'))
+    assert.deepEqual(forumCompletions('s'), items('status', 'search'))
+    assert.deepEqual(forumCompletions('se'), items('search'))
+    for (const prefix of ['search ', 'search x', 'ui s', 'ui search']) assert.deepEqual(forumCompletions(prefix), [], prefix)
     assert.deepEqual(forumCompletions('on '), items('on project', 'on user'))
     assert.deepEqual(forumCompletions('off u'), items('off user'))
     assert.deepEqual(forumCompletions('re'), items('reset', 'read'))
@@ -1750,7 +1819,7 @@ describe('/forum saved defaults', () => {
 })
 
 describe('/forum reading', () => {
-  const TEXT = ['topics', 'messages', 'messages t-1', 'read m-1', 'topics --after c']
+  const TEXT = ['topics', 'messages', 'messages t-1', 'read m-1', 'topics --after c', 'search x', 'search --after c -- NOT x']
   const UI = ['ui', 'ui topics', 'ui messages', 'ui messages t-1', 'ui read m-1']
 
   async function tempDir() {
@@ -1848,6 +1917,10 @@ describe('/forum reading', () => {
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     assert.equal(messages, formatMessageList({ target: { ...target, status: 'off' }, topicId: topic.id, page: page([message]) }))
     assert.match(messages, /Forum is off for agents; reading does not turn it on\./)
+    const found = await h.text('search hello OR seeded')
+    assert.deepEqual(snapshot(h), before)
+    const hits: SearchHit[] = [{ type: 'topic', topic }, { type: 'message', message }]
+    assert.equal(found, formatSearchResults({ target: { ...target, status: 'off' }, query: 'hello OR seeded', page: page(hits) }))
 
     // Unavailable after drift: the last selected directory, with a warning; the new value is neither
     // read nor adopted.
@@ -1863,6 +1936,8 @@ describe('/forum reading', () => {
     assert.equal(h.runtime.binding, null)
     assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
     assert.deepEqual(h.env, { PATH: withBin(), PI_FORUM_DIR: '/elsewhere/forum' })
+    assert.deepEqual(await h.browse('search -- hello'), [[formatTarget(drifted), 'warning']])
+    assert.equal(h.texts.at(-1), formatSearchResults({ target: drifted, query: 'hello', page: page([{ type: 'message', message }]) }))
     assert.deepEqual(recorded.clients.map((client) => client.config.forumDir), [forumDir, forumDir])
   })
 
@@ -1907,15 +1982,18 @@ describe('/forum reading', () => {
     assert.match(await h.text('topics'), /\n\nNo topics yet\.\n\nYou are caught up\.$/)
     assert.match(await h.text('messages'), /\n\nNo messages yet\.\n\nYou are caught up\.$/)
     assert.match(await h.text('messages t-1'), /^Forum messages in topic t-1 · from the start\n[^]*\nNo messages yet\./)
+    assert.match(await h.text('search NOT x'), /^Forum search · from the start\n[^]*\nQuery: NOT x\n\nNo matches\.\n\nYou are caught up\.$/)
     assert.deepEqual(await fs.readdir(forumDir), [])
     await fs.rm(path.join(agentDir, 'forums'), { recursive: true })
     const count = h.texts.length
     for (const args of [...TEXT, ...UI]) {
       const [message, type] = (await h.browse(args))[0]!
       assert.equal(type, 'error')
-      const verb = args.startsWith('ui') ? 'browse' : 'read'
+      const verb = args.startsWith('ui') ? 'browse' : args.startsWith('search') ? 'search' : 'read'
       assert.ok(message.startsWith(`Could not ${verb} ${forumDir}: forum directory ${forumDir} is unavailable: ENOENT`), message)
     }
+    // A malformed query fails before the forum is reached.
+    assert.deepEqual(await h.browse('search a AND'), [[`Could not search ${forumDir}: search query expects a term, phrase or group at offset 5.`, 'error']])
     h.forum('off')
     const [message] = (await h.browse('topics'))[0]!
     assert.match(message, /is unavailable: ENOENT/)
@@ -1923,6 +2001,92 @@ describe('/forum reading', () => {
     await assert.rejects(fs.stat(forumDir), { code: 'ENOENT' })
     assert.deepEqual(await fs.readdir(agentDir), [])
     assert.deepEqual(h.env, { PATH: BASE_PATH })
+  })
+
+  test('search prints typed hits for the exact query; its copied next-page and restart commands round-trip', async () => {
+    const dir = await tempDir()
+    const forumDir = path.join(dir, 'searched')
+    const forum = createForum({ forumDir })
+    const topics: Topic[] = []
+    for (let i = 0; i < 21; i++) topics.push((await forum.createTopic({ title: `needle "x" alpha ${i}`, author: 'a' })).topic)
+    const beta = await forum.postMessage({ topicId: topics[0]!.id, author: 'b', body: 'Needle "X"  beta\nsecond line' })
+    await forum.postMessage({ topicId: topics[0]!.id, author: 'b', body: 'needle "x" alpha gamma' })
+    await forum.postMessage({ topicId: topics[0]!.id, author: 'b', body: 'needle x alpha' })
+    const { topic: dash } = await forum.createTopic({ title: '-dash --after', author: 'c' })
+    const log = await fs.readFile(path.join(forumDir, 'events.jsonl'), 'utf8')
+    const calls: unknown[][] = []
+    const h = host({
+      env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir },
+      // The shared client, with its searches recorded.
+      createForum: (config) => {
+        const client = createForum(config)
+        const { search } = client
+        return Object.assign(client, {
+          search: (query: string, options?: ListOptions) => (calls.push([query, options?.after, options?.limit]), search(query, options)),
+        })
+      },
+      openBrowser: () => assert.fail('search opens no browser'),
+    })
+    h.start('s-1')
+    const run = (command: string) => {
+      assert.ok(command.startsWith('/forum search '), command)
+      return h.text(command.slice('/forum '.length))
+    }
+    const query = '"needle \\"x\\""  AND (alpha OR beta) NOT gamma'
+
+    const first = await h.text(`search ${query}`)
+    const header = ['Forum search · from the start', `Forum directory: ${forumDir} (supplied PI_FORUM_DIR)`, 'Forum is on for agents.', `Query: ${query}`]
+    assert.ok(first.startsWith(`${header.join('\n')}\n\n1. Topic: needle "x" alpha 0\n`), first)
+    assert.equal(first.match(/^\d+\. Topic: needle "x" alpha \d+$/gm)!.length, 20)
+    const cursor = (await forum.search(query, { limit: 20 })).next_cursor
+    const next = first.match(/20 shown; there may be more\. Next page: (.+)$/)![1]!
+    assert.equal(next, `/forum search --after ${cursor} -- ${query}`)
+    const rest = await run(next)
+    assert.match(rest, new RegExp(`^Forum search · after cursor ${cursor}\n`))
+    assert.ok(rest.endsWith(
+      [
+        `1. Topic: needle "x" alpha 20`,
+        `   Topic ${topics[20]!.id} · by a · ${topics[20]!.created_at}`,
+        `2. Message by b · ${beta.created_at}`,
+        `   Message ${beta.id} · topic ${topics[0]!.id}`,
+        '   Needle "X"  beta…',
+        '',
+        'You are caught up.',
+      ].join('\n'),
+    ), rest)
+    // An unusable cursor names the restart command, which repeats the first page.
+    assert.deepEqual(await h.browse(`search --after bogus -- ${query}`), [
+      [`Could not search ${forumDir}: cursor is not valid. Run /forum search ${query} to start from the first page.`, 'error'],
+    ])
+    assert.equal(await run(`/forum search ${query}`), first)
+    assert.deepEqual(calls, [
+      [query, undefined, 20],
+      [query, cursor, 20],
+      [query, 'bogus', 20],
+      [query, undefined, 20],
+    ])
+
+    // A query starting with "-" is restarted after "--"; words that look like options are query text.
+    calls.length = 0
+    const dashed = await h.text('search -- -dash --after')
+    assert.ok(dashed.includes(`\n1. Topic: -dash --after\n   Topic ${dash.id} · by c · `))
+    const [restart] = (await h.browse('search --after=-bad -- -dash --after'))[0]!
+    assert.match(restart, /: cursor is not valid\. Run \/forum search -- -dash --after to start from the first page\.$/)
+    assert.equal(await run(restart.match(/Run (.+) to start/)![1]!), dashed)
+    assert.deepEqual(calls, [
+      ['-dash --after', undefined, 20],
+      ['-dash --after', '-bad', 20],
+      ['-dash --after', undefined, 20],
+    ])
+
+    // A query on several lines is searched as written, but no command could carry it.
+    const multiline = await h.text('search needle\nOR beta')
+    assert.ok(multiline.includes('\nQuery: needle␊OR beta\n'))
+    assert.match(multiline, /\n20 shown; there may be more after cursor \S+\.$/)
+    const [error] = (await h.browse('search --after bogus -- needle\nOR beta'))[0]!
+    assert.ok(error.endsWith('cursor is not valid. Run it again without --after to start from the first page.'), error)
+    // Searching writes nothing.
+    assert.equal(await fs.readFile(path.join(forumDir, 'events.jsonl'), 'utf8'), log)
   })
 
   test('read prints all metadata and the complete body with controls made visible', async () => {
@@ -1996,7 +2160,7 @@ describe('/forum reading', () => {
     await fs.writeFile(path.join(forumDir, 'events.jsonl'), lines.map((line) => `${JSON.stringify(line)}\n`).join(''))
 
     const calls: unknown[][] = []
-    const recording = (config: ReaderConfig): BrowserForum => {
+    const recording = (config: ReaderConfig): ReadClient => {
       const forum = createForum(config)
       return {
         get resolved() {
@@ -2005,6 +2169,7 @@ describe('/forum reading', () => {
         listTopics: (options: ListOptions) => (calls.push(['topics', options.after]), forum.listTopics(options)),
         listMessages: (options: ListMessagesOptions) => (calls.push(['messages', options.topicId, options.after]), forum.listMessages(options)),
         getMessage: (id: string, options: ReadCallOptions) => (calls.push(['read', id]), forum.getMessage(id, options)),
+        search: (query: string, options: ListOptions) => (calls.push(['search', query, options.after]), forum.search(query, options)),
       }
     }
     const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: forumDir }, createForum: recording, openBrowser: () => assert.fail('no browser') })
@@ -2123,6 +2288,22 @@ describe('/forum reading', () => {
     assert.doesNotMatch(text, /bad record 1/)
   })
 
+  test('a search counts damaged records as the other reads do', async () => {
+    const client = {
+      resolved: '/shared/forum',
+      async search(_query: string, { onWarning }: RuntimeReadOptions): Promise<Page<SearchHit>> {
+        for (let i = 0; i < 300; i++) onWarning(`bad record ${i}\u202e`)
+        return { items: [], next_cursor: 'c' }
+      },
+    }
+    // @ts-expect-error -- a client with only the read this test makes
+    const h = host({ env: { PATH: BASE_PATH, PI_FORUM_DIR: '/shared/forum' }, createForum: () => client })
+    h.start('s-1')
+    const text = await h.text('search x')
+    assert.match(text, /\n\nNo matches\.\n300 damaged record\(s\) skipped; first: bad record 0⟨U\+202E⟩\n\nYou are caught up\.$/)
+    assert.doesNotMatch(text, /bad record 1/)
+  })
+
   test('the terminal UI opens the selected forum whether it is on, off or unavailable', async () => {
     const dir = await tempDir()
     const forumDir = path.join(dir, 'shared')
@@ -2203,6 +2384,8 @@ describe('/forum reading', () => {
     assert.match(refused, new RegExp(`^Could not browse ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
     const [text] = (await h.browse('topics'))[0]!
     assert.match(text, new RegExp(`^Could not read ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
+    const [searched] = (await h.browse('search in'))[0]!
+    assert.match(searched, new RegExp(`^Could not search ${link}: forum directory ${link} now resolves to ${b}, not ${a}`))
     assert.equal(recorded.clients.length, 1)
 
     // Off keeps the client; a failed on keeps the selection and client too.
@@ -2218,6 +2401,7 @@ describe('/forum reading', () => {
     h.forum('on')
     assert.equal(signal.aborted, true)
     assert.match(await h.text('topics'), /\n1\. In B\n/)
+    assert.match(await h.text('search in'), /\n1\. Topic: In B\n/)
     assert.equal(recorded.clients.length, 2)
 
     // Shutdown discards it as well, and the next runtime binds its own.
@@ -2278,7 +2462,11 @@ describe('/forum reading', () => {
     const notices: [string, NotifyType | undefined][] = []
     const texts: [string, RuntimeContext['mode']][] = []
     const ui: TestUI = { notify: (message, type) => notices.push([message, type]), custom: () => assert.fail('text reads open no UI') }
-    const client = { resolved: undefined, listTopics: async () => ({ items: [], next_cursor: 'c' }) }
+    const client = {
+      resolved: undefined,
+      listTopics: async () => ({ items: [], next_cursor: 'c' }),
+      search: async (): Promise<Page<SearchHit>> => ({ items: [], next_cursor: 'c' }),
+    }
     const runtime = createForumRuntime({
       binDir: BIN_DIR,
       getAgentDir: () => AGENT_DIR,
@@ -2304,6 +2492,19 @@ describe('/forum reading', () => {
     assert.deepEqual(texts.map(([, mode]) => mode), ['tui', 'rpc', 'print', 'json'])
     assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[text], [text]])
     for (const spy of stdout) assert.equal(spy.mock.callCount(), 0)
+
+    // An empty search page is one entry in every mode as well, and is shown the same way.
+    // @ts-expect-error -- a page without the cursor a forum read always returns; an empty page never shows it
+    const found = formatSearchResults({ target: { forumDir: '/shared/forum', generated: false, status: 'on', warning: null }, query: 'x', page: { items: [] } })
+    texts.length = 0
+    notices.length = 0
+    stderr.mock.resetCalls()
+    await runtime.command('search x', ctx('s-1', ui, 'tui'))
+    await runtime.command('search x', ctx('s-1', ui, 'rpc'))
+    for (const mode of ['print', 'json'] as const) await runtime.command('search x', ctx('s-1', undefined, mode))
+    assert.deepEqual(texts, [[found, 'tui'], [found, 'rpc'], [found, 'print'], [found, 'json']])
+    assert.deepEqual(notices, [[found, 'info']])
+    assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[found], [found]])
 
     // A failing entry callback is reported; the result still reaches non-terminal modes.
     const failing = createForumRuntime({
@@ -2331,7 +2532,7 @@ describe('/forum reading', () => {
 interface PendingRead {
   args: unknown[]
   options: RuntimeReadOptions
-  resolve: (value: Page<Topic> | Page<Message> | Message) => void
+  resolve: (value: Page<Topic> | Page<Message> | Page<SearchHit> | Message) => void
   reject: (reason: unknown) => void
 }
 
@@ -2362,7 +2563,7 @@ describe('/forum browser lifecycle', { timeout: 10000 }, () => {
       new Promise<T>((resolve, reject) =>
         calls.push({ args, options: args.at(-1) as RuntimeReadOptions, resolve: resolve as PendingRead['resolve'], reject }),
       )
-    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } satisfies BrowserForum }
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read, search: read } satisfies ReadClient }
   }
 
   test('one browser is open per runtime; Esc closes it and another may open', async () => {
@@ -2519,7 +2720,7 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
       new Promise<T>((resolve, reject) =>
         calls.push({ args, options: args.at(-1) as RuntimeReadOptions, resolve: resolve as PendingRead['resolve'], reject }),
       )
-    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read } satisfies BrowserForum }
+    return { calls, forum: { resolved: undefined, listTopics: read, listMessages: read, getMessage: read, search: read } satisfies ReadClient }
   }
 
   function setup() {
@@ -2546,7 +2747,7 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     const before = snapshot(h)
     const first = h.runtime.command('topics', tui())
     await settle()
-    for (const args of ['topics', 'messages', 'read m-1', 'topics --after c']) {
+    for (const args of ['topics', 'messages', 'read m-1', 'topics --after c', 'search x']) {
       assert.deepEqual(await h.browse(args), [[BUSY, 'warning']])
     }
     assert.deepEqual(await h.browse('messages', 'rpc'), [[BUSY, 'warning']])
@@ -2567,6 +2768,22 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     clients[0]!.calls[2]!.resolve({ items: [], next_cursor: 'c' })
     await third
     assert.equal(h.texts.length, 2)
+    // A search holds the same slot, and its failure records no entry.
+    const searching = h.runtime.command('search "a  b"', tui())
+    await settle()
+    assert.deepEqual(await h.browse('topics'), [[BUSY, 'warning']])
+    const search = clients[0]!.calls[3]!
+    assert.deepEqual(search.args, ['"a  b"', { signal: search.options.signal, onWarning: search.options.onWarning, after: undefined, limit: 20 }])
+    search.reject(Object.assign(new Error('search query has an unclosed quote at offset 0'), { code: 'INVALID_INPUT' }))
+    await searching
+    assert.deepEqual(h.reports.slice(-1), ['Could not search /shared/forum: search query has an unclosed quote at offset 0.'])
+    assert.equal(h.texts.length, 2)
+    const found = h.runtime.command('search --after c -- x', tui())
+    await settle()
+    clients[0]!.calls[4]!.resolve({ items: [], next_cursor: 'd' })
+    await found
+    assert.equal(h.texts.length, 3)
+    assert.match(h.texts[2]!, /^Forum search · after cursor c\n[^]*\nQuery: x\n\nNo newer matches\.\n\nYou are caught up\.$/)
     assert.equal(clients.length, 1)
   })
 
@@ -2574,11 +2791,11 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     const { h, clients, opened } = setup()
     const browsing = h.runtime.command('ui', tui())
     await settle()
-    const reading = h.runtime.command('messages t-1', tui())
+    const reading = h.runtime.command('search --after c -- x', tui())
     await settle()
     const load = clients[0]!.calls[0]!
     const read = clients[0]!.calls[1]!
-    assert.deepEqual(read.args, [{ signal: opened[0]!.signal, onWarning: read.options.onWarning, after: undefined, limit: 20, topicId: 't-1' }])
+    assert.deepEqual(read.args, ['x', { signal: opened[0]!.signal, onWarning: read.options.onWarning, after: 'c', limit: 20 }])
     // A browser may still open while the text read runs; it is the browser that is limited to one.
     assert.deepEqual(await h.browse('ui read m-1'), [['The forum browser is already open; close it with Esc before opening another view.', 'warning']])
     opened[0]!.browser.close()
@@ -2591,7 +2808,7 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     read.resolve({ items: [], next_cursor: 'c' })
     await reading
     assert.equal(h.texts.length, 1)
-    assert.match(h.texts[0]!, /^Forum messages in topic t-1 · from the start\n/)
+    assert.match(h.texts[0]!, /^Forum search · after cursor c\n/)
     assert.equal(opened[1]!.browser.closed, false)
     opened[1]!.browser.close()
     await again
@@ -2614,11 +2831,11 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     assert.match(h.texts[0]!, /\nForum is on for agents\.\n[^]*\nkept$/)
   })
 
-  for (const end of ['reselect', 'shutdown']) {
+  for (const [end, args] of [['reselect', 'topics'], ['shutdown', 'topics'], ['reselect', 'search x'], ['shutdown', 'search x']]) {
     for (const outcome of ['result', 'error']) {
-      test(`after ${end}, a late ${outcome} and its warnings are dropped and the slot is held until it settles`, async () => {
+      test(`after ${end}, a late ${args} ${outcome} and its warnings are dropped and the slot is held until it settles`, async () => {
         const { h, clients } = setup()
-        const reading = h.runtime.command('topics', tui())
+        const reading = h.runtime.command(args!, tui())
         await settle()
         const read = clients[0]!.calls[0]!
         const reports = h.reports.length
@@ -2631,7 +2848,8 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
         // This adapter ignores cancellation: until it settles, no other text read starts.
         if (end === 'reselect') assert.deepEqual(await h.browse('topics'), [[BUSY, 'warning']])
         read.options.onWarning('late warning')
-        if (outcome === 'result') read.resolve({ items: [{ id: 'late', title: 'Late', created_by: 'a', created_at: 'now' }], next_cursor: 'c' })
+        const late: Topic = { id: 'late', title: 'Late', created_by: 'a', created_at: 'now' }
+        if (outcome === 'result') read.resolve(args === 'topics' ? { items: [late], next_cursor: 'c' } : { items: [{ type: 'topic', topic: late }], next_cursor: 'c' })
         else read.reject(new Error('late failure'))
         assert.equal(await reading, undefined)
         await settle()
@@ -2639,13 +2857,14 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
         const expected = end === 'reselect' ? ['Forum is on: /other/forum (supplied PI_FORUM_DIR)', BUSY] : []
         assert.deepEqual(h.reports.slice(reports), expected)
         if (end === 'reselect') {
-          const next = h.runtime.command('topics', tui())
+          const next = h.runtime.command(args!, tui())
           await settle()
           assert.equal(clients.length, 2)
           clients[1]!.calls[0]!.resolve({ items: [], next_cursor: 'c' })
           await next
           // The texts as they are now, not as the assertion above narrowed them.
-          assert.match((h.texts as string[])[0]!, /^Forum topics · from the start\nForum directory: \/other\/forum /)
+          const name = args === 'topics' ? 'topics' : 'search'
+          assert.match((h.texts as string[])[0]!, new RegExp(`^Forum ${name} · from the start\nForum directory: /other/forum `))
         }
       })
     }
@@ -2655,14 +2874,16 @@ describe('/forum text read lifecycle', { timeout: 10000 }, () => {
     const { h, clients } = setup()
     h.forum('off')
     const before = snapshot(h)
-    const reading = h.runtime.command('topics', tui())
-    await settle()
-    assert.deepEqual(snapshot(h), before)
-    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
-    clients[0]!.calls[0]!.resolve({ items: [], next_cursor: 'c' })
-    await reading
-    assert.deepEqual(snapshot(h), before)
-    assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    for (const [i, args] of ['topics', 'search x'].entries()) {
+      const reading = h.runtime.command(args, tui())
+      await settle()
+      assert.deepEqual(snapshot(h), before)
+      assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+      clients[0]!.calls[i]!.resolve({ items: [], next_cursor: 'c' })
+      await reading
+      assert.deepEqual(snapshot(h), before)
+      assert.deepEqual(h.prompt({ cwd: 'x' }), { cwd: 'x' })
+    }
   })
 })
 
@@ -2736,8 +2957,9 @@ describe('extension entry', () => {
     assert.deepEqual([...commands.keys()], ['forum'])
     const forum = commands.get('forum')!
     assert.deepEqual(Object.keys(forum).sort(), ['description', 'getArgumentCompletions', 'handler'])
-    assert.equal(typeof forum.description, 'string')
+    assert.match(forum.description, /show its status, read or search its topics and messages as text, or browse them with \/forum ui$/)
     assert.deepEqual(forum.getArgumentCompletions('o'), [{ value: 'on', label: 'on' }, { value: 'off', label: 'off' }])
+    assert.deepEqual(forum.getArgumentCompletions('se'), [{ value: 'search', label: 'search' }])
     assert.equal(process.env.PATH, BASE_PATH)
     assert.equal(process.env.PI_FORUM_DIR, undefined)
 
@@ -2790,6 +3012,12 @@ describe('extension entry', () => {
     assert.deepEqual(stderr.mock.calls.map((call) => call.arguments), [[empty]])
     stderr.mock.restore()
     assert.equal(entries.length, 3)
+    // A search, even an empty one, is one entry too, and nothing else reaches Pi.
+    // @ts-expect-error -- a page without the cursor a forum read always returns; an empty page never shows it
+    const noHits = formatSearchResults({ target: { forumDir: dir, generated: true, resolved: dir, status: 'on' }, query: '"no such" thing', page: { items: [] } })
+    assert.equal(await forum.handler('search "no such" thing', terminal(ui)), undefined)
+    assert.deepEqual(entries.at(-1), ['pi-forum.output', { text: noHits }])
+    assert.equal(notices.length, count + 1)
 
     // The renderer draws a stored entry as plain text, whatever was stored.
     const render = renderers.get('pi-forum.output')!
@@ -2813,7 +3041,7 @@ describe('extension entry', () => {
     }
     assert.equal(await forum.handler('ui topics', terminal({ ...ui, custom })), undefined)
     assert.deepEqual(shown, [{ overlay: true, overlayOptions: { anchor: 'center', width: '90%', maxHeight: '80%' } }])
-    assert.equal(entries.length, 3)
+    assert.equal(entries.length, 4)
 
     // Tab stops use the host's visibleWidth, here two columns per character: "ab" ends at column 4.
     const { topic } = await createForum({ forumDir: dir }).createTopic({ title: 'T', author: 'a', body: 'ab\tc' })

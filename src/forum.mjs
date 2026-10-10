@@ -10,6 +10,7 @@ import {
   throwIfAborted,
   topicInput,
 } from './records.mjs'
+import { compileSearchQuery } from './search-query.mjs'
 
 /**
  * @import {
@@ -26,6 +27,7 @@ import {
  *   Page,
  *   PostMessageInput,
  *   ReadCallOptions,
+ *   SearchHit,
  *   Topic,
  *   TopicCreatedEvent,
  *   WarningHandler,
@@ -56,6 +58,7 @@ export { ForumError }
 
 const DEFAULT_TOPIC_LIMIT = 20
 const DEFAULT_MESSAGE_LIMIT = 50
+const DEFAULT_SEARCH_LIMIT = 20
 const MAX_LIMIT = 100
 
 /** @type {WarningHandler} */
@@ -238,6 +241,31 @@ export function createForum({ forumDir, adapter = jsonlAdapter, createOnRead = f
         options,
         DEFAULT_MESSAGE_LIMIT,
         ({ type, data }) => type === 'message_posted' && (topicId == null || data.topic_id === topicId) && data,
+      )
+    },
+
+    // Matches the query against each topic's title and each message's body on its own, and lists
+    // every matching record once, in append order. The query is checked before storage is touched.
+    // Like a list's, the cursor is a position in the forum, after every record the page read
+    // whether it matched or not; it is not bound to the query.
+    /**
+     * @param {string} query
+     * @param {ListOptions} [options]
+     * @returns {Promise<Page<SearchHit>>}
+     */
+    async search(query, options = {}) {
+      const matches = compileSearchQuery(query)
+      return list(
+        options,
+        DEFAULT_SEARCH_LIMIT,
+        /**
+         * @param {ForumEvent} event
+         * @returns {SearchHit | false}
+         */
+        (event) =>
+          event.type === 'topic_created'
+            ? matches(event.data.title) && { type: 'topic', topic: event.data }
+            : matches(event.data.body) && { type: 'message', message: event.data },
       )
     },
 

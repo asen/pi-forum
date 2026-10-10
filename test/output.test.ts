@@ -9,14 +9,15 @@ import {
   expandTabs,
   formatMessage,
   formatMessageList,
+  formatSearchResults,
   formatTarget,
   formatTopicList,
   printable,
   textCommand,
 } from '../extension/output.ts'
-import type { ForumTarget, ForumView } from '../extension/types.ts'
+import type { ForumTarget, ForumView, SearchView, TextView } from '../extension/types.ts'
 import { createForum } from '../src/forum.mjs'
-import type { Message, Topic } from '../src/types.d.mts'
+import type { Message, Page, SearchHit, Topic } from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
 
 const TARGET: ForumTarget = { forumDir: '/forums/shared', generated: false, status: 'on', warning: null }
@@ -268,6 +269,75 @@ describe('message reads', () => {
   })
 })
 
+describe('search results', () => {
+  const QUERY = '"flaky  tests" AND (timeout OR \\"x\\") NOT resolved'
+
+  test('rows are typed: a topic by its title, a message by author, IDs, reply target and excerpt', async () => {
+    const forum = createForum({ forumDir: '/forums/shared', adapter: fakeAdapter() })
+    const { topic, message } = await forum.createTopic({ title: 'Flaky  tests: timeout', author: 'alice', body: 'unrelated' })
+    const hit = await forum.postMessage({ topicId: topic.id, author: 'bob', body: '\n  flaky  tests: timeout again\nsecond line', replyTo: message!.id })
+    const page = await forum.search('"flaky  tests" AND timeout', { limit: LIST_PAGE_SIZE })
+    assert.deepEqual(page.items.map((item) => item.type), ['topic', 'message'])
+    const text = formatSearchResults({ target: TARGET, query: QUERY, page })
+    assert.equal(
+      text,
+      [
+        'Forum search · from the start',
+        'Forum directory: /forums/shared (supplied PI_FORUM_DIR)',
+        'Forum is on for agents.',
+        `Query: ${QUERY}`,
+        '',
+        '1. Topic: Flaky  tests: timeout',
+        `   Topic ${topic.id} · by alice · ${topic.created_at}`,
+        `2. Message by bob · ${hit.created_at}`,
+        `   Message ${hit.id} · topic ${topic.id} · reply to ${message!.id}`,
+        '   flaky  tests: timeout again…',
+        '',
+        'You are caught up.',
+      ].join('\n'),
+    )
+  })
+
+  test('a full page offers the next-page command with the exact query and cursor; later pages say where they start', async () => {
+    const { forum } = await seeded({ topics: 3, messages: 8, body: (t, m) => `needle ${t}.${m}` })
+    const page = await forum.search('needle', { limit: LIST_PAGE_SIZE })
+    assert.equal(page.items.length, LIST_PAGE_SIZE)
+    const text = formatSearchResults({ target: TARGET, query: QUERY, page })
+    assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum search --after ${page.next_cursor} -- ${QUERY}`)
+    assert.equal(text.match(/^\d+\. Message by bob\d · /gm)!.length, LIST_PAGE_SIZE)
+    const rest = await forum.search('needle', { after: page.next_cursor, limit: LIST_PAGE_SIZE })
+    const next = formatSearchResults({ target: TARGET, query: 'needle', page: rest, after: page.next_cursor })
+    assert.match(next, new RegExp(`^Forum search · after cursor ${page.next_cursor}\n[^]*\nQuery: needle\n\n1\. Message by bob4 · `))
+    assert.equal(lastLine(next), 'You are caught up.')
+    // A query starting with "-" follows "--" too; a cursor starting with "-" is written --after=.
+    const dashed = formatSearchResults({ target: TARGET, query: '-x OR --after', page: { ...page, next_cursor: '-c' } })
+    assert.equal(lastLine(dashed), '20 shown; there may be more. Next page: /forum search --after=-c -- -x OR --after')
+  })
+
+  test('empty and short pages are caught up and show no cursor', () => {
+    const empty: Page<SearchHit> = { items: [], next_cursor: 'c1' }
+    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty }), /\nQuery: x\n\nNo matches\.\n\nYou are caught up\.$/)
+    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty, after: 'c0' }), /\n\nNo newer matches\.\n\nYou are caught up\.$/)
+    const topic: Topic = { id: 't', title: 'x', created_by: 'a', created_at: 'now' }
+    const short = formatSearchResults({ target: TARGET, query: 'x', page: { items: [{ type: 'topic', topic }], next_cursor: 'c2' } })
+    assert.doesNotMatch(short, /--after|c2|more/)
+  })
+
+  test('query, titles, bodies and IDs show controls as visible text; such a query gets the cursor without a command', () => {
+    const topic: Topic = { id: 'id\u200f', title: `\x1b]0;pwned\x07 **t** ‮x`, created_by: 'x\ty', created_at: 'now' }
+    const message: Message = { id: 'm\x1b', topic_id: 't\x07', author: 'a\u202e', created_at: 'c', body: `${'長'.repeat(EXCERPT_CHARS + 10)}\x1b[2J` }
+    const items: SearchHit[] = Array.from({ length: LIST_PAGE_SIZE }, (_, i) => (i % 2 ? { type: 'message', message } : { type: 'topic', topic }))
+    const query = 'line one\nNOT\x1b[2J ‮two'
+    const text = formatSearchResults({ target: TARGET, query, page: { items, next_cursor: 'c9' }, warnings: [`bad\x1b`] })
+    assert.doesNotMatch(text, RAW_CONTROLS)
+    assert.ok(text.includes('\nQuery: line one␊NOT␛[2J ⟨U+202E⟩two\n'))
+    assert.ok(text.includes('\n1. Topic: ␛]0;pwned␇ **t** ⟨U+202E⟩x\n   Topic id⟨U+200F⟩ · by x␉y · now\n'))
+    assert.ok(text.includes(`\n2. Message by a⟨U+202E⟩ · c\n   Message m␛ · topic t␇\n   ${'長'.repeat(EXCERPT_CHARS - 1)}…\n`))
+    assert.ok(text.includes('\n1 damaged record(s) skipped; first: bad␛\n'))
+    assert.equal(lastLine(text), '20 shown; there may be more after cursor c9.')
+  })
+})
+
 describe('damaged records', () => {
   test('lists and reads count the damaged records their read skipped', () => {
     const warnings = ['skipping malformed record at byte offset 10: bad\x1b[0m', 'ignoring incomplete record at byte offset 99']
@@ -275,6 +345,9 @@ describe('damaged records', () => {
     const page = { items: [], next_cursor: 'c' }
     assert.ok(formatTopicList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
     assert.ok(formatMessageList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
+    assert.ok(formatSearchResults({ target: TARGET, query: 'q', page, warnings }).includes(`\n${expected}\n`))
+    assert.ok(formatSearchResults({ target: TARGET, query: 'q', page, warnings: { items: [], omitted: 3 } }).includes('\n3 damaged record(s) skipped\n'))
+    assert.doesNotMatch(formatSearchResults({ target: TARGET, query: 'q', page }), /damaged/)
     const message: Message = { id: 'm', topic_id: 't', author: 'a', body: 'b', created_at: 'c' }
     assert.ok(formatMessage({ target: TARGET, message, warnings }).includes(`\n${expected}\n`))
     assert.doesNotMatch(formatTopicList({ target: TARGET, page }), /damaged/)
@@ -328,6 +401,12 @@ describe('bidirectional controls', () => {
       formatMessageList({ target, topicId: `t${BIDI}`, page: { items: [message], next_cursor: 'c' }, warnings: { items: [`bad${BIDI}`], omitted: 2 } }),
       formatMessage({ target, message, warnings: [`bad${BIDI}`] }),
       excerpt(message.body),
+      formatSearchResults({
+        target,
+        query: `q${BIDI}`,
+        page: { items: [{ type: 'topic', topic }, { type: 'message', message }], next_cursor: 'c' },
+        warnings: [`bad${BIDI}`],
+      }),
       ...bodyLines(message.body),
     ]
     for (const text of texts) {
@@ -360,6 +439,38 @@ describe('text commands', () => {
       [{ kind: 'read', messageId: 'ui' }, '/forum read ui'],
     ]
     for (const [view, command] of table) assert.equal(textCommand(view), command, JSON.stringify(view))
+  })
+
+  test('a search keeps its query exactly, after "--" when there are options or it starts with "-"', () => {
+    const table: [SearchView, string][] = [
+      [{ kind: 'search', query: 'flaky' }, '/forum search flaky'],
+      [
+        { kind: 'search', query: '"flaky  tests" AND (timeout OR deadlock) NOT resolved' },
+        '/forum search "flaky  tests" AND (timeout OR deadlock) NOT resolved',
+      ],
+      [{ kind: 'search', query: '"a \\"b\\" \\\\c"' }, '/forum search "a \\"b\\" \\\\c"'],
+      [{ kind: 'search', query: 'x', after: 'c1' }, '/forum search --after c1 -- x'],
+      [{ kind: 'search', query: 'x', after: '-c1' }, '/forum search --after=-c1 -- x'],
+      [{ kind: 'search', query: '-x' }, '/forum search -- -x'],
+      [{ kind: 'search', query: '--after c -- y' }, '/forum search -- --after c -- y'],
+      [{ kind: 'search', query: '--' }, '/forum search -- --'],
+      [{ kind: 'search', query: 'x --after c' }, '/forum search x --after c'],
+      [{ kind: 'search', query: 'search' }, '/forum search search'],
+      [{ kind: 'search', query: '日本 🧵' }, '/forum search 日本 🧵'],
+    ]
+    for (const [view, command] of table) assert.equal(textCommand(view), command, JSON.stringify(view))
+    // TextView takes every view a text read reads.
+    const views: TextView[] = table.map(([view]) => view)
+    assert.equal(views.length, table.length)
+  })
+
+  test('a search query that cannot be typed back as written gives no command', () => {
+    for (const query of ['', ' x', 'x ', 'two\nlines', 'a\r\nb', 'tab\there', 'esc\x1b', 'c1\x85', 'nbsp\u00a0x', 'ls\u2028x', 'ideo\u3000x', ...[...BIDI].map((c) => `x${c}`)]) {
+      assert.equal(textCommand({ kind: 'search', query }), null, JSON.stringify(query))
+      assert.equal(textCommand({ kind: 'search', query, after: 'c' }), null, JSON.stringify(query))
+    }
+    // A cursor follows the same rules as in the lists.
+    for (const after of ['', 'two words', 'esc\x1b']) assert.equal(textCommand({ kind: 'search', query: 'x', after }), null)
   })
 
   test('arguments that cannot be typed back as one word give no command', () => {

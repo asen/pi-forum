@@ -1,6 +1,7 @@
 // End-to-end CLI workflow in a temp directory, run with `npm run smoke`: two callers share one
 // forum through the bundled executable, page through it with cursors, pick up a later append,
-// and leave nothing behind outside the forum directory, which is removed at the end.
+// search it with shell-quoted queries, and leave nothing behind outside the forum directory, which
+// is removed at the end.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -9,7 +10,7 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { Environment } from '../src/cli.mjs'
-import type { CreateTopicResult, Message, Page, Topic } from '../src/types.d.mts'
+import type { CreateTopicResult, Message, Page, SearchHit, Topic } from '../src/types.d.mts'
 
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
 const NODE_DIR = path.dirname(process.execPath)
@@ -32,10 +33,11 @@ interface Responses {
   message: { post: { message: Message }; get: { message: Message }; list: Page<Message> }
 }
 
-// Runs pi-forum through PATH with only the given environment, as Pi's bash would.
-function piForum(args: readonly string[], { env, cwd, input }: PiForumOptions): Promise<PiForumResult> {
+// Runs pi-forum through PATH with only the given environment, as Pi's bash would. Given a string,
+// runs it as a shell command line, so the shell does the quoting.
+function piForum(args: readonly string[] | string, { env, cwd, input }: PiForumOptions): Promise<PiForumResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('pi-forum', args, { env, cwd })
+    const child = typeof args === 'string' ? spawn('/bin/sh', ['-c', args], { env, cwd }) : spawn('pi-forum', args, { env, cwd })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
@@ -72,6 +74,15 @@ test('a shared forum workflow through the bundled executable', async () => {
       assert.equal(result.code, 0)
       return JSON.parse(result.stdout)
     }
+
+    // Runs a search command line through the shell, expecting its page of hits.
+    const search = async (commandLine: string, env: Environment): Promise<Page<SearchHit>> => {
+      const result = await piForum(commandLine, { env, cwd: work })
+      assert.equal(result.stderr, '', `stderr of ${commandLine}`)
+      assert.equal(result.code, 0)
+      return JSON.parse(result.stdout)
+    }
+    const text = (hit: SearchHit) => (hit.type === 'topic' ? hit.topic.title : hit.message.body)
 
     // The main session opens a topic with an initial message.
     const created = await ok(['topic', 'create', 'Flaky tests', '--body', 'Report findings here.'], main)
@@ -114,10 +125,34 @@ test('a shared forum workflow through the bundled executable', async () => {
     assert.deepEqual(bodies, ['Report findings here.', fromFile.message.body, fromStdin.message.body, 'Confirmed.'])
 
     // A later append shows up after the caught-up cursor, and only it.
-    await ok(['message', 'post', topicId, '--body', 'Fixed in the pool config.'], helper)
+    const fixed = await ok(['message', 'post', topicId, '--body', 'Fixed in the pool config.'], helper)
     const later = await ok(['message', 'list', '--topic', topicId, '--after', cursor], main)
     assert.deepEqual(later.items.map((m) => m.body), ['Fixed in the pool config.'])
     assert.deepEqual((await ok(['message', 'list', '--after', later.next_cursor], main)).items, [])
+
+    // Searches quoted as a shell user would: phrases and groups reach the query intact, and each
+    // topic title or message body matches on its own.
+    const found = await search(`pi-forum search '"flaky tests" OR ("pool" AND (timeout OR config)) NOT size' --limit 20`, main)
+    assert.deepEqual(found.items, [
+      { type: 'topic', topic: created.topic },
+      { type: 'message', message: fromFile.message },
+      { type: 'message', message: fixed.message },
+    ])
+    // A phrase with escaped quotes, paged one hit at a time.
+    const quoted: SearchHit[] = []
+    let after = ''
+    for (;;) {
+      const page = await search(`pi-forum search '"\\"pool\\""' --limit 1 ${after}`, helper)
+      if (page.items.length === 0) break
+      quoted.push(...page.items)
+      after = `--after ${page.next_cursor}`
+    }
+    assert.deepEqual(quoted.map(text), [fromFile.message.body, fromStdin.message.body])
+    // A dash-leading query follows the options and --.
+    assert.deepEqual((await search(`pi-forum search --limit 5 -- --grep`, main)).items.map(text), [fromFile.message.body])
+    assert.deepEqual((await search(`pi-forum search 'nothing AND "like this"'`, main)).items, [])
+    const malformed = await piForum(`pi-forum search '(flaky'`, { env: main, cwd: work })
+    assert.deepEqual(malformed, { code: 1, stdout: '', stderr: 'pi-forum: error: search query has an unclosed "(" at offset 0\n' })
 
     // An unknown topic lists as empty; getting it or an unknown message fails on stderr.
     assert.deepEqual((await ok(['message', 'list', '--topic', 'no-such-topic'], main)).items, [])

@@ -2,9 +2,19 @@ import type { AutocompleteItem } from '@earendil-works/pi-tui'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { createForum as sharedCreateForum } from '../src/forum.mjs'
-import type { CreateForumOptions, ReadCallOptions } from '../src/types.d.mts'
+import type { CreateForumOptions, Forum, ReadCallOptions } from '../src/types.d.mts'
 import { type Browser, type BrowserForum, createBrowser } from './browser-state.ts'
-import { bindingOrigin, formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.ts'
+import {
+  bindingOrigin,
+  formatMessage,
+  formatMessageList,
+  formatSearchResults,
+  formatTarget,
+  formatTopicList,
+  LIST_PAGE_SIZE,
+  printable,
+  textCommand,
+} from './output.ts'
 import { createPreferenceStore } from './preferences.ts'
 import type {
   BindingStatus,
@@ -21,6 +31,7 @@ import type {
   RuntimeContext,
   SavedDefault,
   ScopeState,
+  TextView,
   VisibleWidth,
 } from './types.ts'
 
@@ -28,8 +39,9 @@ export const SECTION_NAME = 'forum'
 export const COMMAND_NAME = 'forum'
 export const USAGE =
   'Usage: /forum [on|off|status] | /forum on|off|reset project|user | /forum topics [--after CURSOR] | ' +
-  '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
-const ACTIONS = ['on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'ui']
+  '/forum messages [TOPIC_ID] [--after CURSOR] | /forum read MESSAGE_ID | /forum search [--after CURSOR --] QUERY | ' +
+  '/forum ui [topics | messages [TOPIC_ID] | read MESSAGE_ID]'
+const ACTIONS = ['on', 'off', 'status', 'reset', 'topics', 'messages', 'read', 'search', 'ui']
 const UI_VIEWS = ['topics', 'messages', 'read']
 const SCOPES = ['project', 'user'] as const satisfies readonly PreferenceScope[]
 // The words completed after an action and a space.
@@ -43,8 +55,11 @@ const NESTED = new Map<string, readonly string[]>([
 // Feedback for the user of the command or session event that ctx belongs to.
 export type RuntimeReport = (message: string, ctx: RuntimeContext, type?: NotifyType) => void
 
+// The read client of a selection: what the browser reads through, and search for text reads.
+export type ReadClient = BrowserForum & Pick<Forum, 'search'>
+
 // Opens the read client of a selection. Only the directory is read; the client must not create it.
-export type CreateReader = (options: Pick<CreateForumOptions, 'forumDir'> & { createOnRead: false }) => BrowserForum
+export type CreateReader = (options: Pick<CreateForumOptions, 'forumDir'> & { createOnRead: false }) => ReadClient
 
 export interface ForumRuntimeOptions {
   // The bundled executable's directory, prepended to PATH while the forum is on.
@@ -88,12 +103,12 @@ export interface ForumRuntime {
   command(args: string, ctx: RuntimeContext): Promise<void> | undefined
 }
 
-// /forum arguments, parsed: a control action, a scoped default to save or reset, a text read or a
-// browser view.
+// /forum arguments, parsed: a control action, a scoped default to save or reset, a text read (a
+// browser view or a search) or a browser view.
 type ForumCommand =
   | { action: 'on' | 'off' | 'status'; scope?: undefined; text?: undefined; ui?: undefined }
   | { action: 'on' | 'off' | 'reset'; scope: PreferenceScope; text?: undefined; ui?: undefined }
-  | { text: ForumView; action?: undefined; scope?: undefined; ui?: undefined }
+  | { text: TextView; action?: undefined; scope?: undefined; ui?: undefined }
   | { ui: ForumView; action?: undefined; scope?: undefined; text?: undefined }
 
 // The change prependPath made to PATH, to undo later.
@@ -107,7 +122,7 @@ type ActiveBinding = ForumBinding & { pathChange: PathChange | null }
 
 // A selection's read client and the controller whose signal ends its reads.
 interface Reader {
-  forum: BrowserForum
+  forum: ReadClient
   controller: AbortController
 }
 
@@ -134,8 +149,8 @@ type BindingChoice = ForumBinding | { error: string }
 // "unavailable" means the binding could not be selected, or the environment no longer carries it;
 // only /forum on retries.
 //
-// /forum topics, messages and read print one page or message as plain text (output.ts); /forum ui
-// opens the same views in the terminal browser. Both read the last successfully selected directory,
+// /forum topics, messages, read and search print one page or message as plain text (output.ts);
+// /forum ui opens the views other than search in the terminal browser. Both read the last successfully selected directory,
 // whatever the status: reading never selects, activates or changes the environment. They read through
 // one lazily created client per selection, so the forum it first resolves to stays pinned; a
 // successful /forum on or shutdown discards it, off and a failed on keep it.
@@ -435,7 +450,7 @@ export function createForumRuntime({
     return reader
   }
 
-  async function readText(view: ForumView, ctx: RuntimeContext) {
+  async function readText(view: TextView, ctx: RuntimeContext) {
     if (textRead) {
       report('A forum read is still running; wait for it to finish before starting another.', ctx, 'warning')
       return
@@ -466,7 +481,12 @@ export function createForumRuntime({
         text = formatMessage({ target: { ...target, resolved: forum.resolved }, message, warnings, visibleWidth })
       } else {
         const page = { ...options, after: view.after, limit: LIST_PAGE_SIZE }
-        if (view.kind === 'topics') {
+        if (view.kind === 'search') {
+          const result = await forum.search(view.query, page)
+          if (!live()) return
+          const shown = { target: { ...target, resolved: forum.resolved }, page: result, after: view.after, warnings }
+          text = formatSearchResults({ ...shown, query: view.query })
+        } else if (view.kind === 'topics') {
           const result = await forum.listTopics(page)
           if (!live()) return
           text = formatTopicList({ target: { ...target, resolved: forum.resolved }, page: result, after: view.after, warnings })
@@ -492,7 +512,8 @@ export function createForumRuntime({
           : first
             ? ` Run ${first} to start from the first page.`
             : ' Run it again without --after to start from the first page.'
-      report(printable(`Could not read ${target.forumDir}: ${errorField(err, 'message') ?? err}.${restart}`), ctx, 'error')
+      const verb = view.kind === 'search' ? 'search' : 'read'
+      report(printable(`Could not ${verb} ${target.forumDir}: ${errorField(err, 'message') ?? err}.${restart}`), ctx, 'error')
     } finally {
       if (textRead === token) textRead = null
     }
@@ -551,11 +572,13 @@ export function createForumRuntime({
 // Parses /forum arguments: { action } for on, off and status (the default), { action, scope } for
 // on, off and reset with project or user, { text } for a text read, { ui } for the browser, or null
 // for anything else. Words are exact and lowercase; IDs are single
-// words. Before the first standalone "--", text lists take one --after CURSOR (or --after=CURSOR) and
+// words. A search keeps its query as typed (see parseSearch). Before the first standalone "--", text lists take one --after CURSOR (or --after=CURSOR) and
 // any other word starting with "-" is an unknown flag; read takes no options. That "--" is dropped and
 // every word after it, another "--" included, is an ID. The browser views take their IDs as before
 // and no flags.
 function parseCommand(args: string): ForumCommand | null {
+  const search = /^search(?=\s|$)/.exec(args.trim())
+  if (search) return parseSearch(args.trim().slice(search[0].length))
   const [word = 'status', ...rest] = args.trim().split(/\s+/).filter(Boolean)
   if (oneOf(['on', 'off', 'status'], word) && rest.length === 0) return { action: word }
   if (oneOf(['on', 'off', 'reset'], word)) {
@@ -587,6 +610,34 @@ function parseCommand(args: string): ForumCommand | null {
   if (!view) return null
   // read takes no options, so only a list view can have a cursor here.
   return { text: after === undefined || view.kind === 'read' ? view : { ...view, after } }
+}
+
+// Parses what follows "search": one optional --after CURSOR (or --after=CURSOR), then the query. The
+// first other word, or whatever follows a standalone "--", starts the query, which runs to the end
+// unchanged but for the surrounding whitespace: its quotes, backslashes, spacing and later words that
+// look like options or "--" are all query text. Before the query, another word starting with "-", a
+// repeated or empty cursor, or a cursor starting with "-" after a separate --after is an error, as
+// is an empty query.
+function parseSearch(text: string): ForumCommand | null {
+  const word = /\S+/g
+  let after: string | undefined
+  for (let match = word.exec(text); match; match = word.exec(text)) {
+    const [item] = match
+    if (item === '--') return searchCommand(text.slice(word.lastIndex), after)
+    if (!item.startsWith('-')) return searchCommand(text.slice(match.index), after)
+    if (after !== undefined) return null
+    if (item.startsWith('--after=')) after = item.slice('--after='.length)
+    else if (item === '--after') after = word.exec(text)?.[0]
+    else return null
+    if (!after || (item === '--after' && after.startsWith('-'))) return null
+  }
+  return null
+}
+
+function searchCommand(rest: string, after: string | undefined): ForumCommand | null {
+  const query = rest.trim()
+  if (query === '') return null
+  return { text: after === undefined ? { kind: 'search', query } : { kind: 'search', query, after } }
 }
 
 function parseView(kind: string | undefined, ids: string[]): ForumView | null {
@@ -728,9 +779,11 @@ Commands (JSON output; \`pi-forum --help\` for options):
   pi-forum topic get TOPIC_ID
   pi-forum message post TOPIC_ID --body TEXT [--reply-to MESSAGE_ID] [--author LABEL]
   pi-forum message list [--topic TOPIC_ID] [--after CURSOR] [--limit N]
+  pi-forum search 'QUERY' [--after CURSOR] [--limit N]
 
 Bodies: --body TEXT; for long or multi-line text, use --body-file PATH or --body-stdin with a quoted heredoc.
 Lists: Pass next_cursor as --after to read newer items; an empty page means caught up. message list without --topic reads the whole forum.
+Search: Run it yourself when looking for earlier work; nothing searches automatically. It matches topic titles and message bodies, each on its own; quote the whole query as one argument, e.g. pi-forum search '"flaky tests" AND (timeout OR deadlock) NOT resolved'.
 
 When to use it:
 - Read at task start, decision points, after a unit of work, or when blocked; do not poll in a loop.
