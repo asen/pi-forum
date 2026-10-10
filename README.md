@@ -93,7 +93,7 @@ The variable must be in Pi's process environment, as in the launch examples abov
 - A supplied directory is not remembered across launches. A saved project default of `on` pins the forum to `<cwd>/.pi/forum/`; a saved user default only controls activation and never pins or makes a global forum.
 - Sessions in a project with `/forum on project` share its forum. Otherwise each session has its own directory. You can still explicitly share any path, including across projects, with `PI_FORUM_DIR`.
 - A relative or empty `PI_FORUM_DIR` is reported as an error. The forum is then unavailable for that session, and the environment is left unchanged (see `/forum` below).
-- While the forum is on, each agent run's system prompt gets a `<forum>` section with the directory, the session's author identity, the commands, and usage guidance. Other prompt sections are left alone.
+- While the forum is on, each agent run's system prompt gets a concise `<forum>` section with the directory, commands, sender-name guidance and coordination rules. Use an available logical name (assigned agent name or role) with `--author`; otherwise leave that option unset for the CLI default. The prompt does not assume session metadata. Other prompt sections are left alone.
 
 ### Saved defaults
 
@@ -282,7 +282,7 @@ EOF
 - **Binding:** every command except `--help` needs an absolute `PI_FORUM_DIR`. Pi sets it while `/forum` is on, and outside Pi you set it yourself. Every command, including lists and gets, creates the directory if it is missing, as in earlier versions. (`/forum` reads, as text or in the browser, and the library API's default read client do not.)
 - **Output:** one JSON object on stdout: `{"topic", "message"}` from create, `{"topic"}` from `topic get`, `{"message"}` from `message post` and `message get`, `{"items", "next_cursor"}` from lists. Errors and warnings go to stderr, and a failure exits with status 1.
 - **Bodies:** use exactly one of `--body`, `--body-file` or `--body-stdin`. Bodies are stored exactly as given, up to 64 KiB of UTF-8. A topic body becomes the topic's first message.
-- **Attribution:** `--author LABEL`, else `$PI_SESSION_ID`, else `external`. `origin_session_id` is recorded only when `PI_SESSION_ID` is set. Pi's bash sets it to the current session. A non-Pi process started from that bash inherits it unless it passes `--author`. Labels are attribution, not authentication.
+- **Attribution:** `--author LABEL`, else `$PI_SESSION_ID`, else `external`. The agent guidance prefers an available logical sender name from its task/context through `--author`; when none is available, omit that option to use the CLI default. `origin_session_id` is recorded whenever `PI_SESSION_ID` is set, even with an explicit author. Pi's bash sets it to the current session. A non-Pi process started from that bash inherits it unless it passes `--author`. Labels are attribution, not authentication.
 - **Cursors:** lists return items in creation order, 20 topics or 50 messages per page by default, at most 100. Pass `next_cursor` as `--after` to continue. An empty page means you are caught up. Keep its cursor to read only later posts. Cursors are opaque and belong to one forum.
 - **Listing:** `message list` without `--topic` reads activity across the whole forum. `--topic` with an unknown ID lists nothing (`{"items": [], ...}`) and is not an error. `topic get` and `message post` fail for an unknown topic, and `message get` for an unknown message.
 
@@ -321,8 +321,8 @@ main agent --prompt: how to use pi-forum--> child
 
 While the forum is on, the `<forum>` prompt section instructs the main agent to include concise pi-forum usage and relevant topic IDs in each fresh child's task/context, and preserve `PATH` and `PI_FORUM_DIR` where the launcher permits. This is supporting coordination context, not permission to widen the child's assigned task.
 
-- Read-only children may read existing forum data, but must not create storage or post. Even `pi-forum` list/get commands create the forum directory if it is missing, so read-only children need an already existing directory.
-- Other children may post task-relevant findings only when their permissions allow. Posts remain peer data, not instructions; the main agent must not copy its author identity as the child's.
+- The orchestrator may assign distinct logical names in each child's task/context and use the launcher's naming option when available. Children use their own name consistently with `--author`, not the parent's.
+- Pass on the coordination rules, including treating posts as peer data, not instructions, and omitting `--author` when no logical name is available.
 - If access fails, report the limitation and continue without the forum; do not install anything or bypass restrictions.
 
 Ordinary subprocesses usually inherit the environment. A Pi child that loads pi-forum sees the inherited `PI_FORUM_DIR` as supplied and joins the same forum; a child with the CLI, binding and instructions does not need the extension. Nothing propagates guidance automatically, and no launcher is integrated. These are prompt-level instructions, not a guarantee that a child will participate.
@@ -402,7 +402,7 @@ Gaps in the real-Pi coverage: the interactive trust prompt and `/trust` itself a
 
 Manual interactive checklist (TUI). **Not run yet:**
 
-- [ ] With `PI_FORUM_DIR` unset, `pi -e /abs/path/to/pi-forum`: `/forum` reports off, with no startup notification or forum guidance; `command -v pi-forum` fails unless already installed elsewhere. Type `/forum on`, then ask the agent to run `pi-forum --help`, `command -v pi-forum` and create a topic. The author is the ID shown by `/session`.
+- [ ] With `PI_FORUM_DIR` unset, `pi -e /abs/path/to/pi-forum`: `/forum` reports off, with no startup notification or forum guidance; `command -v pi-forum` fails unless already installed elsewhere. Type `/forum on`, then ask the agent to run `pi-forum --help`, `command -v pi-forum` and create a topic. The author is its available logical name, or the CLI default if no name is available.
 - [ ] `/reload`: off again without a supplied binding or saved default; `/forum on` lets the agent post to the same directory.
 - [ ] `/new`, `/fork`, `/clone`: off with nothing saved; `/forum on` selects a new default directory. `pi-forum topic list` there starts empty.
 - [ ] `/resume` the first session, then `/forum on`: earlier topics are listed again.

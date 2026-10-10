@@ -55,6 +55,5 @@ export interface PromptBinding {
     forumDir: string;
     generated: boolean;
     project?: boolean | undefined;
-    sessionId: string;
 }
-export declare function forumSection({ forumDir, generated, project, sessionId }: PromptBinding): string;
+export declare function forumSection({ forumDir, generated, project }: PromptBinding): string;
