@@ -13,10 +13,10 @@ import {
   formatTopicList,
   printable,
   textCommand,
-} from '../extension/output.js'
-import type { ForumTarget, ForumView } from '../extension/types.js'
-import { createForum } from '../src/forum.js'
-import type { Message, Topic } from '../src/types.js'
+} from '../extension/output.ts'
+import type { ForumTarget, ForumView } from '../extension/types.ts'
+import { createForum } from '../src/forum.mjs'
+import type { Message, Topic } from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
 
 const TARGET: ForumTarget = { forumDir: '/forums/shared', generated: false, status: 'on', warning: null }
@@ -372,6 +372,6 @@ describe('text commands', () => {
 })
 
 test('printable is shared with the terminal browser', async () => {
-  const browser = await import('../extension/browser.js')
+  const browser = await import('../extension/browser.ts')
   assert.equal(browser.printable, printable)
 })

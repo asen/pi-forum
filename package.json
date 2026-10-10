@@ -9,18 +9,17 @@
   },
   "files": [
     "bin/pi-forum",
-    "src/*.js",
-    "src/*.d.ts",
-    "src/backends/*.js",
-    "src/backends/*.d.ts",
-    "extension/*.js",
-    "extension/*.d.ts",
+    "src/*.mjs",
+    "src/*.d.mts",
+    "src/backends/*.mjs",
+    "src/backends/*.d.mts",
+    "extension/*.ts",
     "README.md",
     "docs/architecture.md"
   ],
   "pi": {
     "extensions": [
-      "./extension/index.js"
+      "./extension/forum.ts"
     ]
   },
   "peerDependencies": {
@@ -33,10 +32,7 @@
   "scripts": {
     "test": "node --test \"test/*.test.ts\"",
     "smoke": "node --test test/smoke.test.ts",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.tooling.json",
-    "build": "node scripts/build.mjs",
-    "check-generated": "node scripts/build.mjs --check",
-    "prepack": "npm run build"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.tooling.json"
   },
   "devDependencies": {
     "@babel/parser": "7.29.7",

@@ -1,5 +1,5 @@
 // Forum text for people: the sanitizing helpers the terminal browser shares, and plain-text
-// formatters for the results of src/forum.js reads (a listTopics or listMessages page, or one
+// formatters for the results of src/forum.mjs reads (a listTopics or listMessages page, or one
 // getMessage record). Forum text is peer data: control characters and bidirectional formatting are
 // shown as visible symbols, Markdown stays literal, and nothing is styled, so the text means the same
 // wherever it is shown and no terminal escape is ever interpreted.
@@ -10,7 +10,7 @@
 // { items, omitted } when the caller kept only the first items and counted the rest. The requests
 // and views are typed in types.ts.
 
-import type { Message, Page, Topic } from '../src/types.js'
+import type { Message, Page, Topic } from '../src/types.d.mts'
 import type {
   ForumBinding,
   ForumTarget,
@@ -22,7 +22,7 @@ import type {
   TopicListRequest,
   VisibleWidth,
   WarningSummary,
-} from './types.js'
+} from './types.ts'
 
 // Rows per text list page; the caller reads each page with this limit.
 export const LIST_PAGE_SIZE = 20

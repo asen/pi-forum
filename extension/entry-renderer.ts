@@ -1,13 +1,13 @@
 // Pi session entries holding /forum text results, and their transcript renderer.
 //
-// The runtime's text results are plain, already printable text (output.js). Each is recorded as one
+// The runtime's text results are plain, already printable text (output.ts). Each is recorded as one
 // custom entry, which Pi keeps out of the model's context, and drawn as plain text: no Markdown, no
 // styling and no collapsing, so every line is shown whether or not tool output is expanded. Control
 // characters are made visible again on render, since a stored entry is read back from the session.
 
 import type { EntryRenderer } from '@earendil-works/pi-coding-agent'
 import type { Text } from '@earendil-works/pi-tui'
-import { printable } from './output.js'
+import { printable } from './output.ts'
 
 export const ENTRY_TYPE = 'pi-forum.output'
 

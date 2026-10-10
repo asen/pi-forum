@@ -5,10 +5,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { main } from '../src/cli.js'
-import type { Environment, ForumFactory } from '../src/cli.js'
-import { createForum } from '../src/forum.js'
-import { createTopic, postMessage } from '../src/storage.js'
+import { main } from '../src/cli.mjs'
+import type { Environment, ForumFactory } from '../src/cli.mjs'
+import { createForum } from '../src/forum.mjs'
+import { createTopic, postMessage } from '../src/storage.mjs'
 import type {
   CreateForumOptions,
   CreateTopicResult,
@@ -18,7 +18,7 @@ import type {
   ReadCallOptions,
   Topic,
   WriteCallOptions,
-} from '../src/types.js'
+} from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
 import type { FakeAdapter } from './fake-adapter.ts'
 

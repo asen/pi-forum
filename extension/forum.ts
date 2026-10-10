@@ -2,11 +2,11 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { getAgentDir } from '@earendil-works/pi-coding-agent'
 import * as tui from '@earendil-works/pi-tui'
 import { fileURLToPath } from 'node:url'
-import { createForum } from '../src/forum.js'
-import { createBrowserOpener } from './browser.js'
-import { createEntryRenderer, ENTRY_TYPE, entryData } from './entry-renderer.js'
-import { createPreferenceStore } from './preferences.js'
-import { COMMAND_NAME, createForumRuntime, forumCompletions } from './runtime.js'
+import { createForum } from '../src/forum.mjs'
+import { createBrowserOpener } from './browser.ts'
+import { createEntryRenderer, ENTRY_TYPE, entryData } from './entry-renderer.ts'
+import { createPreferenceStore } from './preferences.ts'
+import { COMMAND_NAME, createForumRuntime, forumCompletions } from './runtime.ts'
 
 // The bundled executable's directory, wherever the package is installed.
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))

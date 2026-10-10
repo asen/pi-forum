@@ -1,11 +1,11 @@
 import type { AutocompleteItem } from '@earendil-works/pi-tui'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
-import { createForum as sharedCreateForum } from '../src/forum.js'
-import type { CreateForumOptions, ReadCallOptions } from '../src/types.js'
-import { type Browser, type BrowserForum, createBrowser } from './browser-state.js'
-import { bindingOrigin, formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.js'
-import { createPreferenceStore } from './preferences.js'
+import { createForum as sharedCreateForum } from '../src/forum.mjs'
+import type { CreateForumOptions, ReadCallOptions } from '../src/types.d.mts'
+import { type Browser, type BrowserForum, createBrowser } from './browser-state.ts'
+import { bindingOrigin, formatMessage, formatMessageList, formatTarget, formatTopicList, LIST_PAGE_SIZE, printable, textCommand } from './output.ts'
+import { createPreferenceStore } from './preferences.ts'
 import type {
   BindingStatus,
   BrowserReport,
@@ -22,7 +22,7 @@ import type {
   SavedDefault,
   ScopeState,
   VisibleWidth,
-} from './types.js'
+} from './types.ts'
 
 export const SECTION_NAME = 'forum'
 export const COMMAND_NAME = 'forum'
@@ -121,7 +121,7 @@ type BindingChoice = ForumBinding | { error: string }
 //
 // Each runtime starts from its default, by precedence: a supplied PI_FORUM_DIR (inherited or set at
 // launch, never the one this runtime generated) turns it on, then the saved project and user defaults
-// (preferences.js), then off. The saved defaults are read once at session start and again after each
+// (preferences.ts), then off. The saved defaults are read once at session start and again after each
 // successful /forum on|off|reset project|user; status reports what was last read. An enabled project
 // default pins the forum to <cwd>/.pi/forum; user defaults only activate a session directory. A
 // supplied PI_FORUM_DIR still wins over either choice.
@@ -134,7 +134,7 @@ type BindingChoice = ForumBinding | { error: string }
 // "unavailable" means the binding could not be selected, or the environment no longer carries it;
 // only /forum on retries.
 //
-// /forum topics, messages and read print one page or message as plain text (output.js); /forum ui
+// /forum topics, messages and read print one page or message as plain text (output.ts); /forum ui
 // opens the same views in the terminal browser. Both read the last successfully selected directory,
 // whatever the status: reading never selects, activates or changes the environment. They read through
 // one lazily created client per selection, so the forum it first resolves to stays pinned; a
@@ -147,7 +147,7 @@ type BindingChoice = ForumBinding | { error: string }
 //
 // Only the terminal UI (ctx.mode "tui") opens openBrowser; other modes are pointed to the text
 // command. At most one browser is open per runtime. openBrowser receives its controller
-// (browser-state.js) and resolves once it is closed; discarding the selection closes it, off leaves it
+// (browser-state.ts) and resolves once it is closed; discarding the selection closes it, off leaves it
 // open. visibleWidth, if given, measures text for tab stops in message bodies.
 export function createForumRuntime({
   binDir,
@@ -629,7 +629,7 @@ function scopeText({ path: file, enabled, ignored, error }: ScopeState) {
   return `${enabled === undefined ? 'not set' : onOff(enabled)} (${file})`
 }
 
-// The default opener for hosts without the terminal browser (Pi gets browser.js).
+// The default opener for hosts without the terminal browser (Pi gets browser.ts).
 async function noBrowser(): Promise<never> {
   throw new Error('no terminal browser is available')
 }

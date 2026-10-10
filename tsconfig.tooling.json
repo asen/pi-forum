@@ -1,19 +1,17 @@
 {
-  // Authored TypeScript outside production: build tooling under scripts/ and tests, their helpers and
-  // fixtures under test/. Node runs these files directly by stripping their types, so they are only
-  // ever checked (npm run typecheck), never emitted, and use only syntax Node can erase. Relative
+  // Authored TypeScript outside production: tests, their helpers and fixtures under test/. Node runs
+  // these files directly by stripping their types, so they use only syntax Node can erase. Relative
   // imports between them name the .ts file itself.
+  //
+  // The .d.mts sidecars under src/ are roots here rather than in tsconfig.json, which checks the
+  // .mjs modules they declare (see there why one config cannot hold both).
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true,
-    "declaration": false,
-    "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["scripts/**/*.ts", "scripts/**/*.mts", "test/**/*.ts", "test/**/*.mts"],
-  // Production declarations are generated, not inputs. test/types/consumer.ts compiles only against
-  // the packed package, in a scratch project of test/types.test.ts. Declarations authored under test/
-  // stay included.
-  "exclude": ["src/**/*.d.ts", "extension/**/*.d.ts", "test/types/consumer.ts"]
+  "include": ["test/**/*.ts", "test/**/*.mts", "src/**/*.d.mts"],
+  // test/types/consumer.ts compiles only against the packed package, in a scratch project of
+  // test/types.test.ts. Declarations authored under test/ stay included.
+  "exclude": ["test/types/consumer.ts"]
 }

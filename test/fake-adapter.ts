@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { setImmediate as tick } from 'node:timers/promises'
-import { ForumError } from '../src/forum.js'
-import type { EventVisitor, ForumAdapter, ForumEvent, ForumStore, OpenOptions } from '../src/types.js'
+import { ForumError } from '../src/forum.mjs'
+import type { EventVisitor, ForumAdapter, ForumEvent, ForumStore, OpenOptions } from '../src/types.d.mts'
 
 // One in-memory forum: its events in append order, and the tail of its queue of writes.
 export interface FakeForum {

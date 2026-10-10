@@ -1,35 +1,47 @@
-import { ForumError } from './records.js'
+import { ForumError } from './records.mjs'
+
+/** @import { CursorData } from './cursor.d.mts' */
 
 // Cursors are opaque to callers: base64url JSON { v: 1, forum, offset }, where forum is the
 // SHA-256 of the forum's real directory and offset is a byte position after a complete line.
-export interface CursorData {
-  v: 1
-  forum: string
-  offset: number
-}
-
-export function encodeCursor(forumId: string, offset: number): string {
-  const data: CursorData = { v: 1, forum: forumId, offset }
+/**
+ * @param {string} forumId
+ * @param {number} offset
+ * @returns {string}
+ */
+export function encodeCursor(forumId, offset) {
+  /** @type {CursorData} */
+  const data = { v: 1, forum: forumId, offset }
   return Buffer.from(JSON.stringify(data)).toString('base64url')
 }
 
-function invalid(message: string): ForumError {
+/**
+ * @param {string} message
+ * @returns {ForumError}
+ */
+function invalid(message) {
   return new ForumError('INVALID_CURSOR', message)
 }
 
-const isObject = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  value !== null && typeof value === 'object'
+/**
+ * @param {unknown} value
+ * @returns {value is Readonly<Record<string, unknown>>}
+ */
+const isObject = (value) => value !== null && typeof value === 'object'
 
 // Returns the cursor's byte offset after checking it against this forum and a log snapshot of size
 // bytes; byteAt(position) resolves to one byte of that snapshot.
-export async function decodeCursor(
-  cursor: string,
-  forumId: string,
-  size: number,
-  byteAt: (position: number) => Promise<number | undefined>,
-): Promise<number> {
+/**
+ * @param {string} cursor
+ * @param {string} forumId
+ * @param {number} size
+ * @param {(position: number) => Promise<number | undefined>} byteAt
+ * @returns {Promise<number>}
+ */
+export async function decodeCursor(cursor, forumId, size, byteAt) {
   if (typeof cursor !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw invalid('cursor is not valid')
-  let value: unknown
+  /** @type {unknown} */
+  let value
   try {
     value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
   } catch {

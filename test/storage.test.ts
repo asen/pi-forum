@@ -6,10 +6,10 @@ import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { encodeCursor } from '../src/cursor.js'
-import type { CursorData } from '../src/cursor.js'
-import { createTopic, getTopic, listMessages, listTopics, postMessage } from '../src/storage.js'
-import type { ListMessagesOptions, Message, Page, Topic, WarningHandler } from '../src/types.js'
+import { encodeCursor } from '../src/cursor.mjs'
+import type { CursorData } from '../src/cursor.mjs'
+import { createTopic, getTopic, listMessages, listTopics, postMessage } from '../src/storage.mjs'
+import type { ListMessagesOptions, Message, Page, Topic, WarningHandler } from '../src/types.d.mts'
 
 const roots: string[] = []
 

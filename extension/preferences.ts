@@ -13,7 +13,7 @@ import type {
   PreferenceUpdate,
   SavedDefault,
   ScopeState,
-} from './types.js'
+} from './types.ts'
 
 export const PREFERENCES_FILE = 'forum.json'
 export const SCOPES: readonly PreferenceScope[] = ['user', 'project']

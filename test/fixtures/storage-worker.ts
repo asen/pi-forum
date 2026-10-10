@@ -1,7 +1,7 @@
 // One writer process of storage.test.ts's concurrent-process test, run as
 // `node storage-worker.ts <forumDir> <topicId> <worker>`. It posts ten messages to the topic and creates
 // two topics with initial messages, all labelled with the worker's name.
-import { createTopic, postMessage } from '../../src/storage.js'
+import { createTopic, postMessage } from '../../src/storage.mjs'
 
 const [dir, topicId, worker] = process.argv.slice(2)
 if (dir === undefined || topicId === undefined || worker === undefined) {

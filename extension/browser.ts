@@ -7,10 +7,10 @@
 
 import type { Theme, ThemeColor } from '@earendil-works/pi-coding-agent'
 import type { Component, KeyId, matchesKey, TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
-import type { Message, Topic } from '../src/types.js'
-import type { Browser, BrowserState, BrowserTarget, ListViewState, MessageBrowserState } from './browser-state.js'
-import { expandTabs, printable } from './output.js'
-import type { OpenBrowserRequest } from './types.js'
+import type { Message, Topic } from '../src/types.d.mts'
+import type { Browser, BrowserState, BrowserTarget, ListViewState, MessageBrowserState } from './browser-state.ts'
+import { expandTabs, printable } from './output.ts'
+import type { OpenBrowserRequest } from './types.ts'
 
 export { printable }
 

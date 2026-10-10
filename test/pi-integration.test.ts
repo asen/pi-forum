@@ -15,8 +15,9 @@
 // packages for their values: those imports are type-only, against the Pi this repository develops
 // against (the pinned 1.1.0 devDependencies), and the modules loaded from the root are typed as them
 // where they are imported (setUp). What Pi writes for other processes (JSON and RPC records, session
-// files) and what the probe extensions log is typed where it is parsed. pi-forum itself, in both
-// variants, is always loaded from its generated JavaScript.
+// files) and what the probe extensions log is typed where it is parsed. pi-forum itself, in every
+// variant, is loaded as it ships: Pi's own loader runs the TypeScript extension (extension/forum.ts,
+// also from inside node_modules), and the extension and the bundled CLI import the JavaScript core.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -46,8 +47,8 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 import type { AssistantMessage, JsonObject } from '@earendil-works/pi-ai'
 import type { AutocompleteItem } from '@earendil-works/pi-tui'
-import { createForum } from '../src/forum.js'
-import type { Message, Topic } from '../src/types.js'
+import { createForum } from '../src/forum.mjs'
+import type { Message, Topic } from '../src/types.d.mts'
 import { copyCheckout, listFiles, ROOT } from './checkout.ts'
 import type { LifecycleEvent, LifecycleProbeConfig, LifecycleProbeState } from './fixtures/pi-lifecycle-probe.ts'
 import type { RepairProbeConfig, RepairProbeRecord } from './fixtures/pi-repair-probe.ts'
@@ -58,6 +59,7 @@ import {
   SYNTHETIC_PROVIDER,
   createTerminalUI,
   hasTmux,
+  hostLibrary,
   installSyntheticProvider,
   jsonRecords,
   rpcProcess,
@@ -167,15 +169,8 @@ async function setUp() {
   // against, which the host must provide.
   pi = (await import(pathToFileURL(path.join(PI_ROOT!, piManifest.exports['.'].import)).href)) as PiCodingAgent
   // The host's own copies of its AI and terminal libraries, which it also gives extensions.
-  const hostLibrary = async (name: string) => {
-    for (const dir of [path.join(PI_ROOT!, 'node_modules', '@earendil-works'), path.dirname(PI_ROOT!)]) {
-      const entry = path.join(dir, name, 'dist', 'index.js')
-      if (await fs.access(entry).then(() => true, () => false)) return pathToFileURL(entry).href
-    }
-    throw new Error(`cannot find @earendil-works/${name} for ${PI_ROOT}`)
-  }
-  piAi = (await import(await hostLibrary('pi-ai'))) as PiAi
-  piTui = (await import(await hostLibrary('pi-tui'))) as PiTui
+  piAi = (await import(hostLibrary(PI_ROOT!, 'pi-ai'))) as PiAi
+  piTui = (await import(hostLibrary(PI_ROOT!, 'pi-tui'))) as PiTui
   pi.initTheme('dark')
   // Pi passes custom UI factories this live view of the active theme, which initTheme set.
   const themeKey = Symbol.for('@earendil-works/pi-coding-agent:theme')
@@ -193,9 +188,9 @@ async function setUp() {
   await fs.writeFile(probes.synthetic, SYNTHETIC_PROVIDER)
   await fs.writeFile(probes.fileSynthetic, FILE_SYNTHETIC_PROVIDER)
 
-  // Packs the tracked files without running prepack, so the working tree is never rebuilt
-  // (build.test.ts covers prepack in a scratch copy).
-  const { stdout } = await exec('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temp], { cwd: ROOT })
+  // Packs the checkout as npm publishes it, offline. The package has no lifecycle scripts, so nothing
+  // is built and the working tree is left as it is (package.test.ts checks both).
+  const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', temp], { cwd: ROOT, env: { ...process.env, npm_config_offline: 'true' } })
   // npm pack --json lists one entry per packed package.
   const [{ filename }] = JSON.parse(stdout) as [{ filename: string }]
   tarball = path.join(temp, filename)
@@ -381,11 +376,12 @@ async function headlessPi(packageDir: string, { extensions = [] }: { extensions?
   return { run, paths, args, options, launch }
 }
 
-// The extension Pi loaded from packageDir, with no load errors or warnings for it.
+// The extension Pi loaded from packageDir, with no load errors or warnings for it: the TypeScript
+// entry the manifest names, as it ships.
 function loadedExtension(host: Host, packageDir: string): Extension {
   const result = host.runtime.services.resourceLoader.getExtensions()
   assert.deepEqual(result.errors, [])
-  const entry = path.join(packageDir, 'extension', 'index.js')
+  const entry = path.join(packageDir, 'extension', 'forum.ts')
   const extension = result.extensions.find((ext) => ext.resolvedPath === entry)
   assert.ok(extension, `Pi did not load ${entry}; loaded: ${result.extensions.map((ext) => ext.resolvedPath)}`)
   assert.deepEqual((result.warnings ?? []).filter((w) => w.path.startsWith(packageDir)), [])
@@ -617,7 +613,7 @@ interface SyntheticLogEntry {
   delta?: string
 }
 
-// A canonical record of a forum's log, as src/forum.js writes them.
+// A canonical record of a forum's log, as src/forum.mjs writes them.
 type LogRecord = ({ type: 'topic_created' } & Topic) | ({ type: 'message_posted' } & Message)
 
 // Appends canonical records to a forum's log, as an import would: IDs the API accepts but never
@@ -650,7 +646,7 @@ const LONG_LINES = [
 
 // A forum that pages: 23 topics, the first with 22 messages, the last of which is LONG_BODY; the
 // last topic has a terminal control and every bidirectional control in its title, and no messages. The expected pages are read
-// back through src/forum.js with the text page size.
+// back through src/forum.mjs with the text page size.
 async function seedPages(forumDir: string) {
   const forum = createForum({ forumDir })
   const { topic, message: kickoff } = await forum.createTopic({ title: 'Release plan', author: 'ralph', body: 'Kickoff' })
@@ -2961,6 +2957,14 @@ else describe('real Pi host', () => {
         const created = await forum(host, ['topic', 'create', 'Installed', '--body', source])
         assert.equal(created.topic.created_by, host.sessionId)
         assert.deepEqual((await forum(host, ['message', 'list'])).items.map((m) => m.body), [source])
+        // The bundled CLI and the core it imports are plain JavaScript: Node runs them from the
+        // installation with its TypeScript stripping off, and with nothing on PATH but Node and the system.
+        const plain = await exec(process.execPath, ['--no-experimental-strip-types', path.join(installed, 'bin', 'pi-forum'), 'message', 'list'], {
+          cwd: project,
+          env: { PATH: BASE_PATH, PI_FORUM_DIR: host.defaultDir(host.sessionId) },
+        })
+        assert.equal(plain.stderr, '')
+        assert.deepEqual((JSON.parse(plain.stdout) as ForumOutput).items.map((m) => m.body), [source])
         // The installed extension's text reader shows the post as a session entry.
         await host.runtime.session.prompt('/forum topics')
         assert.deepEqual(outputs(host.runtime.session).map((entry) => outputText(entry).split('\n').includes('1. Installed')), [true])

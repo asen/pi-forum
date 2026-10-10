@@ -1,14 +1,65 @@
-// Fixtures for the real-Pi tests: a synthetic model provider and terminal UI hosts. Only the
-// pieces named "fixture" here are stand-ins; everything they drive is Pi's own code.
+// Fixtures for the real-Pi tests: a synthetic model provider and terminal UI hosts, and the lookup of
+// the installed host's own libraries. Only the pieces named "fixture" here are stand-ins; everything
+// they drive is Pi's own code.
 import { type ChildProcessByStdio, execFile, type SpawnOptions, spawn } from 'node:child_process'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
+import path from 'node:path'
 import type { Readable, Writable } from 'node:stream'
+import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import type { AssistantMessage, createAssistantMessageEventStream, JsonObject, TextContent } from '@earendil-works/pi-ai'
 import type { AgentSession, CustomEntry, ExtensionUIContext, KeybindingsManager, Theme } from '@earendil-works/pi-coding-agent'
 import type * as PiTui from '@earendil-works/pi-tui'
 
 const exec = promisify(execFile)
+
+// The fields of a package.json that locate its entry module, as far as hostLibrary reads them.
+interface EntryManifest {
+  exports?: unknown
+  main?: string
+}
+
+// Picks an export target for an ES module import under Node: a path, the first entry of a fallback
+// array, or the first of the node, import and default conditions an object holds, in its key order.
+function exportTarget(target: unknown): string | undefined {
+  if (typeof target === 'string') return target
+  if (Array.isArray(target)) return exportTarget(target[0])
+  if (target === null || typeof target !== 'object') return undefined
+  for (const [condition, value] of Object.entries(target)) {
+    if (['node', 'import', 'default'].includes(condition)) return exportTarget(value)
+  }
+  return undefined
+}
+
+// The file URL of the entry module of one of the installed host's own libraries
+// (@earendil-works/<name>, such as pi-tui), found as Node resolves a bare import made from the Pi
+// package at piRoot: through the node_modules directories of piRoot and each of its ancestors, in
+// order. A global install nests the libraries in piRoot/node_modules; a local install hoists them
+// next to Pi, into the project's node_modules.
+export function hostLibrary(piRoot: string, name: string): string {
+  const specifier = `@earendil-works/${name}`
+  const lookup = createRequire(path.join(piRoot, 'package.json')).resolve.paths(specifier) ?? []
+  for (const modules of lookup) {
+    const dir = path.join(modules, specifier)
+    let manifest: EntryManifest
+    try {
+      manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as EntryManifest
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw err
+    }
+    const { exports } = manifest
+    // An exports object keyed by subpath maps the package itself as '.'; any other is its conditions.
+    const root = exports !== null && typeof exports === 'object' && !Array.isArray(exports) && Object.keys(exports).some((key) => key.startsWith('.'))
+      ? (exports as Record<string, unknown>)['.']
+      : exports
+    const entry = exports === undefined ? (manifest.main ?? 'index.js') : exportTarget(root)
+    if (entry === undefined) throw new Error(`${dir}/package.json exports no entry for an ES module import`)
+    return pathToFileURL(path.join(dir, entry)).href
+  }
+  throw new Error(`cannot resolve ${specifier} from ${piRoot}; looked in ${lookup.join(', ')}`)
+}
 
 // Extension source for an in-process synthetic provider (test/fixtures/pi-synthetic.ts). Pi registers
 // it like any provider extension and its agent loop streams from it; the test decides, through

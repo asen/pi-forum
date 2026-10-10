@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { jsonlAdapter } from './backends/jsonl.js'
+import { jsonlAdapter } from './backends/jsonl.mjs'
 import {
   ForumError,
   checkId,
@@ -9,21 +9,30 @@ import {
   newTopic,
   throwIfAborted,
   topicInput,
-} from './records.js'
-import type {
-  CreateForumOptions,
-  CreateTopicResult,
-  Forum,
-  ForumEvent,
-  ForumStore,
-  ListOptions,
-  Message,
-  MessagePostedEvent,
-  Page,
-  ReadCallOptions,
-  TopicCreatedEvent,
-  WarningHandler,
-} from './types.js'
+} from './records.mjs'
+
+/**
+ * @import {
+ *   CreateForumOptions,
+ *   CreateTopicInput,
+ *   CreateTopicResult,
+ *   Forum,
+ *   ForumEvent,
+ *   ForumStore,
+ *   ListMessagesOptions,
+ *   ListOptions,
+ *   Message,
+ *   MessagePostedEvent,
+ *   Page,
+ *   PostMessageInput,
+ *   ReadCallOptions,
+ *   Topic,
+ *   TopicCreatedEvent,
+ *   WarningHandler,
+ *   WriteCallOptions,
+ *   WriteTransaction,
+ * } from './types.d.mts'
+ */
 
 export { ForumError }
 
@@ -43,21 +52,31 @@ export { ForumError }
 //     Runs fn({ read(visit), append(event) }) exclusively among writers. read scans all events
 //     from the start, as above; append adds one event or fails with WRITE_FAILED.
 //
-// The adapter contract and the API's inputs and results are typed in types.ts.
+// The adapter contract and the API's inputs and results are typed in types.d.mts.
 
 const DEFAULT_TOPIC_LIMIT = 20
 const DEFAULT_MESSAGE_LIMIT = 50
 const MAX_LIMIT = 100
 
-const defaultWarning: WarningHandler = (message) => console.warn(`pi-forum: warning: ${message}`)
+/** @type {WarningHandler} */
+const defaultWarning = (message) => console.warn(`pi-forum: warning: ${message}`)
 
-function checkForumDir(forumDir: unknown): asserts forumDir is string {
+/**
+ * @param {unknown} forumDir
+ * @returns {asserts forumDir is string}
+ */
+function checkForumDir(forumDir) {
   if (typeof forumDir !== 'string' || !path.isAbsolute(forumDir)) {
     throw new ForumError('INVALID_INPUT', 'forum directory must be an absolute path')
   }
 }
 
-function checkLimit(limit: number | null | undefined, defaultLimit: number): number {
+/**
+ * @param {number | null | undefined} limit
+ * @param {number} defaultLimit
+ * @returns {number}
+ */
+function checkLimit(limit, defaultLimit) {
   if (limit == null) return defaultLimit
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
     throw new ForumError('INVALID_INPUT', `limit must be an integer from 1 to ${MAX_LIMIT}`)
@@ -65,7 +84,11 @@ function checkLimit(limit: number | null | undefined, defaultLimit: number): num
   return limit
 }
 
-function checkSignal(signal: AbortSignal | null | undefined): AbortSignal | undefined {
+/**
+ * @param {AbortSignal | null | undefined} signal
+ * @returns {AbortSignal | undefined}
+ */
+function checkSignal(signal) {
   if (signal != null && !(signal instanceof AbortSignal)) {
     throw new ForumError('INVALID_INPUT', 'signal must be an AbortSignal')
   }
@@ -73,37 +96,61 @@ function checkSignal(signal: AbortSignal | null | undefined): AbortSignal | unde
   return signal ?? undefined
 }
 
-function checkCursor(after: string | null | undefined): string | undefined {
+/**
+ * @param {string | null | undefined} after
+ * @returns {string | undefined}
+ */
+function checkCursor(after) {
   if (after != null && (typeof after !== 'string' || after === '')) {
     throw new ForumError('INVALID_CURSOR', 'cursor is not valid')
   }
   return after ?? undefined
 }
 
+/** @param {string} id */
 const isTopic =
-  (id: string) =>
-  (event: ForumEvent): event is TopicCreatedEvent =>
+  (id) =>
+  /**
+   * @param {ForumEvent} event
+   * @returns {event is TopicCreatedEvent}
+   */
+  (event) =>
     event.type === 'topic_created' && event.data.id === id
+/** @param {string} id */
 const isMessage =
-  (id: string) =>
-  (event: ForumEvent): event is MessagePostedEvent =>
+  (id) =>
+  /**
+   * @param {ForumEvent} event
+   * @returns {event is MessagePostedEvent}
+   */
+  (event) =>
     event.type === 'message_posted' && event.data.id === id
 
 // Reads use createOnRead to decide whether an absent forum is created or reported; writes create it.
 // Storage is first touched by the first call. The forum it resolves to on the first successful access
 // is pinned for this client only; a new client is needed to follow forumDir somewhere else.
-export function createForum(options: CreateForumOptions): Forum
-export function createForum({
-  forumDir,
-  adapter = jsonlAdapter,
-  createOnRead = false,
-}: Partial<CreateForumOptions> = {}): Forum {
+/**
+ * @overload
+ * @param {CreateForumOptions} options
+ * @returns {Forum}
+ */
+/**
+ * @param {Partial<CreateForumOptions>} [options]
+ * @returns {Forum}
+ */
+export function createForum({ forumDir, adapter = jsonlAdapter, createOnRead = false } = {}) {
   checkForumDir(forumDir)
-  let resolved: string | undefined
-  const open = (create: boolean) => adapter.open({ forumDir, create, identity: resolved })
+  /** @type {string | undefined} */
+  let resolved
+  /** @param {boolean} create */
+  const open = (create) => adapter.open({ forumDir, create, identity: resolved })
 
   // Concurrent first calls may resolve differently; only the first to succeed is kept.
-  function pin(store: ForumStore): void {
+  /**
+   * @param {ForumStore} store
+   * @returns {void}
+   */
+  function pin(store) {
     resolved ??= store.identity
     if (store.identity !== resolved) {
       throw new ForumError('FORUM_UNAVAILABLE', `forum directory ${forumDir} no longer resolves to ${resolved}`)
@@ -112,17 +159,21 @@ export function createForum({
 
   // Reads are cancelled through an optional AbortSignal: once it is aborted they fail with ABORTED
   // and never return a partial page or record. select returns the item an event lists, if any.
-  async function list<T>(
-    { after, limit, onWarning = defaultWarning, signal }: ListOptions,
-    defaultLimit: number,
-    select: (event: ForumEvent) => T | false,
-  ): Promise<Page<T>> {
+  /**
+   * @template T
+   * @param {ListOptions} options
+   * @param {number} defaultLimit
+   * @param {(event: ForumEvent) => T | false} select
+   * @returns {Promise<Page<T>>}
+   */
+  async function list({ after, limit, onWarning = defaultWarning, signal }, defaultLimit, select) {
     const pageLimit = checkLimit(limit, defaultLimit)
     const start = checkCursor(after)
     const checkedSignal = checkSignal(signal)
     const store = await open(createOnRead)
     throwIfAborted(checkedSignal)
-    const items: T[] = []
+    /** @type {T[]} */
+    const items = []
     const next_cursor = await store.read({ after: start, onWarning, signal: checkedSignal }, (event) => {
       const item = select(event)
       if (item) items.push(item)
@@ -133,15 +184,19 @@ export function createForum({
     return { items, next_cursor }
   }
 
-  async function find<E extends ForumEvent>(
-    match: (event: ForumEvent) => event is E,
-    { onWarning = defaultWarning, signal }: ReadCallOptions,
-    notFound: string,
-  ): Promise<E['data']> {
+  /**
+   * @template {ForumEvent} E
+   * @param {(event: ForumEvent) => event is E} match
+   * @param {ReadCallOptions} options
+   * @param {string} notFound
+   * @returns {Promise<E['data']>}
+   */
+  async function find(match, { onWarning = defaultWarning, signal }, notFound) {
     const checkedSignal = checkSignal(signal)
     const store = await open(createOnRead)
     throwIfAborted(checkedSignal)
-    let found: E['data'] | undefined
+    /** @type {E['data'] | undefined} */
+    let found
     await store.read({ onWarning, signal: checkedSignal }, (event) => {
       if (match(event)) found = event.data
       return found !== undefined
@@ -155,18 +210,28 @@ export function createForum({
   return {
     // The requested directory, and the adapter's identity of the pinned forum (for JSONL its real
     // directory), or undefined before the first successful access.
+    /** @returns {string} */
     get forumDir() {
       return forumDir
     },
+    /** @returns {string | undefined} */
     get resolved() {
       return resolved
     },
 
+    /**
+     * @param {ListOptions} [options]
+     * @returns {Promise<Page<Topic>>}
+     */
     async listTopics(options = {}) {
       return list(options, DEFAULT_TOPIC_LIMIT, ({ type, data }) => type === 'topic_created' && data)
     },
 
     // Without topicId, lists messages across the forum; an unknown topic lists nothing.
+    /**
+     * @param {ListMessagesOptions} [options]
+     * @returns {Promise<Page<Message>>}
+     */
     async listMessages({ topicId, ...options } = {}) {
       if (topicId != null) checkId(topicId, 'topicId')
       return list(
@@ -176,41 +241,68 @@ export function createForum({
       )
     },
 
+    /**
+     * @param {string} topicId
+     * @param {ReadCallOptions} [options]
+     * @returns {Promise<Topic>}
+     */
     async getTopic(topicId, options = {}) {
       checkId(topicId, 'topicId')
       return find(isTopic(topicId), options, `topic ${topicId} not found`)
     },
 
+    /**
+     * @param {string} messageId
+     * @param {ReadCallOptions} [options]
+     * @returns {Promise<Message>}
+     */
     async getMessage(messageId, options = {}) {
       checkId(messageId, 'messageId')
       return find(isMessage(messageId), options, `message ${messageId} not found`)
     },
 
     // Topic and initial message are two appends. If the second fails, the error carries the created topic.
+    /**
+     * @param {CreateTopicInput} input
+     * @param {WriteCallOptions} [options]
+     * @returns {Promise<CreateTopicResult>}
+     */
     async createTopic(input, { onWarning = defaultWarning } = {}) {
       const fields = topicInput(input)
       const store = await open(true)
-      return store.write({ onWarning }, async ({ append }): Promise<CreateTopicResult> => {
-        pin(store)
-        const topic = newTopic(fields)
-        await append({ type: 'topic_created', data: topic })
-        if (fields.body === undefined) return { topic, message: null }
-        const message = newMessage({ ...fields, body: fields.body, topicId: topic.id })
-        try {
-          await append({ type: 'message_posted', data: message })
-        } catch (err) {
-          const partial = new ForumError(
-            'PARTIAL_WRITE',
-            `topic ${topic.id} was created but its initial message was not appended: ${errorMessage(err)}`,
-            { cause: err },
-          )
-          partial.topic = topic
-          throw partial
-        }
-        return { topic, message }
-      })
+      return store.write(
+        { onWarning },
+        /**
+         * @param {WriteTransaction} transaction
+         * @returns {Promise<CreateTopicResult>}
+         */
+        async ({ append }) => {
+          pin(store)
+          const topic = newTopic(fields)
+          await append({ type: 'topic_created', data: topic })
+          if (fields.body === undefined) return { topic, message: null }
+          const message = newMessage({ ...fields, body: fields.body, topicId: topic.id })
+          try {
+            await append({ type: 'message_posted', data: message })
+          } catch (err) {
+            const partial = new ForumError(
+              'PARTIAL_WRITE',
+              `topic ${topic.id} was created but its initial message was not appended: ${errorMessage(err)}`,
+              { cause: err },
+            )
+            partial.topic = topic
+            throw partial
+          }
+          return { topic, message }
+        },
+      )
     },
 
+    /**
+     * @param {PostMessageInput} input
+     * @param {WriteCallOptions} [options]
+     * @returns {Promise<Message>}
+     */
     async postMessage(input, { onWarning = defaultWarning } = {}) {
       const fields = messageInput(input)
       const store = await open(true)
@@ -218,7 +310,7 @@ export function createForum({
         pin(store)
         let topicFound = false
         // Widened for the visitor's assignment, which narrowing cannot see.
-        let reply = null as Message | null
+        let reply = /** @type {Message | null} */ (null)
         await read(({ type, data }) => {
           if (type === 'topic_created' && data.id === fields.topicId) topicFound = true
           if (type === 'message_posted' && data.id === fields.replyTo) reply = data

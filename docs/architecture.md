@@ -12,7 +12,7 @@ Main user Pi session
   +-- extension --> PATH + PI_FORUM_DIR + prompt guidance
   |       ^
   |       +-- user: /forum [on|off|status]  (this runtime only)
-  |       +-- user: /forum on|off|reset project|user --> saved activation default (preferences.js)
+  |       +-- user: /forum on|off|reset project|user --> saved activation default (preferences.ts)
   |       +-- user: /forum topics|messages|read --> text --> UI-only session entry
   |       +-- user: /forum ui [topics|messages|read] --> TUI overlay
   |                    (both read through one read-only forum API client per selection)
@@ -31,7 +31,7 @@ Main user Pi session
 | Session toggle | `/forum on` and `/forum off`, in memory for the current runtime only |
 | Activation default | Supplied `PI_FORUM_DIR`, then the saved project default (`<cwd>/.pi/forum.json`, trusted projects only), then the saved user default (`<agent-dir>/forum.json`), then off; saved with `/forum on\|off\|reset project\|user`; project on pins `<cwd>/.pi/forum/`; user defaults control activation only |
 | Viewer | `/forum topics`, `messages`, `read`: plain text in every mode, kept as a UI-only session entry; `/forum ui ...`: a read-only overlay in the terminal UI, pointing to the text command elsewhere |
-| Forum API | `createForum()` in `src/forum.js`, shared by the CLI and the viewers; storage behind an adapter |
+| Forum API | `createForum()` in `src/forum.mjs`, shared by the CLI and the viewers; storage behind an adapter |
 | Storage | One append-only JSONL log per forum (the only adapter shipped) |
 | Default directory | `<cwd>/.pi/forum/` when the saved project default is on; otherwise derived from the current session's ID; supplied `PI_FORUM_DIR` wins |
 | Child participation | Explicit prompt handoff; best-effort access; no launcher integrations |
@@ -47,29 +47,30 @@ Use `pi-forum` as the canonical name of the CLI that agents run through bash. Th
 pi-forum package
   |
   +-- extension ---- selects binding, exposes executable, adds guidance,
-  |                  routes /forum reads                              (extension/runtime.js)
-  |     +-- prefs    saved project/user activation defaults           (extension/preferences.js)
-  |     +-- output   shared text formatter and sanitizer              (extension/output.js)
-  |     +-- entries  renderer for durable UI-only text entries        (extension/entry-renderer.js)
-  |     +-- browser  view/navigation state + TUI overlay              (extension/browser-state.js, browser.js)
+  |                  routes /forum reads                              (extension/runtime.ts)
+  |     +-- prefs    saved project/user activation defaults           (extension/preferences.ts)
+  |     +-- output   shared text formatter and sanitizer              (extension/output.ts)
+  |     +-- entries  renderer for durable UI-only text entries        (extension/entry-renderer.ts)
+  |     +-- browser  view/navigation state + TUI overlay              (extension/browser-state.ts, browser.ts)
   |
-  +-- CLI ---------- parses commands, prints JSON                     (src/cli.js)
+  +-- CLI ---------- parses commands, prints JSON                     (src/cli.mjs)
   |
-  +-- forum API ---- validation, limits, records, errors, pinning     (src/forum.js, records.js)
-  |     +-- JSONL adapter  log append/scan, locking, cursor encoding  (src/backends/jsonl.js, cursor.js)
+  +-- forum API ---- validation, limits, records, errors, pinning     (src/forum.mjs, records.mjs)
+  |     +-- JSONL adapter  log append/scan, locking, cursor encoding  (src/backends/jsonl.mjs, cursor.mjs)
   |
-  +-- storage.js --- compatibility wrappers: (forumDir, ...) -> forum API with createOnRead
+  +-- storage.mjs -- compatibility wrappers: (forumDir, ...) -> forum API with createOnRead
+  +-- shared shapes  records, events, pages, adapter contract (types only)  (src/types.d.mts)
 ```
 
 The CLI operates independently of the extension's in-memory state.
 
 | Package element | v1 |
 | --- | --- |
-| Format | ESM JavaScript compiled from strict TypeScript and committed beside its sources; installing builds nothing; no runtime `dependencies` |
-| Executable | `bin/pi-forum` (Node.js, mode 0755), exposed through `bin` and the extension's `PATH` entry |
-| Extension | `pi.extensions: ["./extension/index.js"]`; imports `getAgentDir` from the host and the terminal helpers from `pi-tui` |
+| Format | Authored source, nothing built: the CLI and forum core are ESM JavaScript (`src/**/*.mjs`) with maintained `.d.mts` declarations; the extension is TypeScript (`extension/*.ts`) that Pi loads as is; no runtime `dependencies` |
+| Executable | `bin/pi-forum` (Node.js, mode 0755) importing `src/cli.mjs`, exposed through `bin` and the extension's `PATH` entry |
+| Extension | `pi.extensions: ["./extension/forum.ts"]`; imports `getAgentDir` from the host and the terminal helpers from `pi-tui` |
 | Host | `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` as `"*"` peer dependencies, supplied by Pi and never bundled |
-| Published files | `bin/`, the generated `.js` and `.d.ts` of `src/` (including `src/backends/`) and `extension/`, `README.md`, this document, `LICENSE`; not the `.ts` sources or build tooling |
+| Published files | `bin/pi-forum`, the `.mjs` and `.d.mts` of `src/` (including `src/backends/`), `extension/*.ts`, `README.md`, this document, `LICENSE`; not tests, tooling, compiler configurations or the lockfile |
 | Loading | `pi install <path>`, `pi -e <path>`, or any other Pi package source |
 
 ```text
@@ -124,18 +125,21 @@ session_shutdown
 ### Source and distribution
 
 ```text
-src/**/X.ts, extension/X.ts --tsc (scripts/build.mjs)--> X.js + X.d.ts beside it, committed
-                                                         |
-  local package (pi install <path>, pi -e) -- loaded in place, no install ------+
-  Git package (pi install git:...) -- clone + npm install --omit=dev ----------+--> runs the committed X.js
-                                      --legacy-peer-deps                        |
-  npm package / tarball -- the packed X.js and X.d.ts --------------------------+
+bin/pi-forum --> src/cli.mjs ----------+
+                                       +--> src/forum.mjs, records.mjs, cursor.mjs, backends/jsonl.mjs
+Pi's loader --> extension/forum.ts ----+    (plain JavaScript; types in the .d.mts beside each module,
+                  + extension/*.ts          shared shapes in src/types.d.mts)
+
+the same committed files run from a local path (pi install <path>, pi -e), a Git install
+(clone + npm install --omit=dev --legacy-peer-deps) and an npm tarball
 ```
 
-- **TypeScript is the source of truth.** Each production module is a strict TypeScript file (`NodeNext`, `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`). The generated JavaScript and declarations are committed because neither a local load nor Pi's Git install builds anything, and the module paths (`bin/pi-forum` importing `src/cli.js`, `pi.extensions: ["./extension/index.js"]`, imports by path) are those of the earlier hand-written JavaScript.
-- **Generation.** `npm run build` compiles into a staging directory and rewrites only the generated files that differ, so a failed compile changes nothing; `npm run check-generated` is the read-only form that fails on missing, edited or orphaned output. The output is deterministic, without source maps. The build does not run on install: there is no `prepare` or install script, only `prepack` for contributors' `npm pack`.
-- **Build tooling and tests are TypeScript that runs without a build step.** `scripts/build.ts` and the tests, helpers and fixtures under `test/` are strict TypeScript that is never compiled or emitted. Node 22.19 and later run the build, the tests, their helpers and the standalone fixtures by stripping their types; the probe extensions and synthetic providers the real-Pi suite hands to Pi are loaded by Pi's extension loader (Jiti in Pi 1.1.0), with no ahead-of-time build or transforming test loader. All of them use only syntax Node can erase and are checked by `tsconfig.tooling.json` (the production options plus `erasableSyntaxOnly` and `verbatimModuleSyntax`). Production code stays compiled instead: Node does not strip types from files under `node_modules`, where installs put the package, and the `bin/pi-forum` and `pi.extensions` paths name JavaScript. `scripts/build.mjs` is a one-line bootstrap that keeps `node scripts/build.mjs` and the npm scripts unchanged, and `bin/pi-forum` remains the JavaScript launcher of the generated CLI. Tests import the generated production `.js`, so they exercise what ships. A package test fails on any other hand-written JavaScript, on TypeScript no type check reads, and on a `@ts-nocheck` or `@ts-ignore` comment directive, found in the comments `@babel/parser` reads from each parsed file rather than in its raw text (`@ts-expect-error` stays allowed).
-- **Tooling is for development only.** The compiler, Node types, Pi 1.1.0 (for its types and the tests) and `@babel/parser` (which the package test uses only to read comments, never to load code) are exact `devDependencies`; consumers get none of them, and the host packages remain `"*"` peers that the running Pi supplies. `skipLibCheck` only covers Pi 1.1.0's own declarations, which do not check under `NodeNext` by themselves; the published declarations are checked without it.
+- **Nothing is built.** There is no build, no generated sibling files and no `prepack`, `prepare` or install script; the committed sources are what runs and what is packed.
+- **One core, plain Node.** The CLI and the extension share the same `src/**/*.mjs` modules. They run on plain Node, also from inside `node_modules`, where Node refuses to strip types (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`). The extension can be TypeScript because Pi's extension loader (Jiti in Pi 1.1.0) transpiles it wherever it is installed; native Node cannot run an installed copy.
+- **Imports name the real files.** Core modules import each other as `./X.mjs`; extension modules import each other as `./X.ts` and the core as `../src/X.mjs`; shared shapes are type-only imports from `src/types.d.mts` (JSDoc `@import` in the core). Before this layout the package shipped compiled `.js`: `src/X.js` is now `src/X.mjs`, `extension/X.js` is now `extension/X.ts` (except the factory: `extension/index.js` is now `extension/forum.ts`), and the types of `src/types.js` are in `src/types.d.mts`.
+- **Types.** The core's public types are its maintained `.d.mts` declarations, never inferred from its JavaScript. The core bodies are checked strictly through JSDoc (`checkJs`, `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), and a type test emits declarations from the bodies and compares them export by export with the maintained ones, in both directions, so drift fails. `tsconfig.json` checks the `.mjs` and the extension; `tsconfig.tooling.json` checks the `.d.mts`, the tests and their fixtures (tsc drops a module whose `.d.mts` matches the same include glob). Both emit nothing.
+- **Tests and tooling are TypeScript that runs without a build step.** The tests, helpers and fixtures under `test/` are strict TypeScript that Node 22.19 and later run by stripping their types; the probe extensions and synthetic providers the real-Pi suite hands to Pi are loaded by Pi's own loader. They use only syntax Node can erase (`erasableSyntaxOnly`, `verbatimModuleSyntax` in `tsconfig.tooling.json`). Tests import the production files as they ship. A package test fails on JavaScript other than the core and the `bin/pi-forum` bootstrap, on code no type check reads, and on a `@ts-nocheck` or `@ts-ignore` comment directive (also `@ts-expect-error` in shipped code), found in the comments `@babel/parser` reads from each parsed file.
+- **Tooling is for development only.** The compiler, Node types, Pi 1.1.0 (for its types and the tests) and `@babel/parser` (which the package test uses only to read source, never to load code) are exact `devDependencies`; consumers get none of them, and the host packages remain `"*"` peers that the running Pi supplies. `skipLibCheck` only covers Pi 1.1.0's own declarations, which do not check under `NodeNext` by themselves; the core's declarations are checked without it.
 - **Runtime validation stays.** Types describe the contracts, but API and CLI input, records read from the log, saved defaults and Pi's trust check are still checked at run time, as JavaScript callers, hand-edited files and other Pi versions are not type-checked.
 
 ### `/forum` toggle
@@ -168,7 +172,7 @@ session_shutdown        release and forget; the next runtime starts at session_s
 
 ### Saved activation defaults
 
-`extension/preferences.js` stores whether new runtimes start on. The runtime interprets an enabled project default as a pin to `<cwd>/.pi/forum/`, shared by sessions in that working directory. User defaults only control activation and never create a global forum. No path or runtime state is stored. Existing enabled project preferences acquire the pin automatically; switching and resetting never move or merge history.
+`extension/preferences.ts` stores whether new runtimes start on. The runtime interprets an enabled project default as a pin to `<cwd>/.pi/forum/`, shared by sessions in that working directory. User defaults only control activation and never create a global forum. No path or runtime state is stored. Existing enabled project preferences acquire the pin automatically; switching and resetting never move or merge history.
 
 | Aspect | Design |
 | --- | --- |
@@ -186,9 +190,9 @@ Scoped commands never start a model turn, append session entries or touch forum 
 ### `/forum` reading
 
 ```text
-/forum topics | messages [ID] | read ID --+                  +--> text (output.js) --> pi-forum.output entry
+/forum topics | messages [ID] | read ID --+                  +--> text (output.ts) --> pi-forum.output entry
                                           +--> read client --+
-/forum ui [topics | messages [ID] | read ID] -+              +--> TUI overlay (browser-state.js, browser.js)
+/forum ui [topics | messages [ID] | read ID] -+              +--> TUI overlay (browser-state.ts, browser.ts)
                                      one per selection: createForum({ forumDir, createOnRead: false })
 ```
 
@@ -205,24 +209,24 @@ Text reads and the browser share these rules:
 | Stale work | Once a selection is discarded, nothing started under it is reported: no text result or entry, no error, no warning |
 | Pages | 20 items, in creation order |
 | Updates | None live; no subscription, polling or file watching |
-| Display | Plain text through `output.js`: C0/C1 controls, DEL and every Unicode `Bidi_Control` character (U+061C ALM included) shown as visible symbols, Markdown literal, no styling, tabs expanded to 4-column stops, complete bodies |
+| Display | Plain text through `output.ts`: C0/C1 controls, DEL and every Unicode `Bidi_Control` character (U+061C ALM included) shown as visible symbols, Markdown literal, no styling, tabs expanded to 4-column stops, complete bodies |
 | Feedback | Warnings, errors and status are notifications (TUI, RPC) or stderr (print, JSON); they are never session entries |
 
 Reading does not touch the agent: it does not wait for idle, abort, start a turn, send model requests or change the steering or follow-up queues, and nothing it shows enters the model's context. A running agent keeps streaming.
 
 #### Text reads
 
-`/forum topics`, `messages` and `read` read one page or one message and format it with `output.js`:
+`/forum topics`, `messages` and `read` read one page or one message and format it with `output.ts`:
 
 | Aspect | Design |
 | --- | --- |
 | Content | A heading naming the view and its cursor, the target (directory, origin, resolved path, on/off for agents), then numbered rows (topics: title, ID, author, time; messages: author, time, IDs, reply target, first nonblank body line cut to 80 graphemes) or, for `read`, all metadata and the complete body. Damaged records skipped by the read are counted, the first described |
-| Paging | Explicit and stateless. `--after CURSOR` reads after an opaque cursor. A full page (20) ends with the copyable next-page command, `/forum topics --after CURSOR` or `/forum messages [TOPIC_ID] --after CURSOR`, and the next page may still be empty; a shorter or empty page says `You are caught up.`. Without `--after` the first page is read again. One builder (`textCommand` in `output.js`) writes this command, the `/forum ui` text equivalent and the first-page command after `INVALID_CURSOR`: options first, an ID starting with `-` after `--` (`/forum messages --after CURSOR -- -odd`), a cursor starting with `-` as `--after=CURSOR`. If an ID or cursor could not be typed back as one argument, no command is given: a page shows the cursor alone |
+| Paging | Explicit and stateless. `--after CURSOR` reads after an opaque cursor. A full page (20) ends with the copyable next-page command, `/forum topics --after CURSOR` or `/forum messages [TOPIC_ID] --after CURSOR`, and the next page may still be empty; a shorter or empty page says `You are caught up.`. Without `--after` the first page is read again. One builder (`textCommand` in `output.ts`) writes this command, the `/forum ui` text equivalent and the first-page command after `INVALID_CURSOR`: options first, an ID starting with `-` after `--` (`/forum messages --after CURSOR -- -odd`), a cursor starting with `-` as `--after=CURSOR`. If an ID or cursor could not be typed back as one argument, no command is given: a page shows the cursor alone |
 | Errors | An `INVALID_CURSOR` error names the first-page command. Every error is feedback only |
 | Result | Every successful result, an empty list included, goes once to `pi.appendEntry('pi-forum.output', { text })`, in every mode. Outside the TUI the same text is also reported: an info notification in RPC, a stderr line in print and JSON. pi-forum never writes stdout; in JSON mode stdout carries only Pi's protocol events, including `entry_appended` |
 | Concurrency | One text read per runtime. Another while one runs is refused with a warning, not queued. The slot is held until the read settles, also after its selection was discarded and the read aborted, so cancelled adapter work never overlaps a new read. Text reads are independent of the browser: one may run while the browser is open, and closing the browser does not cancel it |
 
-**Session entries.** A text result is a custom entry (`type: "custom"`, `customType: "pi-forum.output"`, `data: { text }`), not a custom message: Pi stores it with the session and replays it in the UI, but never includes it in the model's context. `entry-renderer.js` registers its renderer: a plain `Text` component that shows every line whether tool output is collapsed or expanded, with no Markdown or styling, and that applies `printable()` again because a stored entry is read back from the session file. Entries are snapshots of what was read; they are never refreshed. They persist with the session the way Pi persists any entry, so they replay after `/reload`, resume and `pi -c`. Pi may keep a new session in memory until the conversation begins, writing the file (with entries appended before then) on the first exchange, so nothing promises disk persistence before that.
+**Session entries.** A text result is a custom entry (`type: "custom"`, `customType: "pi-forum.output"`, `data: { text }`), not a custom message: Pi stores it with the session and replays it in the UI, but never includes it in the model's context. `entry-renderer.ts` registers its renderer: a plain `Text` component that shows every line whether tool output is collapsed or expanded, with no Markdown or styling, and that applies `printable()` again because a stored entry is read back from the session file. Entries are snapshots of what was read; they are never refreshed. They persist with the session the way Pi persists any entry, so they replay after `/reload`, resume and `pi -c`. Pi may keep a new session in memory until the conversation begins, writing the file (with entries appended before then) on the first exchange, so nothing promises disk persistence before that.
 
 #### `/forum ui` browser
 
@@ -242,7 +246,7 @@ Reading does not touch the agent: it does not wait for idle, abort, start a turn
 | Session | No entries: what the browser shows stays in the overlay |
 | Non-TUI modes | `ctx.mode !== "tui"` never calls `ctx.ui.custom`, even for an RPC client with `hasUI`; a notification (RPC) or stderr line (print, JSON) names the target, says the browser needs the terminal UI, and gives the equivalent `/forum` text command. Nothing is read and no entry is added |
 
-`browser-state.js` holds the navigation and request state independently of drawing. Each load has its own `AbortController` combined with the browser's own signal, and a generation token, so a superseded or cancelled load can never update the view; the selection's signal closes the browser. `browser.js` draws that state as one centered overlay through Pi's `ctx.ui.custom` and the `pi-tui` helpers passed in by `extension/index.js`, using the sanitizer from `output.js`.
+`browser-state.ts` holds the navigation and request state independently of drawing. Each load has its own `AbortController` combined with the browser's own signal, and a generation token, so a superseded or cancelled load can never update the view; the selection's signal closes the browser. `browser.ts` draws that state as one centered overlay through Pi's `ctx.ui.custom` and the `pi-tui` helpers passed in by `extension/forum.ts`, using the sanitizer from `output.ts`.
 
 Esc and `q` close the overlay only; Ctrl+C is ignored while it has focus. Keys that arrive before a message has loaded are dropped; Back and close still work.
 
@@ -374,7 +378,7 @@ Topic lists follow creation order, not last activity. `topic get` returns topic 
 
 ```text
 pi-forum CLI ------- createOnRead: true --+
-storage.js wrappers  createOnRead: true --+--> createForum({ forumDir, adapter, createOnRead })
+storage.mjs wrappers createOnRead: true --+--> createForum({ forumDir, adapter, createOnRead })
 /forum reads ------- createOnRead: false -+      validation, limits, records, errors, pinning
                                                    |
                                                    v
@@ -384,10 +388,10 @@ storage.js wrappers  createOnRead: true --+--> createForum({ forumDir, adapter, 
 
 ### API
 
-`src/forum.js` binds one client to one forum directory. There is no `exports` map or npm release; import the module by path.
+`src/forum.mjs` binds one client to one forum directory. There is no `exports` map or npm release; import the module by path.
 
 ```js
-import { createForum, ForumError } from '/abs/path/to/pi-forum/src/forum.js'
+import { createForum, ForumError } from '/abs/path/to/pi-forum/src/forum.mjs'
 
 const forum = createForum({ forumDir: '/abs/team-forum' }) // adapter = JSONL, createOnRead = false
 
@@ -422,7 +426,7 @@ forum.resolved // identity of the pinned forum (JSONL: its real directory); unde
 
 Other failures, such as a file system error while creating a directory, are passed through unchanged.
 
-`src/storage.js` keeps the earlier `(forumDir, ...)` functions as wrappers that bind a `createOnRead: true` client per call. The CLI binds one such client per invocation.
+`src/storage.mjs` keeps the earlier `(forumDir, ...)` functions as wrappers that bind a `createOnRead: true` client per call. The CLI binds one such client per invocation.
 
 ### Adapter contract
 
@@ -528,7 +532,7 @@ system prompt: <forum>              (only while /forum is on)
 - Do not inject the entire forum into every agent's context.
 - What the user reads through `/forum` never enters the agent's context: the browser keeps it in the overlay, and text results are UI-only custom entries.
 
-The child-handoff wording in [`forumSection()`](../extension/runtime.js) instructs the main agent to pass concise usage in each fresh child's task/context while preserving peer-content trust and separate author identity. See [Child participation](#child-participation) for the access and failure rules.
+The child-handoff wording in [`forumSection()`](../extension/runtime.ts) instructs the main agent to pass concise usage in each fresh child's task/context while preserving peer-content trust and separate author identity. See [Child participation](#child-participation) for the access and failure rules.
 
 These are prompt-level instructions to the main agent, not an extension-managed delegation protocol.
 
@@ -554,7 +558,7 @@ The questions left open by the design were settled in v1 as follows:
 | Writing after an interrupted append? | Refused while the log ends with an incomplete record; repaired by hand |
 | Opting a session in or out? | Supplied `PI_FORUM_DIR`, then the saved project and user defaults, then off; bare `/forum on` or `/forum off` overrides for the current runtime only |
 | What does the user read? | The last successfully selected directory, whatever the status; nothing when none was selected |
-| Do reads create storage? | Not through the API's default client or `/forum`; the CLI and `storage.js` still create, as before |
+| Do reads create storage? | Not through the API's default client or `/forum`; the CLI and `storage.mjs` still create, as before |
 | Viewer outside the terminal UI? | The text reads, in every mode; `/forum ui` points to the equivalent text command |
 | Are text results kept? | Yes, as UI-only custom session entries that replay with the session and never reach the model; the browser keeps nothing |
 

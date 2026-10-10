@@ -7,10 +7,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
-import type { CursorData } from '../src/cursor.js'
-import { ForumError, createForum } from '../src/forum.js'
-import { listTopics } from '../src/storage.js'
-import type { Message, Page, Topic } from '../src/types.js'
+import type { CursorData } from '../src/cursor.mjs'
+import { ForumError, createForum } from '../src/forum.mjs'
+import { listTopics } from '../src/storage.mjs'
+import type { Message, Page, Topic } from '../src/types.d.mts'
 
 const roots: string[] = []
 

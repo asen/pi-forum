@@ -13,13 +13,13 @@
 // signal (the runtime's per-selection signal) closes the browser when it aborts; the browser never
 // aborts or reuses any other signal.
 
-import type { Forum, Message, Page, ReadCallOptions, Topic } from '../src/types.js'
-import type { ForumTarget, ForumView } from './types.js'
+import type { Forum, Message, Page, ReadCallOptions, Topic } from '../src/types.d.mts'
+import type { ForumTarget, ForumView } from './types.ts'
 
 export const PAGE_SIZE = 20
 export const WARNING_LIMIT = 20
 
-// What the browser reads through: the bound forum client (src/forum.js), which knows where it
+// What the browser reads through: the bound forum client (src/forum.mjs), which knows where it
 // resolved once it has read.
 export interface BrowserForum extends Pick<Forum, 'listTopics' | 'listMessages' | 'getMessage'> {
   readonly resolved?: Forum['resolved'] | undefined

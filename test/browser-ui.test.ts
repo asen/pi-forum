@@ -2,19 +2,18 @@
 // helpers, and also against the real @earendil-works/pi-tui when PI_FORUM_TEST_PI_ROOT names an
 // installed Pi. The host's ctx.ui.custom is replaced by one that follows its documented contract.
 import assert from 'node:assert/strict'
-import path from 'node:path'
 import { describe, test } from 'node:test'
-import { pathToFileURL } from 'node:url'
 import type { CustomEntry, EntryRenderOptions, ExtensionContext, ExtensionUIContext } from '@earendil-works/pi-coding-agent'
 import type { Component } from '@earendil-works/pi-tui'
-import { type BrowserHost, type BrowserTheme, type BrowserTui, createBrowserOpener, overlayHeight, printable } from '../extension/browser.js'
-import { type Browser, type BrowserForum, type BrowserState, createBrowser } from '../extension/browser-state.js'
-import { createEntryRenderer, ENTRY_TYPE, type EntryRendererTui } from '../extension/entry-renderer.js'
-import { createForumRuntime } from '../extension/runtime.js'
-import type { ForumTarget, ForumView, RuntimeContext } from '../extension/types.js'
-import { createForum } from '../src/forum.js'
-import type { ListOptions, Message, Page, Topic } from '../src/types.js'
+import { type BrowserHost, type BrowserTheme, type BrowserTui, createBrowserOpener, overlayHeight, printable } from '../extension/browser.ts'
+import { type Browser, type BrowserForum, type BrowserState, createBrowser } from '../extension/browser-state.ts'
+import { createEntryRenderer, ENTRY_TYPE, type EntryRendererTui } from '../extension/entry-renderer.ts'
+import { createForumRuntime } from '../extension/runtime.ts'
+import type { ForumTarget, ForumView, RuntimeContext } from '../extension/types.ts'
+import { createForum } from '../src/forum.mjs'
+import type { ListOptions, Message, Page, Topic } from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
+import { hostLibrary } from './pi-fixtures.ts'
 
 const PI_ROOT = process.env.PI_FORUM_TEST_PI_ROOT
 // Every Bidi_Control character, by code point: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI.
@@ -98,9 +97,8 @@ const standIn: Library = {
 // The installed Pi's pi-tui also provides the Text the entry renderer uses.
 const libraries: (Library & Partial<EntryRendererTui>)[] = [standIn]
 if (PI_ROOT) {
-  const entry = path.join(PI_ROOT, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.js')
   // Typed as the pi-tui this repository develops against.
-  const tui: typeof import('@earendil-works/pi-tui') = await import(pathToFileURL(entry).href)
+  const tui: typeof import('@earendil-works/pi-tui') = await import(hostLibrary(PI_ROOT, 'pi-tui'))
   libraries.push({ name: 'pi-tui', ...tui })
 }
 

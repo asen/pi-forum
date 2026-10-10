@@ -1,24 +1,27 @@
 // Type-regression fixture: how a consumer of the installed package uses its public types, compiled
-// by test/types.test.ts against the packed declarations (node_modules/pi-forum), never the sources.
-// It imports pi-forum by package name, so it is the one file under test/ that npm run typecheck
-// leaves out (see tsconfig.tooling.json); the test compiles it instead. The plain statements must
-// compile. Each @ts-expect-error marks a use the declarations must reject;
-// if a type widened (to any, say), the unused directive fails the compile.
+// by test/types.test.ts against the packed package (node_modules/pi-forum), never the checkout, and
+// without allowJs: the core's types come from its maintained .d.mts sidecars and the extension's from
+// its TypeScript, never from inferring the JavaScript. It imports pi-forum by package name, so it is
+// the one file under test/ that npm run typecheck leaves out (see tsconfig.tooling.json); the test
+// compiles it instead. The plain statements must compile. Each @ts-expect-error marks a use the
+// types must reject; if a type widened (to any, say), the unused directive fails the compile.
 import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from '@earendil-works/pi-coding-agent'
 import { matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
-import { createBrowser, type BrowserForum } from 'pi-forum/extension/browser-state.js'
-import { createBrowserOpener, type BrowserTui } from 'pi-forum/extension/browser.js'
-import { createEntryRenderer, ENTRY_TYPE, entryData } from 'pi-forum/extension/entry-renderer.js'
-import piForum from 'pi-forum/extension/index.js'
-import { formatTopicList, textCommand } from 'pi-forum/extension/output.js'
-import { createPreferenceStore } from 'pi-forum/extension/preferences.js'
-import { createForumRuntime } from 'pi-forum/extension/runtime.js'
-import type { ForumTarget, ForumView, PromptEvent, RuntimeContext } from 'pi-forum/extension/types.js'
-import { jsonlAdapter } from 'pi-forum/src/backends/jsonl.js'
-import { main } from 'pi-forum/src/cli.js'
-import { createForum, ForumError } from 'pi-forum/src/forum.js'
-import * as storage from 'pi-forum/src/storage.js'
-import type { Forum, ForumAdapter, ForumErrorCode, ForumEvent, ForumStore, Message, Page, Topic } from 'pi-forum/src/types.js'
+import { createBrowser, type BrowserForum } from 'pi-forum/extension/browser-state.ts'
+import { createBrowserOpener, type BrowserTui } from 'pi-forum/extension/browser.ts'
+import { createEntryRenderer, ENTRY_TYPE, entryData } from 'pi-forum/extension/entry-renderer.ts'
+import piForum from 'pi-forum/extension/forum.ts'
+import { formatTopicList, textCommand } from 'pi-forum/extension/output.ts'
+import { createPreferenceStore } from 'pi-forum/extension/preferences.ts'
+import { createForumRuntime } from 'pi-forum/extension/runtime.ts'
+import type { ForumTarget, ForumView, PromptEvent, RuntimeContext } from 'pi-forum/extension/types.ts'
+import { jsonlAdapter } from 'pi-forum/src/backends/jsonl.mjs'
+import { main, type Environment, type ForumFactory, type MainOptions, type OutputWriter } from 'pi-forum/src/cli.mjs'
+import { decodeCursor, encodeCursor, type CursorData } from 'pi-forum/src/cursor.mjs'
+import { createForum, ForumError } from 'pi-forum/src/forum.mjs'
+import { canonicalEvent, checkId, MAX_BODY_BYTES, MAX_LABEL_CHARS, newTopic, topicInput, type TopicFields, type Unchecked } from 'pi-forum/src/records.mjs'
+import * as storage from 'pi-forum/src/storage.mjs'
+import type { CreateTopicInput, Forum, ForumAdapter, ForumErrorCode, ForumEvent, ForumStore, Message, Page, Topic } from 'pi-forum/src/types.d.mts'
 
 // Pi: the extension is a factory Pi can load, and Pi's own objects fit what pi-forum asks for.
 export const factory: ExtensionFactory = piForum
@@ -79,8 +82,15 @@ export function errorCode(err: unknown): ForumErrorCode | null {
   // @ts-expect-error: not a ForumError code
   const unknown: ForumErrorCode = 'NOPE'
   void unknown
+  // @ts-expect-error: the created topic is absent, never undefined
+  err.topic = undefined
   return err.code
 }
+export const notFound: ForumError = new ForumError('NOT_FOUND', 'no such topic', { cause: null })
+// @ts-expect-error: a ForumError has one of its codes
+new ForumError('NOPE', 'message')
+// The compatibility wrappers throw the same class.
+export const sameError: typeof ForumError = storage.ForumError
 
 // Events: what an adapter stores and replays, narrowed by type.
 export function describeEvent(event: ForumEvent): string {
@@ -153,3 +163,58 @@ export const exitCode: Promise<number> = main(['topic', 'list'], { PI_FORUM_DIR:
 export const listed: Promise<Page<Topic>> = storage.listTopics('/abs/forum', { limit: 5 })
 // @ts-expect-error: arguments are strings
 main([1])
+const env: Environment = { PI_FORUM_DIR: '/abs/forum', PI_SESSION_ID: undefined }
+const writer: OutputWriter = { write: (chunk: string) => void chunk }
+const bind: ForumFactory = createForum
+export const mainOptions: MainOptions = { createForum: bind, stdout: writer, stderr: undefined }
+export const withOptions: Promise<number> = main(['--help'], env, mainOptions)
+// @ts-expect-error: main only reads the environment
+env.PI_FORUM_DIR = '/elsewhere'
+// @ts-expect-error: output is written as strings
+main([], env, { stdout: { write: (chunk: number) => void chunk } })
+// @ts-expect-error: a forum factory returns a Forum
+main([], env, { createForum: () => ({}) })
+
+// Records: the limits, input checks and canonical events behind the API.
+export const labelLimit: 256 = MAX_LABEL_CHARS
+export const bodyLimit: number = MAX_BODY_BYTES
+// @ts-expect-error: the label limit is exactly 256
+export const otherLimit: 255 = MAX_LABEL_CHARS
+export const id: string = checkId('t-1' as unknown, 'topic ID')
+// Inputs are unchecked: any value may be passed for a known field, and is checked at run time.
+const raw: Unchecked<CreateTopicInput> = { title: 42, author: null }
+export const fields: TopicFields = topicInput(raw)
+export const created: Topic = newTopic(fields)
+// @ts-expect-error: not a field of a topic input
+topicInput({ titel: 'Plan' })
+// @ts-expect-error: checked topic fields have an author
+newTopic({ title: 'Plan' })
+// @ts-expect-error: optional record fields are omitted, never undefined
+export const undefinedOrigin: Topic = { ...topicValue, origin_session_id: undefined }
+export function eventBody(value: unknown): string {
+  const event = canonicalEvent(value)
+  if (event.type === 'message_posted') return event.data.body
+  // @ts-expect-error: a topic has no body
+  return event.data.body
+}
+
+// Cursors of the JSONL adapter: opaque strings, checked against a forum and a log snapshot.
+export const cursor: string = encodeCursor('forum-id', 0)
+export const offset: Promise<number> = decodeCursor(cursor, 'forum-id', 10, async (position: number) => (position < 10 ? 10 : undefined))
+export const cursorData: CursorData = { v: 1, forum: 'forum-id', offset: 0 }
+// @ts-expect-error: a byte read resolves to a byte or undefined
+decodeCursor(cursor, 'forum-id', 10, async () => 'x')
+// @ts-expect-error: version 1 is the only cursor format
+export const futureCursor: CursorData = { v: 2, forum: 'forum-id', offset: 0 }
+
+// A store's write resolves to what its function returns.
+export function writeCount(store: ForumStore): Promise<number> {
+  const count: Promise<number> = store.write({ onWarning: () => {} }, async (transaction) => {
+    await transaction.append({ type: 'topic_created', data: topicValue })
+    return 1
+  })
+  // @ts-expect-error: the write resolves to a number here
+  const text: Promise<string> = store.write({ onWarning: () => {} }, async () => 1)
+  void text
+  return count
+}

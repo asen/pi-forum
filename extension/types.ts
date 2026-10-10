@@ -3,8 +3,8 @@
 // come from the installed Pi as type-only imports, so nothing here loads Pi at runtime.
 
 import type { BeforeAgentStartEvent, ExtensionContext, ExtensionUIContext } from '@earendil-works/pi-coding-agent'
-import type { Message, Page, Topic } from '../src/types.js'
-import type { Browser, BrowserForum } from './browser-state.js'
+import type { Message, Page, Topic } from '../src/types.d.mts'
+import type { Browser, BrowserForum } from './browser-state.ts'
 
 // Saved defaults
 
@@ -199,7 +199,7 @@ export interface BrowserContext {
 // A notice about the browsed forum, shown while its browser is still open.
 export type BrowserReport = (message: string, type?: Parameters<ExtensionUIContext['notify']>[1]) => void
 
-// What the runtime gives an opener: the browser's controller (browser-state.js) on the bound client,
+// What the runtime gives an opener: the browser's controller (browser-state.ts) on the bound client,
 // the target and view it was created for, the context of the command that opened it, the selection's
 // lifetime signal, and report.
 export interface OpenBrowserRequest {

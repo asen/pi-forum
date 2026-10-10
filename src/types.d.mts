@@ -1,5 +1,6 @@
 // Shared shapes of the forum core: canonical records and events, pages, and the adapter contract
-// documented in the forum module. Types only; the emitted module is empty.
+// documented in the forum module. Types only: there is no runtime module, so import them with
+// import type (or JSDoc @import) from this file.
 
 // Optional fields are omitted when unavailable, never stored as null or undefined.
 export interface Topic {

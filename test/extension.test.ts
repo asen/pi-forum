@@ -11,10 +11,10 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import type { CustomEntry, EntryRenderOptions } from '@earendil-works/pi-coding-agent'
 import type { AutocompleteItem } from '@earendil-works/pi-tui'
-import type { BrowserForum } from '../extension/browser-state.js'
-import type { OutputEntryData } from '../extension/entry-renderer.js'
-import { formatMessage, formatMessageList, formatTarget, formatTopicList } from '../extension/output.js'
-import { createPreferenceStore } from '../extension/preferences.js'
+import type { BrowserForum } from '../extension/browser-state.ts'
+import type { OutputEntryData } from '../extension/entry-renderer.ts'
+import { formatMessage, formatMessageList, formatTarget, formatTopicList } from '../extension/output.ts'
+import { createPreferenceStore } from '../extension/preferences.ts'
 import {
   type CreateReader,
   createForumRuntime,
@@ -24,7 +24,7 @@ import {
   type RuntimeReport,
   SECTION_NAME,
   USAGE,
-} from '../extension/runtime.js'
+} from '../extension/runtime.ts'
 import type {
   ForumTarget,
   ForumView,
@@ -36,9 +36,9 @@ import type {
   PreferenceStore,
   RuntimeContext,
   ScopeState,
-} from '../extension/types.js'
-import { createForum } from '../src/forum.js'
-import type { Forum, ListMessagesOptions, ListOptions, Message, Page, ReadCallOptions, Topic, WarningHandler } from '../src/types.js'
+} from '../extension/types.ts'
+import { createForum } from '../src/forum.mjs'
+import type { Forum, ListMessagesOptions, ListOptions, Message, Page, ReadCallOptions, Topic, WarningHandler } from '../src/types.d.mts'
 import type { Text } from './fixtures/extension-tui.ts'
 
 const exec = promisify(execFile)
@@ -2716,7 +2716,7 @@ describe('extension entry', () => {
     roots.push(agentDir)
     globalThis.piForumTestAgentDir = agentDir
 
-    const { default: factory } = await import('../extension/index.js')
+    const { default: factory } = await import('../extension/forum.ts')
     const handlers = new Map<string, EntryHandler>()
     const commands = new Map<string, EntryCommand>()
     const renderers = new Map<string, DrawEntry>()
@@ -2842,7 +2842,7 @@ describe('extension entry', () => {
     const agentDir = path.join(root, 'agent')
     const project = path.join(root, 'project')
     globalThis.piForumTestAgentDir = agentDir
-    const { default: factory } = await import('../extension/index.js')
+    const { default: factory } = await import('../extension/forum.ts')
     // Like Pi, each session start gets a fresh runtime from the factory.
     const launch = () => {
       const handlers = new Map<string, EntryHandler>()

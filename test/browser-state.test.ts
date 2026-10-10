@@ -10,10 +10,10 @@ import {
   type BrowserState,
   createBrowser,
   type MessagesViewState,
-} from '../extension/browser-state.js'
-import type { ForumTarget, ForumView } from '../extension/types.js'
-import { ForumError, createForum } from '../src/forum.js'
-import type { Forum, ListOptions, Message, Topic, WarningHandler } from '../src/types.js'
+} from '../extension/browser-state.ts'
+import type { ForumTarget, ForumView } from '../extension/types.ts'
+import { ForumError, createForum } from '../src/forum.mjs'
+import type { Forum, ListOptions, Message, Topic, WarningHandler } from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
 
 const roots: string[] = []

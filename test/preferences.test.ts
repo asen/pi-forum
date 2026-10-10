@@ -3,14 +3,14 @@ import nodeFs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
-import { createPreferenceStore } from '../extension/preferences.js'
+import { createPreferenceStore } from '../extension/preferences.ts'
 import type {
   PreferenceContext,
   PreferenceErrorCode,
   PreferenceFs,
   PreferenceIgnoredCode,
   PreferenceUpdate,
-} from '../extension/types.js'
+} from '../extension/types.ts'
 
 const roots: string[] = []
 

@@ -1,5 +1,5 @@
-// Scratch copies of this checkout, for tests that build, pack or install it without touching the
-// working tree.
+// Scratch copies of this checkout, for tests that pack, install or type-check it without touching the
+// working tree, and the inventory of its production sources.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
@@ -13,15 +13,27 @@ const exec = promisify(execFile)
 export type FileState = { sha256: string; mode: number; mtimeMs: number } | null
 export type Snapshot = Record<string, FileState>
 
+// The production sources, all authored and shipped as they are: nothing is generated from them.
 export interface Inventory {
-  sources: string[]
-  generated: string[]
+  // src/**/*.mjs: the forum core and CLI, JavaScript that Node runs as is, typed through JSDoc.
+  core: string[]
+  // src/**/*.d.mts: the consumer contract of each core module, next to it, and the type-only shapes.
+  sidecars: string[]
+  // extension/**/*.ts: the Pi extension, TypeScript that Pi's loader runs as is.
+  extension: string[]
+  // All of the above, sorted.
+  shipped: string[]
+  // Any other file under src/ or extension/, which should not be there.
+  others: string[]
 }
 
 export const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
-// The production directories whose X.ts each own a generated X.js and X.d.ts next to it.
-export const SOURCE_DIRS: readonly string[] = ['src', 'src/backends', 'extension']
+// The production directories: the core under src/ and the extension under extension/.
+export const SOURCE_DIRS: readonly string[] = ['src', 'extension']
+
+// Declarations of types alone, with no core module of their own.
+export const TYPE_ONLY: readonly string[] = ['src/types.d.mts']
 
 // The files a commit of the working tree would hold, as Git would clone them: tracked files that still
 // exist and untracked files that are not ignored, sorted. node_modules and other ignored files are left
@@ -72,15 +84,23 @@ export async function snapshot(dir: string, { files, skip = [] }: { files?: read
   return result
 }
 
-// Production TypeScript sources and the generated files they own, from the given tree.
-export async function generatedInventory(root = ROOT): Promise<Inventory> {
-  const sources: string[] = []
+// The production sources in the given tree, by kind, from every file under the source directories.
+export async function sourceInventory(root = ROOT): Promise<Inventory> {
+  const inventory: Inventory = { core: [], sidecars: [], extension: [], shipped: [], others: [] }
   for (const dir of SOURCE_DIRS) {
-    for (const name of await fs.readdir(path.join(root, dir))) {
-      if (name.endsWith('.ts') && !name.endsWith('.d.ts')) sources.push(`${dir}/${name}`)
+    for (const name of await listFiles(path.join(root, dir))) {
+      const file = `${dir}/${name}`
+      if (dir === 'src' && file.endsWith('.d.mts')) inventory.sidecars.push(file)
+      else if (dir === 'src' && file.endsWith('.mjs')) inventory.core.push(file)
+      else if (dir === 'extension' && file.endsWith('.ts') && !/\.d\.[cm]?ts$/.test(file)) inventory.extension.push(file)
+      else inventory.others.push(file)
     }
   }
-  sources.sort()
-  const generated = sources.flatMap((file) => ['.js', '.d.ts'].map((ext) => file.slice(0, -'.ts'.length) + ext)).sort()
-  return { sources, generated }
+  inventory.shipped = [...inventory.core, ...inventory.sidecars, ...inventory.extension].sort()
+  return inventory
+}
+
+// The sidecar declaring a core module: src/X.d.mts for src/X.mjs.
+export function sidecarOf(file: string): string {
+  return file.replace(/\.mjs$/, '.d.mts')
 }

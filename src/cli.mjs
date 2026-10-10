@@ -1,10 +1,14 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
-import type { ParseArgsOptionsConfig } from 'node:util'
-import { createForum } from './forum.js'
-import { MAX_BODY_BYTES, MAX_LABEL_CHARS, errorMessage } from './records.js'
-import type { CreateForumOptions, CreateTopicResult, Forum, Message, Page, Topic, WarningHandler } from './types.js'
+import { createForum } from './forum.mjs'
+import { MAX_BODY_BYTES, MAX_LABEL_CHARS, errorMessage } from './records.mjs'
+
+/**
+ * @import { ParseArgsOptionsConfig } from 'node:util'
+ * @import { CreateTopicResult, Forum, Message, Page, Topic, WarningHandler } from './types.d.mts'
+ * @import { Environment, MainOptions } from './cli.d.mts'
+ */
 
 const HELP = `Usage:
   pi-forum topic create TITLE [BODY] [--author LABEL]
@@ -54,25 +58,8 @@ Pagination:
 
 class UsageError extends Error {}
 
-// The environment main reads: PI_FORUM_DIR and PI_SESSION_ID.
-export type Environment = { readonly [name: string]: string | undefined }
-
-// Where main writes its output and warnings; the process streams by default.
-export interface OutputWriter {
-  write(chunk: string): void
-}
-
-// Binds the forum client of one invocation; createForum by default.
-export type ForumFactory = (options: CreateForumOptions) => Forum
-
-export interface MainOptions {
-  createForum?: ForumFactory | undefined
-  stdout?: OutputWriter | undefined
-  stderr?: OutputWriter | undefined
-}
-
 // Every option a command may accept, with its parseArgs type.
-const OPTION_TYPES = {
+const OPTION_TYPES = /** @type {const} */ ({
   body: 'string',
   'body-file': 'string',
   'body-stdin': 'boolean',
@@ -81,60 +68,72 @@ const OPTION_TYPES = {
   topic: 'string',
   after: 'string',
   limit: 'string',
-} as const
+})
 
-type OptionName = keyof typeof OPTION_TYPES
-type OptionValue<K extends OptionName> = (typeof OPTION_TYPES)[K] extends 'string' ? string : boolean
+/** @typedef {keyof typeof OPTION_TYPES} OptionName */
+/**
+ * @template {OptionName} K
+ * @typedef {(typeof OPTION_TYPES)[K] extends 'string' ? string : boolean} OptionValue
+ */
 // A command's parseArgs definitions, each typed as above.
-type OptionDefinitions = { readonly [K in OptionName]?: { readonly type: (typeof OPTION_TYPES)[K] } }
+/** @typedef {{ readonly [K in OptionName]?: { readonly type: (typeof OPTION_TYPES)[K] } }} OptionDefinitions */
 
 // Option values as given on the command line, so --limit is still its raw text.
-type RawValues = { readonly [K in OptionName]?: OptionValue<K> | undefined }
+/** @typedef {{ readonly [K in OptionName]?: OptionValue<K> | undefined }} RawValues */
 
 // Option values once validated, with --limit as a number.
-interface CommandValues extends Omit<RawValues, 'limit'> {
-  readonly limit?: number | undefined
-}
+/** @typedef {Omit<RawValues, 'limit'> & { readonly limit?: number | undefined }} CommandValues */
 
-type ArgName = 'TITLE' | 'TOPIC_ID' | 'MESSAGE_ID'
-type CommandArgs<A extends ArgName> = { readonly [K in A]: string }
+/** @typedef {'TITLE' | 'TOPIC_ID' | 'MESSAGE_ID'} ArgName */
+/**
+ * @template {ArgName} A
+ * @typedef {{ readonly [K in A]: string }} CommandArgs
+ */
 
-type CommandResult = CreateTopicResult | { topic: Topic } | { message: Message } | Page<Topic> | Page<Message>
+/** @typedef {CreateTopicResult | { topic: Topic } | { message: Message } | Page<Topic> | Page<Message>} CommandResult */
 
 // Each command: accepted options, positional argument names, whether it takes a body, and a handler
 // that runs against the invocation's bound forum client.
-interface CommandSpec<A extends ArgName = ArgName> {
-  options: OptionDefinitions
-  args: readonly A[]
-  body?: 'optional' | 'required'
-  run(forum: Forum, args: CommandArgs<A>, values: CommandValues, env: Environment, onWarning: WarningHandler): Promise<CommandResult>
-}
+/**
+ * @template {ArgName} [A=ArgName]
+ * @typedef {{
+ *   options: OptionDefinitions
+ *   args: readonly A[]
+ *   body?: 'optional' | 'required'
+ *   run(forum: Forum, args: CommandArgs<A>, values: CommandValues, env: Environment, onWarning: WarningHandler): Promise<CommandResult>
+ * }} CommandSpec
+ */
 
 // Checks a handler against its own argument names.
-const command = <A extends ArgName>(spec: CommandSpec<A>): CommandSpec => spec
+/**
+ * @template {ArgName} A
+ * @param {CommandSpec<A>} spec
+ * @returns {CommandSpec}
+ */
+const command = (spec) => spec
 
 // parseCommand's result: a help request, or a validated command to run.
-interface HelpRequest {
-  help: true
-}
+/** @typedef {{ help: true }} HelpRequest */
 
-interface CommandInvocation {
-  help: false
-  command: CommandSpec
-  args: CommandArgs<ArgName>
-  values: CommandValues
-}
+/** @typedef {{ help: false, command: CommandSpec, args: CommandArgs<ArgName>, values: CommandValues }} CommandInvocation */
 
-const BODY_OPTIONS = {
-  body: { type: 'string' },
-  'body-file': { type: 'string' },
-  'body-stdin': { type: 'boolean' },
-} as const satisfies OptionDefinitions
-const BODY_SOURCES = ['body', 'body-file', 'body-stdin'] as const satisfies readonly (keyof typeof BODY_OPTIONS)[]
-const LIST_OPTIONS = { after: { type: 'string' }, limit: { type: 'string' } } as const satisfies OptionDefinitions
+const BODY_OPTIONS = /** @satisfies {OptionDefinitions} */ (
+  /** @type {const} */ ({
+    body: { type: 'string' },
+    'body-file': { type: 'string' },
+    'body-stdin': { type: 'boolean' },
+  })
+)
+const BODY_SOURCES = /** @satisfies {readonly (keyof typeof BODY_OPTIONS)[]} */ (
+  /** @type {const} */ (['body', 'body-file', 'body-stdin'])
+)
+const LIST_OPTIONS = /** @satisfies {OptionDefinitions} */ (
+  /** @type {const} */ ({ after: { type: 'string' }, limit: { type: 'string' } })
+)
 const BODY_REQUIRED = 'a body is required: use --body, --body-file or --body-stdin'
 
-const COMMANDS: { readonly [name: string]: CommandSpec } = {
+/** @type {{ readonly [name: string]: CommandSpec }} */
+const COMMANDS = {
   'topic create': command({
     options: { ...BODY_OPTIONS, author: { type: 'string' } },
     args: ['TITLE'],
@@ -183,18 +182,27 @@ const COMMANDS: { readonly [name: string]: CommandSpec } = {
   }),
 }
 
-const isHelpFlag = (arg: string | undefined): boolean => arg === '--help' || arg === '-h'
+/**
+ * @param {string | undefined} arg
+ * @returns {boolean}
+ */
+const isHelpFlag = (arg) => arg === '--help' || arg === '-h'
 const GROUPS = new Set(Object.keys(COMMANDS).map((name) => name.split(' ')[0]))
 
 // Returns a help request or a validated command. Help is recognized only where the parser expects
 // an option, so a value such as `--body --help` is still an argument error.
-function parseCommand(argv: readonly string[]): HelpRequest | CommandInvocation {
+/**
+ * @param {readonly string[]} argv
+ * @returns {HelpRequest | CommandInvocation}
+ */
+function parseCommand(argv) {
   if (argv[0] === 'help' || isHelpFlag(argv[0])) return { help: true }
   if (GROUPS.has(argv[0]) && isHelpFlag(argv[1])) return { help: true }
   const name = argv.slice(0, 2).join(' ')
   const command = COMMANDS[name]
   if (!command) throw new UsageError(argv.length === 0 ? 'missing command' : `unknown command "${name}"`)
-  const options: ParseArgsOptionsConfig = Object.fromEntries(
+  /** @type {ParseArgsOptionsConfig} */
+  const options = Object.fromEntries(
     Object.entries(command.options).map(([key, option]) => [key, { ...option, multiple: true }]),
   )
   options.help = { type: 'boolean', short: 'h' }
@@ -209,13 +217,13 @@ function parseCommand(argv: readonly string[]): HelpRequest | CommandInvocation 
   }
   // parseArgs types options built at run time loosely. Strict parsing admits only the command's
   // options and help, and every option is multiple, so each holds a list of its type's values.
-  const { help = false, ...lists } = parsed.values as { readonly help?: boolean } & {
-    readonly [K in OptionName]?: readonly OptionValue<K>[]
-  }
+  const { help = false, ...lists } =
+    /** @type {{ readonly help?: boolean } & { readonly [K in OptionName]?: readonly OptionValue<K>[] }} */ (parsed.values)
   for (const [key, list] of Object.entries(lists)) {
     if (list.length > 1) throw new UsageError(`--${key} may be given only once`)
   }
-  const raw: RawValues = {
+  /** @type {RawValues} */
+  const raw = {
     body: lists.body?.[0],
     'body-file': lists['body-file']?.[0],
     'body-stdin': lists['body-stdin']?.[0],
@@ -234,25 +242,40 @@ function parseCommand(argv: readonly string[]): HelpRequest | CommandInvocation 
     throw new UsageError(`unexpected argument "${positionals[command.args.length]}" for ${name}`)
   }
   if (command.body) checkBodySource(raw, command.body === 'required' && !help)
-  const values: CommandValues = { ...raw, limit: raw.limit === undefined ? undefined : parseLimit(raw.limit) }
+  /** @type {CommandValues} */
+  const values = { ...raw, limit: raw.limit === undefined ? undefined : parseLimit(raw.limit) }
   if (help) return { help }
   // Every argument has its positional, as the counts were checked above.
-  const args = Object.fromEntries(command.args.map((arg, i) => [arg, positionals[i]])) as CommandArgs<ArgName>
+  const args = /** @type {CommandArgs<ArgName>} */ (Object.fromEntries(command.args.map((arg, i) => [arg, positionals[i]])))
   return { help, command, args, values }
 }
 
-function parseLimit(value: string): number {
+/**
+ * @param {string} value
+ * @returns {number}
+ */
+function parseLimit(value) {
   if (!/^[0-9]+$/.test(value)) throw new UsageError('--limit must be an integer from 1 to 100')
   return Number(value)
 }
 
 // Explicit --author wins, then the caller's Pi session; origin is recorded only for a real session.
-function attribution(values: CommandValues, env: Environment): { author: string; originSessionId: string | undefined } {
+/**
+ * @param {CommandValues} values
+ * @param {Environment} env
+ * @returns {{ author: string, originSessionId: string | undefined }}
+ */
+function attribution(values, env) {
   const session = env.PI_SESSION_ID?.trim() ? env.PI_SESSION_ID : undefined
   return { author: values.author ?? session ?? 'external', originSessionId: session }
 }
 
-function decode(bytes: Uint8Array, source: string): string {
+/**
+ * @param {Uint8Array} bytes
+ * @param {string} source
+ * @returns {string}
+ */
+function decode(bytes, source) {
   try {
     return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
@@ -260,7 +283,12 @@ function decode(bytes: Uint8Array, source: string): string {
   }
 }
 
-function checkBodySource(values: RawValues, required: boolean): void {
+/**
+ * @param {RawValues} values
+ * @param {boolean} required
+ * @returns {void}
+ */
+function checkBodySource(values, required) {
   const sources = BODY_SOURCES.filter((key) => values[key] !== undefined)
   if (sources.length > 1) throw new UsageError(`use only one of ${sources.map((key) => `--${key}`).join(', ')}`)
   if (sources.length === 0 && required) {
@@ -269,7 +297,11 @@ function checkBodySource(values: RawValues, required: boolean): void {
 }
 
 // Reads the single body source chosen on the command line, if any.
-async function readBody(values: CommandValues): Promise<string | undefined> {
+/**
+ * @param {CommandValues} values
+ * @returns {Promise<string | undefined>}
+ */
+async function readBody(values) {
   if (values.body !== undefined) return values.body
   if (values['body-file'] !== undefined) {
     const file = path.resolve(values['body-file'])
@@ -282,12 +314,17 @@ async function readBody(values: CommandValues): Promise<string | undefined> {
     return decode(bytes, file)
   }
   if (!values['body-stdin']) return undefined
-  const chunks: Buffer[] = []
+  /** @type {Buffer[]} */
+  const chunks = []
   for await (const chunk of process.stdin) chunks.push(chunk)
   return decode(Buffer.concat(chunks), 'stdin')
 }
 
-function forumDirectory(env: Environment): string {
+/**
+ * @param {Environment} env
+ * @returns {string}
+ */
+function forumDirectory(env) {
   const dir = env.PI_FORUM_DIR
   if (!dir) throw new Error('PI_FORUM_DIR is not set; it must be the absolute path of the forum directory')
   if (!path.isAbsolute(dir)) throw new Error(`PI_FORUM_DIR must be an absolute path, got ${JSON.stringify(dir)}`)
@@ -297,14 +334,19 @@ function forumDirectory(env: Environment): string {
 // What describeError reads of a thrown value. Asserted only to allow JavaScript's property reads:
 // a thrown null or undefined still fails reading code, and a partial write without a topic fails
 // reading its id.
-interface ThrownFields {
-  readonly code?: unknown
-  readonly topic: { readonly id: unknown }
-  readonly cause?: unknown
-}
+/**
+ * @typedef {object} ThrownFields
+ * @property {unknown} [code]
+ * @property {{ readonly id: unknown }} topic
+ * @property {unknown} [cause]
+ */
 
-function describeError(err: unknown): unknown {
-  const thrown = err as ThrownFields
+/**
+ * @param {unknown} err
+ * @returns {unknown}
+ */
+function describeError(err) {
+  const thrown = /** @type {Readonly<ThrownFields>} */ (err)
   if (thrown.code === 'PARTIAL_WRITE') {
     const id = thrown.topic.id
     const { cause } = thrown
@@ -323,12 +365,19 @@ function describeError(err: unknown): unknown {
 // for the invocation by options.createForum, and output goes to options.stdout and options.stderr;
 // the defaults are the shared API and the process streams, and tests may inject others. Reads create
 // a missing forum directory, as they always have.
+/**
+ * @param {readonly string[]} argv
+ * @param {Environment} [env]
+ * @param {MainOptions} [options]
+ * @returns {Promise<number>}
+ */
 export async function main(
-  argv: readonly string[],
-  env: Environment = process.env,
-  { createForum: bind = createForum, stdout = process.stdout, stderr = process.stderr }: MainOptions = {},
-): Promise<number> {
-  const onWarning: WarningHandler = (message) => stderr.write(`pi-forum: warning: ${message}\n`)
+  argv,
+  env = process.env,
+  { createForum: bind = createForum, stdout = process.stdout, stderr = process.stderr } = {},
+) {
+  /** @type {WarningHandler} */
+  const onWarning = (message) => stderr.write(`pi-forum: warning: ${message}\n`)
   try {
     const parsed = parseCommand(argv)
     if (parsed.help) {

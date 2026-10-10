@@ -5,9 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
-import { jsonlAdapter } from '../src/backends/jsonl.js'
-import type { CursorData } from '../src/cursor.js'
-import { ForumError, createForum } from '../src/forum.js'
+import { jsonlAdapter } from '../src/backends/jsonl.mjs'
+import type { CursorData } from '../src/cursor.mjs'
+import { ForumError, createForum } from '../src/forum.mjs'
 import type {
   CreateForumOptions,
   Forum,
@@ -19,7 +19,7 @@ import type {
   Message,
   Page,
   Topic,
-} from '../src/types.js'
+} from '../src/types.d.mts'
 import { fakeAdapter } from './fake-adapter.ts'
 
 const roots: string[] = []

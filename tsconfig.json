@@ -1,9 +1,8 @@
 {
-  // Production TypeScript under src/ and extension/. Each X.ts owns the tracked X.js and X.d.ts next
-  // to it; scripts/build.ts emits them (npm run build) and checks them (npm run check-generated).
-  // Tooling and tests are checked by tsconfig.tooling.json, which extends these options. This config
-  // never emits by itself: npm run typecheck only checks, and the build runner overrides noEmit and
-  // outDir to a staging directory.
+  // Authored production sources: the TypeScript extension under extension/ and the JavaScript modules
+  // under src/, whose bodies are checked through their JSDoc (checkJs). Nothing is ever emitted; Node
+  // and Pi run these files as they are. Tooling and tests are checked by tsconfig.tooling.json, which
+  // extends these options; npm run typecheck runs both.
   "compilerOptions": {
     "target": "ES2023",
     // ES2024.String types String.prototype.isWellFormed, which records validation relies on and every
@@ -19,16 +18,15 @@
     // Vendor-only workaround: Pi 1.1.0's declarations do not check under NodeNext on their own
     // (@earendil-works/pi-ai imports JSON without a type attribute; @google/genai needs DOM types and
     // an optional MCP SDK that is not installed). Our own sources are still fully checked against
-    // them, and generated declarations are excluded below rather than relied on.
+    // them.
     "skipLibCheck": true,
-    "noEmit": true,
-    "noEmitOnError": true,
-    "declaration": true,
-    "sourceMap": false,
-    "newLine": "lf",
-    "rootDir": "."
+    "allowJs": true,
+    "checkJs": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
-  "include": ["src/**/*.ts", "extension/**/*.ts"],
-  // Generated declarations sit next to their sources and must not be read back as inputs.
-  "exclude": ["**/*.d.ts"]
+  // Every authored src/**/*.mjs is a root here, so its body is checked even where a .d.mts sidecar
+  // declares it. The sidecars are roots of tsconfig.tooling.json instead: when one config's globs
+  // match both X.mjs and X.d.mts, tsc keeps only the declaration and silently drops the module.
+  "include": ["src/**/*.mjs", "extension/**/*.ts"]
 }

@@ -8,8 +8,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import type { Environment } from '../src/cli.js'
-import type { CreateTopicResult, Message, Page, Topic } from '../src/types.js'
+import type { Environment } from '../src/cli.mjs'
+import type { CreateTopicResult, Message, Page, Topic } from '../src/types.d.mts'
 
 const BIN_DIR = fileURLToPath(new URL('../bin', import.meta.url))
 const NODE_DIR = path.dirname(process.execPath)
