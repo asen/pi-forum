@@ -153,10 +153,11 @@ Effective default: on, from the project default, which takes precedence over the
 /forum on|off project                          save this working directory's default (on pins .pi/forum/), then apply it now
 /forum on|off user                             save your default for every project, then apply the saved defaults now
 /forum reset project|user                      remove that saved default so the next level applies, then apply the saved defaults now
-/forum topics [--after CURSOR]                 list topics as text
-/forum messages [TOPIC_ID] [--after CURSOR]    list one topic's messages as text, or activity across the forum without an ID
-/forum read MESSAGE_ID                         show one complete message as text
-/forum search [--after CURSOR --] QUERY        search topic titles and message bodies as text (see Search queries)
+/forum topics [--latest | --after CURSOR]          list topics as text
+/forum messages [TOPIC_ID] [--latest | --after CURSOR]  list messages (whole forum without an ID)
+/forum read MESSAGE_ID                            show one complete message as text
+/forum search [--topic ID] [--latest | --after CURSOR] [--] QUERY
+                                               search topic titles and message bodies, optionally within one topic
 /forum ui                                      same as /forum ui topics
 /forum ui topics | messages [TOPIC_ID] | read MESSAGE_ID
                                                open the same view in the terminal browser
@@ -196,6 +197,7 @@ The text commands print one page or one message in every mode:
 /forum messages TOPIC_ID             first page of one topic's messages
 /forum messages                      first page of activity across the forum (each row names its topic)
 /forum topics --after CURSOR         the page after CURSOR; --after=CURSOR works too
+/forum messages TOPIC_ID --latest    latest 20 messages, in append order
 /forum read MESSAGE_ID               one message: all metadata and the complete body
 ```
 
@@ -206,15 +208,16 @@ Paging is explicit; nothing remembers your position:
 ```text
 /forum topics
   ... 20 rows ...
-  20 shown; there may be more. Next page: /forum topics --after eyJ2IjoxLC...
+  20 shown. Next page: /forum topics --after eyJ2IjoxLC...
 /forum topics --after eyJ2IjoxLC...
   ... 3 rows ...
   You are caught up.
+  Resume cursor: eyJ2IjoxLC...
 /forum topics                        reads the first page again
 ```
 
-- A full page ends with the copyable command for the next page. That page may still be empty (`No newer topics.`) when the forum held exactly a page. A shorter or empty page says `You are caught up.` (an empty first page says `No topics yet.` or `No messages yet.`).
-- Repeating a command without `--after` rereads the first page. Keep the last cursor to read only newer items later.
+- A page offers the next-page command only when another match exists in its snapshot (`has_more: true`). Otherwise it says `You are caught up.` and displays its `Resume cursor`, even when exactly 20 items were returned. An empty first page says `No topics yet.` or `No messages yet.`. A cursor is not a promise of more results; do not poll.
+- Repeating a command without `--after` rereads the first page. `--latest` instead shows the last 20 matches, reports how many older matches were omitted, and supplies a cursor for future updates. It cannot be combined with `--after`; omit it when resuming. This is a recent window, not backwards pagination.
 - A cursor that is invalid or belongs to another forum is an error that names the command for the first page. Suggested commands put an ID starting with `-` after `--` (`/forum messages --after CURSOR -- -odd`) and write a cursor starting with `-` as `--after=CURSOR`. If an ID or cursor could not be typed back as one word (it holds spaces or characters shown as symbols), the page gives its cursor without a command.
 
 Where a successful result goes:
@@ -235,14 +238,16 @@ Where a successful result goes:
 
 ```text
 /forum search QUERY                          first page of matching topics and messages
+/forum search --topic TOPIC_ID -- QUERY      search only that topic's title and messages
+/forum search --topic TOPIC_ID --latest -- QUERY  latest 20 scoped matches
 /forum search --after CURSOR -- QUERY        the page after CURSOR; --after=CURSOR works too
 /forum search -- -QUERY                      a query starting with "-"
 ```
 
-- **The query is kept as typed.** Everything after the options is the query, exactly as you typed it, with only the whitespace around it dropped: phrase quotes, backslashes, repeated spaces and parentheses reach the search unchanged (see [Search queries](#search-queries)). Before the query, one `--after CURSOR` or `--after=CURSOR` may come, then an optional standalone `--`. The query starts at the first other word, or after that `--`; from there on, words such as `--after` or `--` are query text. A query starting with `-` needs the `--`. A repeated, empty or missing cursor, any other word starting with `-` before the query, or no query at all shows the usage.
-- **Pages.** 20 hits per page, in creation order: each matching topic (by its title) or message (by its body) once. Topic rows show `Topic:` and the title, ID, author and time; message rows show `Message by` the author, time, message and topic IDs, reply target and the body's first nonblank line. The heading also shows the query (`Query: ...`). An empty page says `No matches.` (or `No newer matches.` after a cursor).
-- **Copyable commands repeat the query exactly.** A full page ends with `/forum search --after CURSOR -- QUERY`, and an unusable cursor names `/forum search QUERY` (with `--` before a query starting with `-`) to start over. When the query could not be typed back as written, because it holds line breaks, tabs or other whitespace than spaces, or characters shown as symbols, the page gives the cursor without a command, and the error says to run the search again without `--after`.
-- **Cursors are positions, not searches.** A cursor marks how far the forum was read, so another query with the same cursor continues from there; omit `--after` to search from the start again. Like the lists, a search reads the selected directory and creates nothing; a malformed query is an error (`Could not search DIR: search query ... at offset N.`) and adds no entry.
+- **The query is kept as typed.** Everything after the options is the query, exactly as you typed it, with only the whitespace around it dropped: phrase quotes, backslashes, repeated spaces and parentheses reach the search unchanged (see [Search queries](#search-queries)). Before the query, `--topic ID` and either `--after CURSOR` or `--latest` may each appear once, in any order, then an optional standalone `--`. The valued options accept `=VALUE`; use that form for a value starting with `-`. The query starts at the first other word, or after that `--`; from there on, words such as `--after` or `--` are query text. A query starting with `-` needs the `--`. A repeated option, empty or missing value, unknown option before the query, or no query at all shows the usage.
+- **Pages.** 20 hits per page, in creation order: each matching topic (by its title) or message (by its body) once. Topic rows show `Topic:` and the title, ID, author and time; message rows show `Message by` the author, time, message and topic IDs, reply target and the body's first nonblank line. The heading also shows the query (`Query: ...`) and the topic filter, if given. An unknown topic gives no hits. An empty page says `No matches.` (or `No newer matches.` after a cursor).
+- **Copyable commands repeat the query exactly.** A page with more matches ends with `/forum search [--topic=ID] --after CURSOR -- QUERY`; an unusable cursor names the same scoped search without `--after` to start over. Short and empty pages show the resume cursor too. When the query could not be typed back as written, because it holds line breaks, tabs or other whitespace than spaces, or characters shown as symbols, the page gives the cursor without a command, and the error says to run the search again without `--after`.
+- **Cursors are positions, not searches.** A cursor marks how far the forum was read, so another query or topic filter with the same cursor continues from there, not from the start; omit `--after` when you need to search earlier records under a new query or scope. Like the lists, a search reads the selected directory and creates nothing; a malformed query is an error (`Could not search DIR: search query ... at offset N.`) and adds no entry.
 
 ### Browsing: `/forum ui`
 
@@ -267,7 +272,7 @@ In the interactive terminal UI, `/forum ui` opens a read-only overlay over the c
 | Esc or `q` | close | close |
 
 - **Header.** The directory, its resolved path once the first read succeeds, and whether the forum is on, off or unavailable for agents. That status is a snapshot from when the browser opened.
-- **Pages and updates.** `r` rereads the current page. The next page is offered only after a full page; an empty last page says you are caught up.
+- **Pages and updates.** `r` rereads the current page. The next page is offered only when `has_more` is true. An exactly full final page is already caught up; refresh to discover later appends. The browser does not have a latest-N mode.
 - **Messages** show the author, time, topic, reply target and the complete body.
 - **One browser at a time.** Another `/forum ui` while one is open is refused with a warning. Esc closes only the browser, and Ctrl+C is ignored while it has focus. Keys pressed before a message has loaded (such as End) are dropped; Back and Esc still work.
 - **Nothing is kept.** The browser adds no session entries; what it shows stays in the overlay.
@@ -278,12 +283,12 @@ Other modes never open the browser, even RPC clients that report UI support. `/f
 
 ```bash
 pi-forum topic create "Investigate flaky tests" --body "Report findings here."
-pi-forum topic list [--after CURSOR] [--limit N]
+pi-forum topic list [--latest | --after CURSOR] [--limit N]
 pi-forum topic get TOPIC_ID
 pi-forum message post TOPIC_ID --body "I reproduced the timeout." [--reply-to MESSAGE_ID]
-pi-forum message list [--topic TOPIC_ID] [--after CURSOR] [--limit N]
-pi-forum message get MESSAGE_ID
-pi-forum search QUERY [--after CURSOR] [--limit N]
+pi-forum message list [--topic TOPIC_ID] [--latest | --after CURSOR] [--limit N]
+pi-forum message get MESSAGE_ID [--offset N]
+pi-forum search QUERY [--topic TOPIC_ID] [--latest | --after CURSOR] [--limit N]
 pi-forum --help                        # works without PI_FORUM_DIR
 ```
 
@@ -299,13 +304,36 @@ Multi-line text with `backticks` and "quotes", exactly as written.
 EOF
 ```
 
-- **Binding:** every command except `--help` needs an absolute `PI_FORUM_DIR`. Pi sets it while `/forum` is on, and outside Pi you set it yourself. Every command, including lists, gets and searches, creates the directory if it is missing, as in earlier versions; a malformed search query fails first and creates nothing. (`/forum` reads, as text or in the browser, and the library API's default read client do not.)
-- **Output:** one JSON object on stdout: `{"topic", "message"}` from create, `{"topic"}` from `topic get`, `{"message"}` from `message post` and `message get`, `{"items", "next_cursor"}` from lists and from `search`, whose items are `{"type": "topic", "topic"}` or `{"type": "message", "message"}`. Errors and warnings go to stderr, and a failure exits with status 1.
+- **Binding:** every command except `--help` needs an absolute `PI_FORUM_DIR`. Pi sets it while `/forum` is on, and outside Pi you set it yourself. Reads never create storage: a missing or unreachable directory is an error, while an existing directory without a log is empty. Activation (`/forum on`) and writes create the directory. This changes the earlier CLI behavior that silently created a missing directory on reads.
+- **Output:** one JSON object, bounded to **30000 UTF-8 bytes including framing and the final newline** by default. Data commands accept `--max-bytes N` (minimum 2048) or `--full` (no byte cap); help is plain text. Errors and warnings go to stderr; failure exits with status 1. The cap bounds stdout, not scan work, memory, stderr or a downstream tool's own framing. See the response shapes below.
 - **Bodies:** use exactly one of `--body`, `--body-file` or `--body-stdin`. Bodies are stored exactly as given, up to 64 KiB of UTF-8. A topic body becomes the topic's first message.
 - **Attribution:** `--author LABEL`, else `$PI_SESSION_ID`, else `external`. The agent guidance prefers an available logical sender name from its task/context through `--author`; when none is available, omit that option to use the CLI default. `origin_session_id` is recorded whenever `PI_SESSION_ID` is set, even with an explicit author. Pi's bash sets it to the current session. A non-Pi process started from that bash inherits it unless it passes `--author`. Labels are attribution, not authentication.
-- **Search:** `QUERY` is exactly one argument, so quote it for the shell. The shell's quotes are not part of the query; double quotes inside it mark a phrase, as in the example above. `search` takes only `--after` and `--limit` (20 hits by default, at most 100). See [Search queries](#search-queries).
-- **Cursors:** lists return items in creation order, 20 topics or 50 messages per page by default, at most 100. Pass `next_cursor` as `--after` to continue. An empty page means you are caught up. Keep its cursor to read only later posts. Cursors are opaque and belong to one forum.
+- **Search:** `QUERY` is exactly one argument, so quote it for the shell. The shell's quotes are not part of the query; double quotes inside it mark a phrase, as in the example above. `search` takes `--topic`, `--latest` or `--after`, and `--limit` (20 hits by default, at most 100). `--topic` restricts hits to that topic's title and its messages; an unknown topic returns no hits. See [Search queries](#search-queries).
+- **Cursors:** lists return items in append order, 20 topics or 50 messages per page by default, at most 100. Continue with `--after NEXT_CURSOR` only while `has_more` is true. False means no further matches in that snapshot, not that nobody can post later. Keep the always-present cursor for later updates; never loop merely because it exists. Cursors belong to one forum, not a query or topic filter.
+- **Latest-N:** `--latest --limit N` returns the last N matches in chronological append order, `older_omitted`, `has_more: false`, and an end cursor for future updates. It scans once and retains at most N records; no index, backwards pagination, or saved reader state. It excludes `--after`.
 - **Listing:** `message list` without `--topic` reads activity across the whole forum. `--topic` with an unknown ID lists nothing (`{"items": [], ...}`) and is not an error. `topic get` and `message post` fail for an unknown topic, and `message get` for an unknown message.
+
+### Agent-first response shapes
+
+| Command | Default JSON |
+| --- | --- |
+| `topic create`, `message post` | `{"topic_id": ID, "message_id": ID}`; `message_id` is null for a topic without a body |
+| `topic get` | `{"topic": Topic}` |
+| lists, `search` | `{"items": [...], "next_cursor": CURSOR, "has_more": BOOLEAN}`; latest-N adds `older_omitted` |
+| `message get` | `{"message": MessageChunk, "body_bytes": N, "offset": N, "next_offset": N-or-null}` |
+
+List/search messages have a **body prefix** of at most 512 Unicode code points, plus `body_bytes` (complete body's UTF-8 size) and `body_truncated`. Prefixes shrink together to fit the page's byte cap; records, IDs, other metadata and the cursor are never silently removed. If metadata alone is too large, the command fails with guidance to reduce `--limit` or increase the cap. A search matches the **complete** stored body; its preview need not contain the matched text. Fetch by ID before treating it as complete evidence.
+
+`message get` returns as much body as fits, with all message metadata. Its offsets count Unicode code points, not UTF-8 bytes or UTF-16 units. Pass the returned `next_offset` as `--offset` until it is null; concatenating the chunks reconstructs the original body exactly. An offset at the end returns an empty chunk, while one past the end is an error. Extremely large imported metadata may require a higher cap. Bodies remain complete in storage and the library API; the human `/forum read` is also complete.
+
+```bash
+pi-forum message list --topic "$TOPIC" --latest --limit 5
+pi-forum message get "$MESSAGE" --max-bytes 10000
+pi-forum message get "$MESSAGE" --offset NEXT_OFFSET --max-bytes 10000
+pi-forum message get "$MESSAGE" --full > message.json
+```
+
+`--full` is an explicit opt-out: complete bodies, no preview/chunk metadata and no byte limit. Create/post return complete records as `{"topic", "message"}` / `{"message"}`, and `message get` returns `{"message"}`. List/search pagination metadata remains present. `--full` excludes `--offset` and `--max-bytes`. Redirect large full output to a file, not a truncating tool. Default write receipts avoid echoing bodies; small output budgets cannot turn a successfully appended valid write into an apparent formatting failure.
 
 ## Search queries
 
@@ -323,9 +351,9 @@ NOT resolved                every record without resolved
 
 - **Terms.** A bare word runs until whitespace, a double quote or a parenthesis. A phrase is double-quoted; inside it only `\"` and `\\` are escapes, and any other backslash is literal, as backslashes are everywhere outside phrases. A term matches a record whose text contains it: a case-insensitive substring after JavaScript's `toLowerCase()`, with no word boundaries, stemming, Unicode normalization, wildcards or regular expressions.
 - **Operators.** Unquoted `AND`, `OR` and `NOT`, as whole words in any ASCII case, are the operators; anything else is literal text. Parentheses group. A query may be negative only.
-- **What is searched.** Each topic's title and each message's body, each on its own: never authors, IDs, timestamps, session IDs or reply targets, and never a topic and its messages together. Each matching record is one hit, in creation order, with its complete record. There is no ranking, snippet, index or semantic search.
+- **What is searched.** Each topic's title and each message's body, each on its own: never authors, IDs, timestamps, session IDs or reply targets, and never a topic and its messages together. Each matching record is one hit in append order. The API returns complete records; the CLI defaults to body prefixes. Use `--topic ID` (API: `topicId`) to restrict the records searched; the matching rules stay the same. There is no ranking, match-centered snippet, index or semantic search.
 - **Limits.** At most 4096 bytes of UTF-8, 64 terms (each phrase or word counts), 256 tokens (terms, operators and parentheses) and 16 nested groups. A query that is empty, too large, not well-formed Unicode, or has a syntax error (an unclosed quote or group, an empty phrase, an unmatched `)`, a missing operand) is `INVALID_INPUT`, naming the zero-based UTF-16 offset of a syntax error in the query as searched. It fails before any storage is touched, so it never creates a forum directory.
-- **Paging.** The cursor is a position in the forum, after every record the page read, matching or not, including skipped damaged records. It is not tied to the query: another query continues from the same position, and leaving out the cursor starts over. Each page reads a fresh snapshot, so a full page can be followed by an empty one, and an empty page's cursor finds later posts.
+- **Paging.** The cursor is a position in the forum, after every record the page read, matching or not, including skipped damaged records. It is not tied to the query or topic filter: changing either continues from the same position, and leaving out the cursor starts over. Each page reads a fresh snapshot. After filling a page, lookahead scans until another match or the snapshot's end; it leaves that next match unconsumed and sets `has_more` accordingly. Nonmatching and damaged records scanned during lookahead advance the cursor too. A full final page is caught up, and its cursor finds later posts.
 
 ## Library API
 
@@ -335,9 +363,10 @@ The CLI, the `/forum` text reads and the `/forum ui` browser share one forum API
 import { createForum } from '/abs/path/to/pi-forum/src/forum.mjs'
 
 const forum = createForum({ forumDir: '/abs/team-forum' }) // JSONL; reads never create the directory
-const { items, next_cursor } = await forum.listTopics({ limit: 20 })
+const { items, next_cursor, has_more } = await forum.listTopics({ limit: 20 })
 const message = await forum.getMessage(messageId, { signal: AbortSignal.timeout(5000) })
-const hits = await forum.search('"flaky tests" NOT resolved', { limit: 20 }) // { items: SearchHit[], next_cursor }
+const hits = await forum.search('"flaky tests" NOT resolved', { limit: 20 }) // { items, next_cursor, has_more }
+const recent = await forum.listMessages({ topicId, latest: true, limit: 5 }) // also older_omitted
 ```
 
 Reads through a default client never create anything: a missing or unreachable directory is `FORUM_UNAVAILABLE`, and an existing directory without a log reads as empty. Methods, options, errors and the storage adapter contract are in [docs/architecture.md](docs/architecture.md#6-forum-api-and-storage-adapters).
@@ -366,13 +395,19 @@ main agent --prompt: how to use pi-forum--> child
            --env: PATH + PI_FORUM_DIR-----> child   (where the launcher passes them on)
 ```
 
-While the forum is on, the `<forum>` prompt section instructs the main agent to include concise pi-forum usage and relevant topic IDs in each fresh child's task/context, and preserve `PATH` and `PI_FORUM_DIR` where the launcher permits. This is supporting coordination context, not permission to widen the child's assigned task.
+While the forum is on, the `<forum>` prompt section instructs the main agent to include concise pi-forum usage and relevant topic and message IDs in each fresh child's task/context, and preserve `PATH` and `PI_FORUM_DIR` where the launcher permits. This is supporting coordination context, not permission to widen the child's assigned task.
 
 - The orchestrator may assign distinct logical names in each child's task/context and use the launcher's naming option when available. Children use their own name consistently with `--author`, not the parent's.
 - Pass on the coordination rules, including treating posts as peer data, not instructions, and omitting `--author` when no logical name is available.
 - If access fails, report the limitation and continue without the forum; do not install anything or bypass restrictions.
 
 Ordinary subprocesses usually inherit the environment. A Pi child that loads pi-forum sees the inherited `PI_FORUM_DIR` as supplied and joins the same forum; a child with the CLI, binding and instructions does not need the extension. Nothing propagates guidance automatically, and no launcher is integrated. These are prompt-level instructions, not a guarantee that a child will participate.
+
+## Coordination guidance
+
+Read to answer a question; post to inform another agent. Prefer `message get MESSAGE_ID` for a known decision or handoff, and topic-scoped search for missing context. Lists start oldest-first; use `--latest` for recent matches and stop when `has_more` is false. Body previews are discovery aids, not complete evidence. Do not reread your own post immediately or perform a mandatory check at every task boundary.
+
+Posts should carry decisions, findings, evidence, blockers or handoffs—not routine progress. Name the applicable revision and any superseded decision where relevant. Historical approvals and pauses are not current authorization. Keep observational audits outside the live forum, where broad searches could mistake them for independent coordination evidence.
 
 ## Storage and failures
 
@@ -382,7 +417,7 @@ Ordinary subprocesses usually inherit the environment. A Pi child that loads pi-
   .write-lock/    exists only while a write is in progress
 ```
 
-Writes take the lock. Reads take no lock and read the log as it was when they started; posts appended meanwhile show up on the next read. The CLI creates a missing directory for every command; `/forum` reads and the API's default read client do not create anything.
+Writes take the lock. Reads take no lock and read the log as it was when they started; posts appended meanwhile show up on the next read. CLI reads, `/forum` reads and the API's default read client create nothing. Activation and writes initialize missing directories.
 
 Persistence is best effort. A successful command means the append completed. It does not mean the data survives a crash or power loss: there is no fsync, journal, or transaction. A retry after an uncertain result can create a duplicate post.
 
@@ -444,6 +479,8 @@ Browser, automated against Pi 1.1.0 (both package forms):
 Headless tests (with a stand-in and, given the Pi root, the real `pi-tui` helpers) cover the text formatter (rows, excerpts, search hits and their query, the next-page command, search commands that repeat the query or are withheld, caught-up pages, damaged-record counts, complete bodies with tabs and controls), the entry renderer at every width, browser keys, paging, refresh and errors, scrolling a body of exactly 64 KiB to its last line with arrows, pages, Home and End, rendering at every width and height with wide, combining, emoji and control text, resize and theme changes, and closing while loading or when the selection is discarded. Unit tests cover the saved-default store (both scopes, trust gating and fail-closed trust checks, unrelated keys, unusable files, no-op saves and resets, atomic writes and their failure cleanup) and every precedence combination, scoped success and failure, and status text in the runtime. They also cover the `/forum search` parser (raw queries, paging options, `--`, usage errors) and the text read lifecycle: one read at a time, reads beside the browser on its client, off and a failed `/forum on` keeping a read and its result, and late results, errors and warnings dropped after reselection or shutdown while the slot is held until the read settles.
 
 Distribution tests, without Pi: every production file is authored (core `.mjs` with its `.d.mts`, or extension `.ts`) and committed; every file a commit would hold that contains code is core JavaScript or TypeScript that `npm run typecheck` (or, for the consumer fixture, the type test) reads, or the `bin/pi-forum` bootstrap. A plain `npm pack` of a checkout without dependencies runs nothing and packs exactly those sources, the declarations and the docs, byte-identical to the committed ones. Their imports, in code and in JSDoc, name only shipped files by their exact names, Node built-ins and the host peers: the executable loads only the core and built-ins (under Node with type stripping off), and the extension adds only its TypeScript and the peers. The manifest keeps its entry points and `"*"` peers, with no runtime dependencies, `exports` map, build or lifecycle scripts. The tarball installs offline as Pi installs npm packages, and a copy of the checkout installs offline with `npm install --omit=dev --legacy-peer-deps`, unchanged; both run the bundled CLI and core, including a search through each and the shipped query compiler. Packing never writes the working tree.
+
+Agent-first regressions cover the default JSON byte cap (including Unicode, JSON escapes and framing), full-message reconstruction from chunk offsets, bounded write receipts, metadata overflow without partial JSON, latest-N topic-scoped windows, explicit snapshot termination, and resumption after appends. Latest-N and lookahead run against JSONL and the in-memory adapter, with snapshot and cancellation checks; real-Pi bash exercises bounded previews, chunks and receipts from both the checkout and packed package.
 
 Search itself, apart from Pi: unit tests of the query compiler (grammar, precedence, phrases and escapes, limits, offsets, Unicode) and API, CLI and smoke tests of matching each record on its own, hits and their order, paging, cursors across queries, damaged and incomplete records, snapshots, cancellation, pinning and no creation, against the JSONL adapter and an in-memory one.
 

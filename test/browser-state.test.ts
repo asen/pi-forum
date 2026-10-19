@@ -243,19 +243,21 @@ describe('navigation', () => {
     assert.equal(reads.length, count)
   })
 
-  test('a caught-up empty page finds new activity on Refresh', async () => {
+  test('an exactly full final page is caught up; Refresh reveals later activity without polling', async () => {
     const { forum, created } = await seeded(1, 2)
     const topicId = created[0]!.topic.id
     const { browser } = browserFor(forum, { kind: 'messages', topicId }, { pageSize: 2 })
     await browser.start()
-    assert.equal(browser.state.page!.caughtUp, false)
-    await browser.next()
-    assert.deepEqual(browser.state.page!.items, [])
     assert.equal(browser.state.page!.caughtUp, true)
-    assert.equal(browser.state.actions.open, false)
+    assert.equal(browser.state.actions.next, false)
+    await browser.next()
+    assert.equal(browser.state.page!.items.length, 2)
     const later = await forum.postMessage({ topicId, author: 'b', body: 'later' })
     await browser.refresh()
+    assert.equal(browser.state.actions.next, true)
+    await browser.next()
     assert.deepEqual(browser.state.page!.items, [later])
+    assert.equal(browser.state.page!.caughtUp, true)
 
     const empty = browserFor(createForum({ forumDir: '/forums/empty', adapter: fakeAdapter(), createOnRead: true }), {
       kind: 'topics',
@@ -442,7 +444,7 @@ describe('requests', { timeout: 10000 }, () => {
     browser.start()
     await new Promise(setImmediate)
     for (let i = 0; i < 5; i++) calls[0]!.warn(`w${i}`)
-    calls[0]!.resolve({ items: [], next_cursor: 'c' })
+    calls[0]!.resolve({ items: [], next_cursor: 'c', has_more: false })
     await new Promise(setImmediate)
     assert.deepEqual(browser.state.warnings, { items: ['w0', 'w1', 'w2'], omitted: 2 })
     browser.refresh()

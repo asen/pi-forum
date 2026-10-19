@@ -179,9 +179,9 @@ async function readAt(log, buffer, length, position) {
  */
 const byteAt = async (log, position) => (await readAt(log, Buffer.alloc(1), 1, position))[0]
 
-// Calls visit(event) for each valid complete line from start until it returns true, warning about
-// skipped records. Returns the offset after the last line consumed. Lines are decoded whole, so
-// characters split across chunks are intact.
+// Calls visit(event) for each valid complete line. true stops after it; 'stop-before' stops
+// without consuming it. Warns about skipped records. Returns the offset after the last line
+// consumed. Lines are decoded whole, so characters split across chunks are intact.
 /**
  * @param {LogSnapshot} log
  * @param {number} start
@@ -223,7 +223,11 @@ async function scan(log, start, { onWarning, signal }, visit) {
       length = 0
       oversized = false
       from = end + 1
-      if (event && visit(event)) return lineStart
+      if (event) {
+        const stop = visit(event)
+        if (stop === 'stop-before') return offset
+        if (stop === true) return lineStart
+      }
     }
     if (!oversized && from < chunk.length) {
       length += chunk.length - from

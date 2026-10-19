@@ -35,10 +35,13 @@ export interface MessagePostedEvent {
 export type ForumEvent = TopicCreatedEvent | MessagePostedEvent
 export type ForumEventType = ForumEvent['type']
 
-// One page of a list read; next_cursor continues after its last item.
+// One snapshot page. has_more refers to matching records in that snapshot, never future appends.
 export interface Page<T> {
   items: T[]
   next_cursor: string
+  has_more: boolean
+  // Present only for latest-N reads: matching older records deliberately left out.
+  older_omitted?: number
 }
 
 // One search result: a topic whose title or a message whose body matched, as its full record.
@@ -59,8 +62,8 @@ export type ForumErrorCode =
 // Receives each warning about a damaged record skipped or a lock left behind.
 export type WarningHandler = (message: string) => void
 
-// Called for each event in append order; returning true stops the scan.
-export type EventVisitor = (event: ForumEvent) => boolean | void
+// true stops after consuming this event; 'stop-before' leaves it for the next read.
+export type EventVisitor = (event: ForumEvent) => boolean | 'stop-before' | void
 
 // Options callers pass to forum reads and writes. Absent values take the defaults.
 export interface ReadCallOptions {
@@ -71,6 +74,8 @@ export interface ReadCallOptions {
 export interface ListOptions extends ReadCallOptions {
   after?: string | null | undefined
   limit?: number | null | undefined
+  // Last N matches in append order. Cannot be combined with after.
+  latest?: boolean | undefined
 }
 
 export interface ListMessagesOptions extends ListOptions {
@@ -117,7 +122,7 @@ export interface Forum {
   readonly resolved: string | undefined
   listTopics(options?: ListOptions): Promise<Page<Topic>>
   listMessages(options?: ListMessagesOptions): Promise<Page<Message>>
-  search(query: string, options?: ListOptions): Promise<Page<SearchHit>>
+  search(query: string, options?: ListMessagesOptions): Promise<Page<SearchHit>>
   getTopic(topicId: string, options?: ReadCallOptions): Promise<Topic>
   getMessage(messageId: string, options?: ReadCallOptions): Promise<Message>
   createTopic(input: CreateTopicInput, options?: WriteCallOptions): Promise<CreateTopicResult>

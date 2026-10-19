@@ -181,7 +181,7 @@ describe('noncreating reads', () => {
     await assert.rejects(forum.getTopic('t'), { code: 'NOT_FOUND' })
     await assert.rejects(forum.getMessage('m'), { code: 'NOT_FOUND' })
     const hits = await forum.search('NOT t')
-    assert.deepEqual(hits, { items: [], next_cursor: topics.next_cursor })
+    assert.deepEqual(hits, { items: [], next_cursor: topics.next_cursor, has_more: false })
     assert.deepEqual(await fs.readdir(forumDir), [])
     assert.deepEqual({ ...process.env }, env)
 
@@ -206,7 +206,7 @@ describe('noncreating reads', () => {
     // createTopic returns a message whenever it is given a body.
     await forum.getMessage(message!.id)
     await assert.rejects(forum.getMessage('missing'), { code: 'NOT_FOUND' })
-    assert.equal((await forum.search('T OR b', { after: page.next_cursor })).items.length, 1)
+    assert.equal((await forum.search('T OR b', { after: page.next_cursor })).items.length, 0)
     assert.deepEqual(await snapshot(root), before)
   })
 
@@ -565,13 +565,16 @@ describe('chunked scanning', () => {
     assert.deepEqual((await forum.search('json OR yyy OR big', quiet)).items, [])
     const fit = await forum.search('x', { limit: 1, ...quiet })
     assert.deepEqual(fit.items.map((hit) => hit.type === 'message' && hit.message.id), ['fit'])
-    assert.equal(decode(fit.next_cursor).offset, offsets[2])
+    assert.equal(fit.has_more, false)
+    assert.equal(decode(fit.next_cursor).offset, offsets[5])
+    // Changing query cannot recover records consumed during lookahead. Start over to find 'ok'.
+    assert.deepEqual((await forum.search('ok', { after: fit.next_cursor, ...quiet })).items, [])
     const rest = collectWarnings()
-    const ok = await forum.search('ok', { after: fit.next_cursor, onWarning: rest.onWarning })
+    const ok = await forum.search('ok', { onWarning: rest.onWarning })
     assert.deepEqual(ok.items, [messageHit('ok', 't', 'ok')])
     assert.deepEqual(rest.warnings, warnings)
     const after = await forum.search('ok', { after: ok.next_cursor, ...quiet })
-    assert.deepEqual(after, { items: [], next_cursor: page.next_cursor })
+    assert.deepEqual(after, { items: [], next_cursor: page.next_cursor, has_more: false })
 
     await assert.rejects(forum.postMessage({ topicId: 't', author: 'a', body: 'x' }, quiet), {
       code: 'INCOMPLETE_LOG',
@@ -583,14 +586,14 @@ describe('chunked scanning', () => {
     const { forumDir, log, count } = await largeForum(3 * CHUNK)
     const size = (await fs.stat(log)).size
     const forum = createForum({ forumDir })
-    const { next_cursor } = await forum.listTopics({ limit: 1 })
     traceReads(t, async ({ count: reads }) => {
       if (reads === 2) await fs.appendFile(log, messageLine('late', 't', 'late'))
     })
-    // No later topic exists, so the read scans its whole snapshot.
-    const page = await forum.listTopics({ after: next_cursor })
+    // An exactly full page scans to the end to establish has_more: false.
+    const page = await forum.listTopics({ limit: 1 })
     t.mock.restoreAll()
-    assert.deepEqual(page.items, [])
+    assert.deepEqual(page.items, [topic('t')])
+    assert.equal(page.has_more, false)
     assert.equal(decode(page.next_cursor).offset, size)
     assert.ok(count > 100)
     const later = await forum.listMessages({ after: page.next_cursor })
@@ -601,17 +604,34 @@ describe('chunked scanning', () => {
     const { forumDir, log } = await largeForum(3 * CHUNK)
     const size = (await fs.stat(log)).size
     const forum = createForum({ forumDir })
-    const { next_cursor } = await forum.search('t', { limit: 1 })
     traceReads(t, async ({ count: reads }) => {
       if (reads === 2) await fs.appendFile(log, messageLine('late', 't', 'late needle'))
     })
-    const page = await forum.search('needle', { after: next_cursor })
+    const page = await forum.search('needle')
     t.mock.restoreAll()
     assert.deepEqual(page.items, [])
     assert.equal(decode(page.next_cursor).offset, size)
     // A later search with any query takes a fresh snapshot from the empty page's cursor.
     assert.deepEqual((await forum.search('late', { after: page.next_cursor })).items, [messageHit('late', 't', 'late needle')])
     assert.deepEqual((await forum.search('needle', { after: page.next_cursor })).items, [messageHit('late', 't', 'late needle')])
+  })
+
+  test('latest-N scans one snapshot and its end cursor finds appends excluded from that window', async (t) => {
+    const { forumDir, log, count } = await largeForum(3 * CHUNK)
+    const size = (await fs.stat(log)).size
+    const forum = createForum({ forumDir })
+    const expected = (await forum.listMessages({ latest: true, limit: 2 })).items
+    const trace = traceReads(t, async ({ count: reads }) => {
+      if (reads === 2) await fs.appendFile(log, messageLine('late', 't', 'late'))
+    })
+    const page = await forum.listMessages({ latest: true, limit: 2 })
+    t.mock.restoreAll()
+    assert.deepEqual(page.items, expected)
+    assert.equal(page.older_omitted, count - 2)
+    assert.equal(page.has_more, false)
+    assert.equal(decode(page.next_cursor).offset, size)
+    assert.equal(trace.reads.filter((read) => read.position === 0).length, 1, 'one forward scan')
+    assert.deepEqual((await forum.listMessages({ after: page.next_cursor })).items.map((m) => m.id), ['late'])
   })
 
   test('a log truncated during a read is reported, not listed', async (t) => {
@@ -687,6 +707,8 @@ describe('chunked scanning', () => {
       (signal: AbortSignal) => forum.getTopic('missing', { signal }),
       (signal: AbortSignal) => forum.search('none', { limit: 100, signal }),
       (signal: AbortSignal) => forum.search('NOT x', { limit: 100, signal }),
+      (signal: AbortSignal) => forum.listMessages({ latest: true, signal }),
+      (signal: AbortSignal) => forum.search('x', { latest: true, signal }),
     ]) {
       const controller = new AbortController()
       trace = traceReads(t, ({ count }) => {

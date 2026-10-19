@@ -85,6 +85,7 @@ describe('topic lists', () => {
         `   Topic ${b!.id} · by alice · ${b!.created_at}`,
         '',
         'You are caught up.',
+        `Resume cursor: ${page.next_cursor}`,
       ].join('\n'),
     )
   })
@@ -94,29 +95,30 @@ describe('topic lists', () => {
     const page = await forum.listTopics({ limit: LIST_PAGE_SIZE })
     const text = formatTopicList({ target: TARGET, page })
     assert.equal(text.match(/^\d+\. Topic \d+$/gm)!.length, LIST_PAGE_SIZE)
-    assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum topics --after ${page.next_cursor}`)
+    assert.equal(lastLine(text), `20 shown. Next page: /forum topics --after ${page.next_cursor}`)
 
     const after = page.next_cursor
     const rest = await forum.listTopics({ after, limit: LIST_PAGE_SIZE })
     const next = formatTopicList({ target: TARGET, page: rest, after })
     assert.match(next, new RegExp(`^Forum topics · after cursor ${after}\n`))
     assert.match(next, /\n1\. Topic 20\n/)
-    assert.equal(lastLine(next), 'You are caught up.')
+    assert.equal(lastLine(next), `Resume cursor: ${rest.next_cursor}`)
   })
 
   test('empty pages say so and are caught up; a cursor alone promises nothing', () => {
-    const empty = { items: [], next_cursor: 'c1' }
-    assert.match(formatTopicList({ target: TARGET, page: empty }), /\n\nNo topics yet\.\n\nYou are caught up\.$/)
-    assert.match(formatTopicList({ target: TARGET, page: empty, after: 'c0' }), /\n\nNo newer topics\.\n\nYou are caught up\.$/)
-    const short = { items: [{ id: 't', title: 'x', created_by: 'a', created_at: 'now' } satisfies Topic], next_cursor: 'c2' }
+    const empty = { items: [], next_cursor: 'c1', has_more: false }
+    assert.match(formatTopicList({ target: TARGET, page: empty }), /\n\nNo topics yet\.\n\nYou are caught up\.\nResume cursor: c1$/)
+    assert.match(formatTopicList({ target: TARGET, page: empty, after: 'c0' }), /\n\nNo newer topics\.\n\nYou are caught up\.\nResume cursor: c1$/)
+    const short = { items: [{ id: 't', title: 'x', created_by: 'a', created_at: 'now' } satisfies Topic], next_cursor: 'c2', has_more: false }
     const text = formatTopicList({ target: TARGET, page: short })
-    assert.doesNotMatch(text, /--after|c2|more/)
+    assert.match(text, /You are caught up\.\nResume cursor: c2$/)
+    assert.doesNotMatch(text, /Next page|more/)
   })
 
   test('titles, IDs and authors are shown in full with controls made visible', () => {
     const title = `\x1b]0;pwned\x07 ${'長'.repeat(200)} **bold** ‮evil‬`
     const topic: Topic = { id: 'id‏', title, created_by: 'x\ty', created_at: '2026-01-01T00:00:00.000Z' }
-    const text = formatTopicList({ target: TARGET, page: { items: [topic], next_cursor: 'c' } })
+    const text = formatTopicList({ target: TARGET, page: { items: [topic], next_cursor: 'c', has_more: false } })
     assert.ok(text.includes(`1. ␛]0;pwned␇ ${'長'.repeat(200)} **bold** ⟨U+202E⟩evil⟨U+202C⟩`))
     assert.ok(text.includes('   Topic id⟨U+200F⟩ · by x␉y · 2026-01-01T00:00:00.000Z'))
     assert.doesNotMatch(text, RAW_CONTROLS)
@@ -148,6 +150,7 @@ describe('message lists', () => {
         '   re',
         '',
         'You are caught up.',
+        `Resume cursor: ${page.next_cursor}`,
       ].join('\n'),
     )
   })
@@ -158,33 +161,34 @@ describe('message lists', () => {
     const text = formatMessageList({ target: TARGET, page })
     assert.match(text, /^Forum messages across all topics · from the start\n/)
     for (const { topic } of created) assert.ok(text.includes(` · topic ${topic.id}`))
-    assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum messages --after ${page.next_cursor}`)
+    assert.equal(lastLine(text), `20 shown. Next page: /forum messages --after ${page.next_cursor}`)
   })
 
   test('a full page of one topic pages with its topic ID; untypable IDs get the cursor without a command', async () => {
-    const { forum, created } = await seeded({ messages: LIST_PAGE_SIZE })
+    const { forum, created } = await seeded({ messages: LIST_PAGE_SIZE + 1 })
     const { topic } = created[0]!
     const page = await forum.listMessages({ topicId: topic.id, limit: LIST_PAGE_SIZE })
     const text = formatMessageList({ target: TARGET, topicId: topic.id, page })
-    assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum messages ${topic.id} --after ${page.next_cursor}`)
+    assert.equal(lastLine(text), `20 shown. Next page: /forum messages ${topic.id} --after ${page.next_cursor}`)
     const rest = await forum.listMessages({ topicId: topic.id, after: page.next_cursor, limit: LIST_PAGE_SIZE })
-    assert.deepEqual(rest.items, [])
-    assert.match(formatMessageList({ target: TARGET, topicId: topic.id, page: rest, after: page.next_cursor }), /\n\nNo newer messages\.\n\nYou are caught up\.$/)
+    assert.equal(rest.items.length, 1)
+    assert.equal(rest.has_more, false)
+    assert.match(formatMessageList({ target: TARGET, topicId: topic.id, page: rest, after: page.next_cursor }), /\nYou are caught up\.\nResume cursor: \S+$/)
 
     // A topic ID starting with "-" follows the "--" that ends the options.
     assert.equal(
       lastLine(formatMessageList({ target: TARGET, topicId: '-flag', page })),
-      `20 shown; there may be more. Next page: /forum messages --after ${page.next_cursor} -- -flag`,
+      `20 shown. Next page: /forum messages --after ${page.next_cursor} -- -flag`,
     )
     // IDs that cannot be typed back as one word get the cursor but no command.
     for (const topicId of ['two words', 'a\x1bb', 'a\u061cb', 'a\u00a0b']) {
       const shown = formatMessageList({ target: TARGET, topicId, page })
-      assert.equal(lastLine(shown), `20 shown; there may be more after cursor ${page.next_cursor}.`)
+      assert.equal(lastLine(shown), `20 shown; more matches after cursor ${page.next_cursor}.`)
     }
     // A page without a cursor, which the forum never returns, still reads as possibly incomplete.
     // @ts-expect-error -- next_cursor is always a string in a forum page
-    const noCursor = formatMessageList({ target: TARGET, page: { items: page.items, next_cursor: null } })
-    assert.equal(lastLine(noCursor), '20 shown; there may be more.')
+    const noCursor = formatMessageList({ target: TARGET, page: { items: page.items, next_cursor: null, has_more: true } })
+    assert.equal(lastLine(noCursor), '20 shown; more matches.')
   })
 
   test('excerpts are bounded by grapheme, never split one and show controls as visible text', () => {
@@ -294,6 +298,7 @@ describe('search results', () => {
         '   flaky  tests: timeout again…',
         '',
         'You are caught up.',
+        `Resume cursor: ${page.next_cursor}`,
       ].join('\n'),
     )
   })
@@ -303,24 +308,34 @@ describe('search results', () => {
     const page = await forum.search('needle', { limit: LIST_PAGE_SIZE })
     assert.equal(page.items.length, LIST_PAGE_SIZE)
     const text = formatSearchResults({ target: TARGET, query: QUERY, page })
-    assert.equal(lastLine(text), `20 shown; there may be more. Next page: /forum search --after ${page.next_cursor} -- ${QUERY}`)
+    assert.equal(lastLine(text), `20 shown. Next page: /forum search --after ${page.next_cursor} -- ${QUERY}`)
     assert.equal(text.match(/^\d+\. Message by bob\d · /gm)!.length, LIST_PAGE_SIZE)
     const rest = await forum.search('needle', { after: page.next_cursor, limit: LIST_PAGE_SIZE })
     const next = formatSearchResults({ target: TARGET, query: 'needle', page: rest, after: page.next_cursor })
     assert.match(next, new RegExp(`^Forum search · after cursor ${page.next_cursor}\n[^]*\nQuery: needle\n\n1\. Message by bob4 · `))
-    assert.equal(lastLine(next), 'You are caught up.')
+    assert.equal(lastLine(next), `Resume cursor: ${rest.next_cursor}`)
     // A query starting with "-" follows "--" too; a cursor starting with "-" is written --after=.
     const dashed = formatSearchResults({ target: TARGET, query: '-x OR --after', page: { ...page, next_cursor: '-c' } })
-    assert.equal(lastLine(dashed), '20 shown; there may be more. Next page: /forum search --after=-c -- -x OR --after')
+    assert.equal(lastLine(dashed), '20 shown. Next page: /forum search --after=-c -- -x OR --after')
   })
 
-  test('empty and short pages are caught up and show no cursor', () => {
-    const empty: Page<SearchHit> = { items: [], next_cursor: 'c1' }
-    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty }), /\nQuery: x\n\nNo matches\.\n\nYou are caught up\.$/)
-    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty, after: 'c0' }), /\n\nNo newer matches\.\n\nYou are caught up\.$/)
+  test('empty and short pages expose a resume cursor, not a promise of more results', () => {
+    const empty: Page<SearchHit> = { items: [], next_cursor: 'c1', has_more: false }
+    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty }), /\nQuery: x\n\nNo matches\.\n\nYou are caught up\.\nResume cursor: c1$/)
+    assert.match(formatSearchResults({ target: TARGET, query: 'x', page: empty, after: 'c0' }), /\n\nNo newer matches\.\n\nYou are caught up\.\nResume cursor: c1$/)
     const topic: Topic = { id: 't', title: 'x', created_by: 'a', created_at: 'now' }
-    const short = formatSearchResults({ target: TARGET, query: 'x', page: { items: [{ type: 'topic', topic }], next_cursor: 'c2' } })
-    assert.doesNotMatch(short, /--after|c2|more/)
+    const short = formatSearchResults({ target: TARGET, query: 'x', page: { items: [{ type: 'topic', topic }], next_cursor: 'c2', has_more: false } })
+    assert.match(short, /You are caught up\.\nResume cursor: c2$/)
+    assert.doesNotMatch(short, /Next page|more/)
+    assert.ok(formatSearchResults({ target: TARGET, query: 'x', page: { ...empty, next_cursor: 'c\x1b' } }).endsWith('Resume cursor: c␛'))
+  })
+
+  test('scoped search names its topic and preserves it in the next-page command', () => {
+    const topic: Topic = { id: '-odd', title: 'x', created_by: 'a', created_at: 'now' }
+    const page: Page<SearchHit> = { items: Array.from({ length: LIST_PAGE_SIZE }, () => ({ type: 'topic', topic })), next_cursor: 'c', has_more: true }
+    const text = formatSearchResults({ target: TARGET, query: 'x', topicId: topic.id, page })
+    assert.match(text, /^Forum search in topic -odd · from the start/)
+    assert.equal(lastLine(text), '20 shown. Next page: /forum search --topic=-odd --after c -- x')
   })
 
   test('query, titles, bodies and IDs show controls as visible text; such a query gets the cursor without a command', () => {
@@ -328,21 +343,35 @@ describe('search results', () => {
     const message: Message = { id: 'm\x1b', topic_id: 't\x07', author: 'a\u202e', created_at: 'c', body: `${'長'.repeat(EXCERPT_CHARS + 10)}\x1b[2J` }
     const items: SearchHit[] = Array.from({ length: LIST_PAGE_SIZE }, (_, i) => (i % 2 ? { type: 'message', message } : { type: 'topic', topic }))
     const query = 'line one\nNOT\x1b[2J ‮two'
-    const text = formatSearchResults({ target: TARGET, query, page: { items, next_cursor: 'c9' }, warnings: [`bad\x1b`] })
+    const text = formatSearchResults({ target: TARGET, query, page: { items, next_cursor: 'c9', has_more: true }, warnings: [`bad\x1b`] })
     assert.doesNotMatch(text, RAW_CONTROLS)
     assert.ok(text.includes('\nQuery: line one␊NOT␛[2J ⟨U+202E⟩two\n'))
     assert.ok(text.includes('\n1. Topic: ␛]0;pwned␇ **t** ⟨U+202E⟩x\n   Topic id⟨U+200F⟩ · by x␉y · now\n'))
     assert.ok(text.includes(`\n2. Message by a⟨U+202E⟩ · c\n   Message m␛ · topic t␇\n   ${'長'.repeat(EXCERPT_CHARS - 1)}…\n`))
     assert.ok(text.includes('\n1 damaged record(s) skipped; first: bad␛\n'))
-    assert.equal(lastLine(text), '20 shown; there may be more after cursor c9.')
+    assert.equal(lastLine(text), '20 shown; more matches after cursor c9.')
   })
+})
+
+test('exactly full final pages stop, and latest windows disclose omissions and their resume cursor', () => {
+  const topic: Topic = { id: 't', title: 'T', created_by: 'a', created_at: 'now' }
+  const page: Page<Topic> = { items: Array(LIST_PAGE_SIZE).fill(topic), next_cursor: 'end', has_more: false }
+  const final = formatTopicList({ target: TARGET, page })
+  assert.match(final, /You are caught up\.\nResume cursor: end$/)
+  assert.doesNotMatch(final, /Next page/)
+  const latest = formatTopicList({ target: TARGET, page: { ...page, older_omitted: 17 } })
+  assert.match(latest, /^Forum topics · latest window/)
+  assert.match(latest, /Latest window: 17 older matches omitted/)
+  assert.equal(textCommand({ kind: 'messages', topicId: '-t', latest: true }), '/forum messages --latest -- -t')
+  assert.equal(textCommand({ kind: 'search', topicId: 't', latest: true, query: 'x OR y' }), '/forum search --topic=t --latest -- x OR y')
+  assert.equal(textCommand({ kind: 'topics', latest: true, after: 'c' }), null)
 })
 
 describe('damaged records', () => {
   test('lists and reads count the damaged records their read skipped', () => {
     const warnings = ['skipping malformed record at byte offset 10: bad\x1b[0m', 'ignoring incomplete record at byte offset 99']
     const expected = '2 damaged record(s) skipped; first: skipping malformed record at byte offset 10: bad␛[0m'
-    const page = { items: [], next_cursor: 'c' }
+    const page = { items: [], next_cursor: 'c', has_more: false }
     assert.ok(formatTopicList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
     assert.ok(formatMessageList({ target: TARGET, page, warnings }).includes(`\n${expected}\n`))
     assert.ok(formatSearchResults({ target: TARGET, query: 'q', page, warnings }).includes(`\n${expected}\n`))
@@ -354,7 +383,7 @@ describe('damaged records', () => {
   })
 
   test('a bounded collection keeps the first warnings and counts the rest', () => {
-    const page = { items: [], next_cursor: 'c' }
+    const page = { items: [], next_cursor: 'c', has_more: false }
     const first = '1000 damaged record(s) skipped; first: bad‮ record'
     const bounded = { items: ['bad‮ record'], omitted: 999 }
     assert.ok(formatTopicList({ target: TARGET, page, warnings: bounded }).includes(`\n${printable(first)}\n`))
@@ -394,17 +423,17 @@ describe('bidirectional controls', () => {
       body: `${BIDI} first\n\t${BIDI}\n**${BIDI}**`,
     }
     const target: ForumTarget = { forumDir: `/f${BIDI}`, generated: false, resolved: `/r${BIDI}`, status: 'unavailable', warning: `w${BIDI}` }
-    const page = { items: Array(LIST_PAGE_SIZE).fill(topic), next_cursor: `c${BIDI}` }
+    const page = { items: Array(LIST_PAGE_SIZE).fill(topic), next_cursor: `c${BIDI}`, has_more: true }
     const texts = [
       formatTarget(target),
       formatTopicList({ target, page, after: `x${BIDI}`, warnings: [`bad${BIDI}`] }),
-      formatMessageList({ target, topicId: `t${BIDI}`, page: { items: [message], next_cursor: 'c' }, warnings: { items: [`bad${BIDI}`], omitted: 2 } }),
+      formatMessageList({ target, topicId: `t${BIDI}`, page: { items: [message], next_cursor: 'c', has_more: false }, warnings: { items: [`bad${BIDI}`], omitted: 2 } }),
       formatMessage({ target, message, warnings: [`bad${BIDI}`] }),
       excerpt(message.body),
       formatSearchResults({
         target,
         query: `q${BIDI}`,
-        page: { items: [{ type: 'topic', topic }, { type: 'message', message }], next_cursor: 'c' },
+        page: { items: [{ type: 'topic', topic }, { type: 'message', message }], next_cursor: 'c', has_more: false },
         warnings: [`bad${BIDI}`],
       }),
       ...bodyLines(message.body),
@@ -415,7 +444,7 @@ describe('bidirectional controls', () => {
     }
     assert.ok(texts[3]!.endsWith(`\nBody (3 lines):\n${BIDI_SHOWN} first\n    ${BIDI_SHOWN}\n**${BIDI_SHOWN}**`))
     // A cursor holding one is not offered as a command.
-    assert.equal(lastLine(texts[1]!), `20 shown; there may be more after cursor c${BIDI_SHOWN}.`)
+    assert.equal(lastLine(texts[1]!), `20 shown; more matches after cursor c${BIDI_SHOWN}.`)
   })
 })
 
@@ -450,6 +479,8 @@ describe('text commands', () => {
       ],
       [{ kind: 'search', query: '"a \\"b\\" \\\\c"' }, '/forum search "a \\"b\\" \\\\c"'],
       [{ kind: 'search', query: 'x', after: 'c1' }, '/forum search --after c1 -- x'],
+      [{ kind: 'search', query: 'x', topicId: 't', after: 'c1' }, '/forum search --topic=t --after c1 -- x'],
+      [{ kind: 'search', query: 'x', topicId: '-odd' }, '/forum search --topic=-odd -- x'],
       [{ kind: 'search', query: 'x', after: '-c1' }, '/forum search --after=-c1 -- x'],
       [{ kind: 'search', query: '-x' }, '/forum search -- -x'],
       [{ kind: 'search', query: '--after c -- y' }, '/forum search -- --after c -- y'],
@@ -471,6 +502,7 @@ describe('text commands', () => {
     }
     // A cursor follows the same rules as in the lists.
     for (const after of ['', 'two words', 'esc\x1b']) assert.equal(textCommand({ kind: 'search', query: 'x', after }), null)
+    for (const topicId of ['', 'two words', 'esc\x1b']) assert.equal(textCommand({ kind: 'search', query: 'x', topicId }), null)
   })
 
   test('arguments that cannot be typed back as one word give no command', () => {

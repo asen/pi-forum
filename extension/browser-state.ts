@@ -91,7 +91,7 @@ export type BrowserViewState = TopicsViewState | MessagesViewState | MessageView
 export type ListViewState = TopicsViewState | MessagesViewState
 
 // A list view's current page. items are empty until its first read and after a failed one; caughtUp
-// is a ready page shorter than the page size.
+// is a ready page with no further matches in its snapshot, even if the page is full.
 export interface BrowserPage<T> {
   readonly index: number
   readonly items: readonly T[]
@@ -158,7 +158,7 @@ interface Warnings {
 // them, and a failed read clears them.
 type ListLoad<T> =
   | { status: 'loading'; error: null; items: T[] | null }
-  | { status: 'ready'; error: null; items: T[]; nextCursor: string }
+  | { status: 'ready'; error: null; items: T[]; nextCursor: string; hasMore: boolean }
   | { status: 'error'; error: BrowserError; items: null }
 
 type MessageLoad =
@@ -172,6 +172,7 @@ interface ListFields<K extends string> {
   cursors: (string | undefined)[]
   pageIndex: number
   nextCursor: string | null
+  hasMore: boolean | null
   selection: number
   warnings: Warnings
 }
@@ -256,6 +257,7 @@ export function createBrowser({
             const page = result as Page<Topic> | Page<Message>
             frame.items = page.items
             frame.nextCursor = page.next_cursor
+            frame.hasMore = page.has_more
             frame.selection = Math.max(0, Math.min(frame.selection, page.items.length - 1))
           } else {
             frame.message = result as Message
@@ -303,7 +305,7 @@ export function createBrowser({
   }
 
   function canNext(frame: Frame) {
-    return isList(frame) && frame.status === 'ready' && frame.items.length === pageSize
+    return isList(frame) && frame.status === 'ready' && frame.hasMore
   }
 
   const browser: Browser = {
@@ -343,7 +345,7 @@ export function createBrowser({
               index: frame.pageIndex,
               items: frame.items ?? [],
               selection: frame.selection,
-              caughtUp: frame.status === 'ready' && frame.items.length < pageSize,
+              caughtUp: frame.status === 'ready' && !frame.hasMore,
             }
           : null,
         message: list ? null : frame.message,
@@ -474,6 +476,7 @@ function listFrame({ kind, topicId, topic }: { kind: ListFrame['kind']; topicId?
     pageIndex: 0,
     items: null,
     nextCursor: null,
+    hasMore: null,
     selection: 0,
     ...pending(),
   } as ListFrame

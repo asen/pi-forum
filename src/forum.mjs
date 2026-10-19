@@ -46,8 +46,9 @@ export { ForumError }
 //     FORUM_UNAVAILABLE. store.identity is a string naming the forum forumDir resolved to; given
 //     the identity of an earlier open, a forumDir that now resolves elsewhere is FORUM_UNAVAILABLE.
 //   store.read({ after, onWarning, signal }, visit) -> cursor
-//     Calls visit({ type, data }) for each canonical event after the cursor, in append order,
-//     until visit returns true. Resolves to an opaque cursor after the last event consumed.
+//     Calls visit({ type, data }) for each canonical event in a fixed snapshot after the cursor,
+//     until visit returns true (consume then stop) or 'stop-before' (leave it for the next read).
+//     Resolves to an opaque cursor after the last event consumed.
 //     Cursors come only from this adapter; an unusable one is INVALID_CURSOR. Once the optional
 //     AbortSignal is aborted it should stop, releasing what it holds, and fail with ABORTED.
 //   store.write({ onWarning }, fn) -> fn's result
@@ -169,22 +170,34 @@ export function createForum({ forumDir, adapter = jsonlAdapter, createOnRead = f
    * @param {(event: ForumEvent) => T | false} select
    * @returns {Promise<Page<T>>}
    */
-  async function list({ after, limit, onWarning = defaultWarning, signal }, defaultLimit, select) {
+  async function list({ after, limit, latest = false, onWarning = defaultWarning, signal }, defaultLimit, select) {
     const pageLimit = checkLimit(limit, defaultLimit)
     const start = checkCursor(after)
+    if (typeof latest !== 'boolean') throw new ForumError('INVALID_INPUT', 'latest must be a boolean')
+    if (latest && start !== undefined) throw new ForumError('INVALID_INPUT', 'latest cannot be combined with after')
     const checkedSignal = checkSignal(signal)
     const store = await open(createOnRead)
     throwIfAborted(checkedSignal)
     /** @type {T[]} */
     const items = []
+    let has_more = false
+    let older_omitted = 0
     const next_cursor = await store.read({ after: start, onWarning, signal: checkedSignal }, (event) => {
       const item = select(event)
-      if (item) items.push(item)
-      return items.length === pageLimit
+      if (!item) return
+      if (items.length === pageLimit) {
+        if (!latest) {
+          has_more = true
+          return 'stop-before'
+        }
+        items.shift()
+        older_omitted++
+      }
+      items.push(item)
     })
     throwIfAborted(checkedSignal)
     pin(store)
-    return { items, next_cursor }
+    return { items, next_cursor, has_more, ...(latest ? { older_omitted } : {}) }
   }
 
   /**
@@ -246,15 +259,17 @@ export function createForum({ forumDir, adapter = jsonlAdapter, createOnRead = f
 
     // Matches the query against each topic's title and each message's body on its own, and lists
     // every matching record once, in append order. The query is checked before storage is touched.
+    // topicId restricts hits to that topic's title and its messages; unknown topics give no hits.
     // Like a list's, the cursor is a position in the forum, after every record the page read
     // whether it matched or not; it is not bound to the query.
     /**
      * @param {string} query
-     * @param {ListOptions} [options]
+     * @param {ListMessagesOptions} [options]
      * @returns {Promise<Page<SearchHit>>}
      */
-    async search(query, options = {}) {
+    async search(query, { topicId, ...options } = {}) {
       const matches = compileSearchQuery(query)
+      if (topicId != null) checkId(topicId, 'topicId')
       return list(
         options,
         DEFAULT_SEARCH_LIMIT,
@@ -264,8 +279,8 @@ export function createForum({ forumDir, adapter = jsonlAdapter, createOnRead = f
          */
         (event) =>
           event.type === 'topic_created'
-            ? matches(event.data.title) && { type: 'topic', topic: event.data }
-            : matches(event.data.body) && { type: 'message', message: event.data },
+            ? (topicId == null || event.data.id === topicId) && matches(event.data.title) && { type: 'topic', topic: event.data }
+            : (topicId == null || event.data.topic_id === topicId) && matches(event.data.body) && { type: 'message', message: event.data },
       )
     },
 

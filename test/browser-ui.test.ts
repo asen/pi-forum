@@ -325,15 +325,17 @@ for (const lib of libraries) {
       browser.close()
     })
 
-    test('an empty caught-up page says so and refreshes into new activity', async () => {
+    test('a full caught-up page stays put; refresh then next reveals new activity', async () => {
       const { forum, created } = await seededForum({ topics: 1, messages: 2 })
       const topicId = created[0]!.topic.id
       const { host, browser } = await open(lib, forum, { kind: 'messages', topicId }, { pageSize: 2 })
       assert.match(host.text(), new RegExp(`^Forum · Messages in topic ${topicId} · page 1`))
+      assert.equal(browser.state.page!.caughtUp, true)
       await host.press(KEY.right)
-      assert.match(host.text(), /No messages yet\. You are caught up; r refreshes\./)
+      assert.equal(browser.state.page!.index, 0)
       await forum.postMessage({ topicId, author: 'carol', body: 'news' })
       await host.press('r')
+      await host.press(KEY.right)
       assert.match(host.text(), /› carol · .* · news/)
       browser.close()
     })
@@ -481,7 +483,7 @@ for (const lib of libraries) {
       assert.equal(calls[0]!.options.signal!.aborted, true)
       assert.equal(host.focus, 'editor')
       const renders = host.renders
-      calls[0]!.resolve({ items: [{ id: 't', title: 'late', created_by: 'a', created_at: 'z' }], next_cursor: 'c' })
+      calls[0]!.resolve({ items: [{ id: 't', title: 'late', created_by: 'a', created_at: 'z' }], next_cursor: 'c', has_more: false })
       await settle()
       assert.equal(host.renders, renders)
       // Repeated input, done and dispose are harmless.
@@ -528,7 +530,7 @@ for (const lib of libraries) {
         assert.equal(host.disposals, 1)
         assert.equal(read.options.signal!.aborted, true)
         const renders = host.renders
-        read.resolve({ items: [], next_cursor: 'c' })
+        read.resolve({ items: [], next_cursor: 'c', has_more: false })
         await settle()
         assert.equal(host.renders, renders)
         assert.deepEqual(reports, end === 'shutdown' ? [] : ['Forum is on: /forums/other (supplied PI_FORUM_DIR)'])

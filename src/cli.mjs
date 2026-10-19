@@ -12,12 +12,13 @@ import { MAX_BODY_BYTES, MAX_LABEL_CHARS, errorMessage } from './records.mjs'
 
 const HELP = `Usage:
   pi-forum topic create TITLE [BODY] [--author LABEL]
-  pi-forum topic list [--after CURSOR] [--limit N]
+  pi-forum topic list [--latest | --after CURSOR] [--limit N]
   pi-forum topic get TOPIC_ID
   pi-forum message post TOPIC_ID BODY [--reply-to MESSAGE_ID] [--author LABEL]
-  pi-forum message list [--topic TOPIC_ID] [--after CURSOR] [--limit N]
-  pi-forum message get MESSAGE_ID
-  pi-forum search QUERY [--after CURSOR] [--limit N]
+  pi-forum message list [--topic TOPIC_ID] [--latest | --after CURSOR] [--limit N]
+  pi-forum message get MESSAGE_ID [--offset N]
+  pi-forum search QUERY [--topic TOPIC_ID] [--latest | --after CURSOR] [--limit N]
+  All commands accept --max-bytes N or --full.
 
 BODY is exactly one of:
   --body TEXT         inline text
@@ -36,35 +37,46 @@ QUERY is one argument, so quote it for the shell:
 Options:
   --author LABEL      author label (default: $PI_SESSION_ID if set, otherwise "external")
   --reply-to ID       mark the message as a reply to a message in the same topic
-  --topic TOPIC_ID    list only messages of this topic (default: activity across the forum)
+  --topic TOPIC_ID    restrict message listing or search to this topic (default: whole forum)
   --after CURSOR      continue after the next_cursor of an earlier list or search result
   --limit N           page size from 1 to 100 (default: 20 topics or search hits, 50 messages)
+  --latest            last N matches, in append order; excludes --after
+  --max-bytes N       stdout UTF-8 byte cap, including JSON framing (default: 30000; minimum: 2048)
+  --offset N          message get: Unicode code-point offset (default: 0); use next_offset
+  --full              complete records, no byte cap or preview; excludes --max-bytes and --offset
   -h, --help          show this help
 
   Titles and author labels must be non-blank, up to ${MAX_LABEL_CHARS} characters.
   Put -- before a TITLE, ID or QUERY that starts with "-"; use --body=TEXT for text that does.
 
 Environment:
-  PI_FORUM_DIR        required absolute path of the forum directory (created if missing)
+  PI_FORUM_DIR        required absolute path; reads require an existing directory, writes create it
   PI_SESSION_ID       default author; recorded as origin_session_id on new topics/messages
 
 Output:
   Success prints one JSON object on stdout:
-    topic create    {"topic": Topic, "message": Message | null}
-    topic get       {"topic": Topic}
-    message post    {"message": Message}
-    message get     {"message": Message}
-    topic list      {"items": [Topic, ...], "next_cursor": CURSOR}
-    message list    {"items": [Message, ...], "next_cursor": CURSOR}
-    search          {"items": [Hit, ...], "next_cursor": CURSOR}, where each Hit is
-                    {"type": "topic", "topic": Topic} or {"type": "message", "message": Message}
+    topic create / message post: {"topic_id": ID, "message_id": ID | null} (write receipts)
+    topic get: {"topic": Topic}
+    message get: {"message": MessageChunk, "body_bytes": N, "offset": N, "next_offset": N | null}
+    lists / search: {"items": [...], "next_cursor": CURSOR, "has_more": BOOLEAN}
+  Latest-N pages also report older_omitted: the number of older matching records left out.
+  List/search messages contain a body preview, body_bytes, and body_truncated. Previews are at
+  most 512 code points and shrink to fit the byte cap; metadata and records are never silently
+  dropped. If metadata alone cannot fit, reduce --limit or increase --max-bytes.
+  Search hits remain {"type": "topic", "topic": Topic} or {"type": "message", "message": Preview}.
+  Read a preview's full body with message get; continue with --offset NEXT_OFFSET until null.
+  --full returns complete records: write results are {"topic", "message"} or {"message"},
+  message get is {"message"}, and list/search bodies are complete. Redirect large full output
+  to a file rather than sending it through a truncating tool.
   Errors and warnings go to stderr; failures exit with status 1.
 
 Pagination:
   Lists return items in creation order. Pass next_cursor as --after to read the next page.
-  An empty page means you are caught up; keep its next_cursor to read only newer items later.
-  Cursors are opaque and belong to one forum. A search cursor is a position in the forum, not
-  tied to its query; omit --after to search from the start again.
+  Stop when has_more is false; keep next_cursor for later updates. It is always present,
+  even at the end. has_more describes this snapshot, not future posts. Do not poll in a loop.
+  --latest scans once, retains only N matches, and returns an end cursor for future updates;
+  it does not page backwards. Omit --latest when continuing with --after.
+  Cursors belong to one forum, not a query or topic filter; omit --after to search earlier records.
 `
 
 class UsageError extends Error {}
@@ -79,6 +91,10 @@ const OPTION_TYPES = /** @type {const} */ ({
   topic: 'string',
   after: 'string',
   limit: 'string',
+  latest: 'boolean',
+  full: 'boolean',
+  'max-bytes': 'string',
+  offset: 'string',
 })
 
 /** @typedef {keyof typeof OPTION_TYPES} OptionName */
@@ -92,8 +108,12 @@ const OPTION_TYPES = /** @type {const} */ ({
 // Option values as given on the command line, so --limit is still its raw text.
 /** @typedef {{ readonly [K in OptionName]?: OptionValue<K> | undefined }} RawValues */
 
-// Option values once validated, with --limit as a number.
-/** @typedef {Omit<RawValues, 'limit'> & { readonly limit?: number | undefined }} CommandValues */
+// Option values once validated, with numeric options parsed.
+/** @typedef {Omit<RawValues, 'limit' | 'offset' | 'max-bytes'> & {
+ *   readonly limit?: number | undefined,
+ *   readonly offset?: number | undefined,
+ *   readonly 'max-bytes'?: number | undefined
+ * }} CommandValues */
 
 /** @typedef {'TITLE' | 'TOPIC_ID' | 'MESSAGE_ID' | 'QUERY'} ArgName */
 /**
@@ -128,7 +148,7 @@ const command = (spec) => spec
 // parseCommand's result: a help request, or a validated command to run.
 /** @typedef {{ help: true }} HelpRequest */
 
-/** @typedef {{ help: false, command: CommandSpec, args: CommandArgs<ArgName>, values: CommandValues }} CommandInvocation */
+/** @typedef {{ help: false, name: string, command: CommandSpec, args: CommandArgs<ArgName>, values: CommandValues }} CommandInvocation */
 
 const BODY_OPTIONS = /** @satisfies {OptionDefinitions} */ (
   /** @type {const} */ ({
@@ -141,9 +161,14 @@ const BODY_SOURCES = /** @satisfies {readonly (keyof typeof BODY_OPTIONS)[]} */ 
   /** @type {const} */ (['body', 'body-file', 'body-stdin'])
 )
 const LIST_OPTIONS = /** @satisfies {OptionDefinitions} */ (
-  /** @type {const} */ ({ after: { type: 'string' }, limit: { type: 'string' } })
+  /** @type {const} */ ({ after: { type: 'string' }, limit: { type: 'string' }, latest: { type: 'boolean' } })
 )
 const BODY_REQUIRED = 'a body is required: use --body, --body-file or --body-stdin'
+const OUTPUT_OPTIONS = /** @satisfies {OptionDefinitions} */ (
+  /** @type {const} */ ({ full: { type: 'boolean' }, 'max-bytes': { type: 'string' } })
+)
+const DEFAULT_MAX_BYTES = 30000
+const PREVIEW_CHARS = 512
 
 /** @type {{ readonly [name: string]: CommandSpec }} */
 const COMMANDS = {
@@ -159,7 +184,8 @@ const COMMANDS = {
   'topic list': command({
     options: LIST_OPTIONS,
     args: [],
-    run: (forum, _, values, env, onWarning) => forum.listTopics({ after: values.after, limit: values.limit, onWarning }),
+    run: (forum, _, values, env, onWarning) =>
+      forum.listTopics({ after: values.after, limit: values.limit, ...(values.latest ? { latest: true } : {}), onWarning }),
   }),
   'topic get': command({
     options: {},
@@ -184,20 +210,20 @@ const COMMANDS = {
     options: { topic: { type: 'string' }, ...LIST_OPTIONS },
     args: [],
     run: (forum, _, values, env, onWarning) =>
-      forum.listMessages({ topicId: values.topic, after: values.after, limit: values.limit, onWarning }),
+      forum.listMessages({ topicId: values.topic, after: values.after, limit: values.limit, ...(values.latest ? { latest: true } : {}), onWarning }),
   }),
   'message get': command({
-    options: {},
+    options: { offset: { type: 'string' } },
     args: ['MESSAGE_ID'],
     run: async (forum, { MESSAGE_ID }, values, env, onWarning) => ({
       message: await forum.getMessage(MESSAGE_ID, { onWarning }),
     }),
   }),
   search: command({
-    options: LIST_OPTIONS,
+    options: { topic: { type: 'string' }, ...LIST_OPTIONS },
     args: ['QUERY'],
     run: (forum, { QUERY }, values, env, onWarning) =>
-      forum.search(QUERY, { after: values.after, limit: values.limit, onWarning }),
+      forum.search(QUERY, { topicId: values.topic, after: values.after, limit: values.limit, ...(values.latest ? { latest: true } : {}), onWarning }),
   }),
 }
 
@@ -229,7 +255,7 @@ function parseCommand(argv) {
   if (!command) throw new UsageError(argv.length === 0 ? 'missing command' : `unknown command "${name}"`)
   /** @type {ParseArgsOptionsConfig} */
   const options = Object.fromEntries(
-    Object.entries(command.options).map(([key, option]) => [key, { ...option, multiple: true }]),
+    Object.entries({ ...command.options, ...OUTPUT_OPTIONS }).map(([key, option]) => [key, { ...option, multiple: true }]),
   )
   options.help = { type: 'boolean', short: 'h' }
   let parsed
@@ -258,6 +284,10 @@ function parseCommand(argv) {
     topic: lists.topic?.[0],
     after: lists.after?.[0],
     limit: lists.limit?.[0],
+    latest: lists.latest?.[0],
+    full: lists.full?.[0],
+    'max-bytes': lists['max-bytes']?.[0],
+    offset: lists.offset?.[0],
   }
   // With --help, whatever is given must be valid, but missing arguments and body are allowed.
   const { positionals } = parsed
@@ -269,11 +299,20 @@ function parseCommand(argv) {
   }
   if (command.body) checkBodySource(raw, command.body === 'required' && !help)
   /** @type {CommandValues} */
-  const values = { ...raw, limit: raw.limit === undefined ? undefined : parseLimit(raw.limit) }
+  const values = {
+    ...raw,
+    limit: raw.limit === undefined ? undefined : parseLimit(raw.limit),
+    offset: raw.offset === undefined ? undefined : parseInteger(raw.offset, '--offset', 0),
+    'max-bytes': raw['max-bytes'] === undefined ? undefined : parseInteger(raw['max-bytes'], '--max-bytes', 2048),
+  }
+  if (raw.latest && raw.after !== undefined) throw new UsageError('--latest cannot be combined with --after')
+  if (raw.full && (raw.offset !== undefined || raw['max-bytes'] !== undefined)) {
+    throw new UsageError('--full cannot be combined with --offset or --max-bytes')
+  }
   if (help) return { help }
   // Every argument has its positional, as the counts were checked above.
   const args = /** @type {CommandArgs<ArgName>} */ (Object.fromEntries(command.args.map((arg, i) => [arg, positionals[i]])))
-  return { help, command, args, values }
+  return { help, name, command, args, values }
 }
 
 /**
@@ -283,6 +322,20 @@ function parseCommand(argv) {
 function parseLimit(value) {
   if (!/^[0-9]+$/.test(value)) throw new UsageError('--limit must be an integer from 1 to 100')
   return Number(value)
+}
+
+/**
+ * @param {string} value
+ * @param {string} name
+ * @param {number} minimum
+ * @returns {number}
+ */
+function parseInteger(value, name, minimum) {
+  const number = Number(value)
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(number) || number < minimum) {
+    throw new UsageError(`${name} must be a safe integer of at least ${minimum}`)
+  }
+  return number
 }
 
 // Explicit --author wins, then the caller's Pi session; origin is recorded only for a real session.
@@ -387,10 +440,103 @@ function describeError(err) {
   return errorMessage(err)
 }
 
+// Output budgeting is presentation-only: it never changes a page's items or cursor.
+// Previews shrink together; IDs and other metadata remain intact. Full output is an explicit opt-out.
+/** @param {unknown} value */
+const jsonLine = (value) => `${JSON.stringify(value)}\n`
+
+/**
+ * @param {(length: number) => unknown} render
+ * @param {number} maximum
+ * @param {number} maxBytes
+ * @returns {{ text: string, length: number }}
+ */
+function fit(render, maximum, maxBytes) {
+  const whole = jsonLine(render(maximum))
+  if (Buffer.byteLength(whole) <= maxBytes) return { text: whole, length: maximum }
+  let text = jsonLine(render(0))
+  if (Buffer.byteLength(text) > maxBytes) {
+    throw new UsageError('metadata alone exceeds --max-bytes; reduce --limit, increase --max-bytes, or redirect --full output to a file')
+  }
+  let low = 0
+  let high = maximum
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    const candidate = jsonLine(render(middle))
+    if (Buffer.byteLength(candidate) <= maxBytes) {
+      low = middle
+      text = candidate
+    } else high = middle - 1
+  }
+  return { text, length: low }
+}
+
+/** @param {string} text @param {number} length */
+function prefix(text, length) {
+  let end = 0
+  let count = 0
+  for (const character of text) {
+    if (count++ === length) break
+    end += character.length
+  }
+  return text.slice(0, end)
+}
+
+/** @param {Message} message @param {number} length */
+function preview(message, length) {
+  const body = prefix(message.body, length)
+  return { ...message, body, body_bytes: Buffer.byteLength(message.body), body_truncated: body.length < message.body.length }
+}
+
+/** @param {CommandResult} result @param {number} length */
+function previews(result, length) {
+  if (!('items' in result)) return result
+  const items = result.items.map((item) => {
+    if ('body' in item) return preview(item, length)
+    if ('type' in item && item.type === 'message') return { ...item, message: preview(item.message, length) }
+    return item
+  })
+  return { ...result, items }
+}
+
+/** @param {Message} message @param {number} offset @param {number} maxBytes */
+function messageChunk(message, offset, maxBytes) {
+  const characters = [...message.body]
+  if (offset > characters.length) throw new UsageError('--offset is past the end of the message')
+  const remaining = characters.length - offset
+  const body_bytes = Buffer.byteLength(message.body)
+  const fitted = fit((length) => ({
+    message: { ...message, body: characters.slice(offset, offset + length).join('') },
+    body_bytes,
+    offset,
+    next_offset: length === remaining ? null : offset + length,
+  }), remaining, maxBytes)
+  if (remaining > 0 && fitted.length === 0) throw new UsageError('--max-bytes cannot fit one body character after metadata; increase it')
+  return fitted.text
+}
+
+/** @param {string} name @param {CommandResult} result @param {CommandValues} values */
+function present(name, result, values) {
+  if (values.full) return jsonLine(result)
+  const maxBytes = values['max-bytes'] ?? DEFAULT_MAX_BYTES
+  if (name === 'message get' && 'message' in result && result.message) {
+    return messageChunk(result.message, values.offset ?? 0, maxBytes)
+  }
+  // Receipts avoid echoing large posted bodies. Their validated IDs fit even the minimum budget,
+  // so output budgeting cannot turn a completed write into an apparent failure.
+  if (name === 'topic create' && 'topic' in result && 'message' in result) {
+    return jsonLine({ topic_id: result.topic.id, message_id: result.message?.id ?? null })
+  }
+  if (name === 'message post' && 'message' in result && result.message) {
+    return jsonLine({ topic_id: result.message.topic_id, message_id: result.message.id })
+  }
+  return fit((length) => previews(result, length), PREVIEW_CHARS, maxBytes).text
+}
+
 // Runs one CLI invocation and returns its exit status. Commands run against one forum client bound
 // for the invocation by options.createForum, and output goes to options.stdout and options.stderr;
-// the defaults are the shared API and the process streams, and tests may inject others. Reads create
-// a missing forum directory, as they always have.
+// the defaults are the shared API and the process streams, and tests may inject others. Reads never
+// create storage: a missing directory is an error, not an empty forum.
 /**
  * @param {readonly string[]} argv
  * @param {Environment} [env]
@@ -410,10 +556,10 @@ export async function main(
       stdout.write(HELP)
       return 0
     }
-    const { command, args, values } = parsed
-    const forum = bind({ forumDir: forumDirectory(env), createOnRead: true })
+    const { name, command, args, values } = parsed
+    const forum = bind({ forumDir: forumDirectory(env), createOnRead: false })
     const result = await command.run(forum, args, values, env, onWarning)
-    stdout.write(`${JSON.stringify(result)}\n`)
+    stdout.write(present(name, result, values))
     return 0
   } catch (err) {
     stderr.write(`pi-forum: error: ${describeError(err)}\n`)

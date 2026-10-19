@@ -140,24 +140,28 @@ export interface WarningSummary {
 export type ReadWarnings = readonly string[] | WarningSummary
 
 // What a view reads: a topic list, a message list (in one topic, or across the forum when topicId is
-// undefined) or one message. List views continue after a cursor; a message has none.
+// undefined) or one message. Text lists accept after or latest; a message accepts neither.
+// Browser entry views ignore text paging fields and always start at the first page.
 export type TopicsView = {
   readonly kind: 'topics'
   readonly topicId?: undefined
   readonly messageId?: undefined
   readonly after?: string | undefined
+  readonly latest?: boolean | undefined
 }
 export type MessagesView = {
   readonly kind: 'messages'
   readonly topicId?: string | undefined
   readonly messageId?: undefined
   readonly after?: string | undefined
+  readonly latest?: boolean | undefined
 }
 export type ReadView = {
   readonly kind: 'read'
   readonly topicId?: undefined
   readonly messageId: string
   readonly after?: undefined
+  readonly latest?: undefined
 }
 export type ListView = TopicsView | MessagesView
 // The views the browser opens; ViewKind names them.
@@ -168,9 +172,10 @@ export type ViewKind = ForumView['kind']
 export type SearchView = {
   readonly kind: 'search'
   readonly query: string
-  readonly topicId?: undefined
+  readonly topicId?: string | undefined
   readonly messageId?: undefined
   readonly after?: string | undefined
+  readonly latest?: boolean | undefined
 }
 // What a text read reads: a browser view or a search.
 export type TextView = ForumView | SearchView
@@ -197,6 +202,7 @@ export interface MessageListRequest {
 export interface SearchResultsRequest {
   target: ForumTarget
   query: string
+  topicId?: string | undefined
   page: Page<SearchHit>
   after?: string | undefined
   warnings?: ReadWarnings | undefined

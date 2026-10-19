@@ -485,6 +485,24 @@ function contract(name: string, setup: Setup) {
       }
     })
 
+    test('topic-scoped search keeps matching local titles and bodies, never peer topics', async () => {
+      const { forum, flaky, report, deploy, quoted } = await searchForum()
+      assert.deepEqual((await forum.search('NOT absent', { topicId: flaky.id })).items, [topicHit(flaky), messageHit(report), messageHit(quoted)])
+      const first = await forum.search('NOT absent', { topicId: flaky.id, limit: 1 })
+      const rest = await forum.search('NOT absent', { topicId: flaky.id, after: first.next_cursor })
+      assert.deepEqual(rest.items, [messageHit(report), messageHit(quoted)])
+      assert.deepEqual((await forum.search('NOT absent', { topicId: 'unknown' })).items, [])
+      assert.deepEqual((await forum.search('NOT absent', { topicId: null })).items, (await forum.search('NOT absent')).items)
+      const later = await forum.postMessage({ topicId: flaky.id, author: 'a', body: 'new decision' })
+      await forum.postMessage({ topicId: deploy.id, author: 'observer', body: 'new decision copied in an audit' })
+      assert.deepEqual((await forum.search('decision', { topicId: flaky.id, after: rest.next_cursor })).items, [messageHit(later)])
+      // A filter is not part of the cursor; a new scope must start over to include earlier records.
+      assert.deepEqual((await forum.search('NOT absent', { topicId: deploy.id, after: rest.next_cursor })).items.length, 1)
+      await assert.rejects(forum.search('x', { topicId: ' ' }), forumError('INVALID_INPUT'))
+      // @ts-expect-error -- runtime callers may supply a non-string topic
+      await assert.rejects(forum.search('x', { topicId: 42 }), forumError('INVALID_INPUT'))
+    })
+
     test('search exclusions and negative-only queries match individual records', async () => {
       const { forum, flaky, report, deploy, repeated, quoted } = await searchForum()
       const search = async (query: string) => (await forum.search(query)).items
@@ -523,9 +541,10 @@ function contract(name: string, setup: Setup) {
         const all = await readAll((options) => forum.search('needle', options), { limit })
         assert.deepEqual(all.items, needles, `limit ${limit}`)
       }
-      // A full page may be the last one: the next page is empty.
+      // An exactly full final page is explicitly caught up.
       const full = await forum.search('needle', { limit: 6 })
       assert.deepEqual(full.items, needles)
+      assert.equal(full.has_more, false)
       assert.deepEqual((await forum.search('needle', { after: full.next_cursor })).items, [])
 
       // The cursor is a position after every record the page read, matching or not, and is not bound
@@ -535,12 +554,14 @@ function contract(name: string, setup: Setup) {
       assert.deepEqual((await forum.search('hay', { after: first.next_cursor })).items, hays.slice(1))
       assert.deepEqual((await forum.search('hay')).items, hays)
       const third = await forum.search('"needle 3"', { limit: 1 })
-      assert.deepEqual((await forum.search('NOT absent', { after: third.next_cursor })).items, records.slice(-2))
+      assert.equal(third.has_more, false)
+      assert.deepEqual((await forum.search('NOT absent', { after: third.next_cursor })).items, [])
 
-      // A list's cursor is the same kind of position: this one is after the second topic.
+      // Lookahead consumes nonmatching records, but leaves the next match for the next page.
+      // This topic cursor is after the second topic's body and before the third topic.
       const listed = await forum.listTopics({ limit: 2 })
       assert.deepEqual(listed.items, topics.slice(0, 2))
-      assert.deepEqual((await forum.search('needle', { after: listed.next_cursor })).items, needles.slice(2))
+      assert.deepEqual((await forum.search('needle', { after: listed.next_cursor })).items, needles.slice(3))
 
       // An empty page still returns a cursor that finds later appends.
       const empty = await forum.search('later')
@@ -755,7 +776,7 @@ describe('client identity', () => {
     assert.equal(searcher.resolved, undefined)
     state.fail = false
     state.identity = 'C'
-    assert.deepEqual(await searcher.search('t'), { items: [], next_cursor: 'cursor' })
+    assert.deepEqual(await searcher.search('t'), { items: [], next_cursor: 'cursor', has_more: false })
     assert.equal(searcher.resolved, 'C')
   })
 

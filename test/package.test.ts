@@ -636,15 +636,15 @@ test('the packaged text output and session entry renderer load from the tarball'
   assert.equal(LIST_PAGE_SIZE, 20)
   const text = formatTopicList({
     target: { forumDir: '/forum', generated: false, status: 'on' },
-    page: { items: [{ id: 't1', title: 'Plan', created_by: 'ralph', created_at: '2026-01-01T00:00:00.000Z' }], next_cursor: 'c1' },
+    page: { items: [{ id: 't1', title: 'Plan', created_by: 'ralph', created_at: '2026-01-01T00:00:00.000Z' }], next_cursor: 'c1', has_more: false },
   })
-  assert.equal(text.split('\n').at(-1), 'You are caught up.')
+  assert.equal(text.split('\n').at(-1), 'Resume cursor: c1')
   const found = formatSearchResults({
     target: { forumDir: '/forum', generated: false, status: 'on' },
     query: '"release plan" OR (kickoff AND NOT x)',
-    page: { items: [{ type: 'message', message: { id: 'm1', topic_id: 't1', author: 'ralph', body: 'Kickoff', created_at: '2026-01-01T00:00:00.000Z' } }], next_cursor: 'c1' },
+    page: { items: [{ type: 'message', message: { id: 'm1', topic_id: 't1', author: 'ralph', body: 'Kickoff', created_at: '2026-01-01T00:00:00.000Z' } }], next_cursor: 'c1', has_more: false },
   })
-  assert.deepEqual(found.split('\n').slice(3), ['Query: "release plan" OR (kickoff AND NOT x)', '', '1. Message by ralph · 2026-01-01T00:00:00.000Z', '   Message m1 · topic t1', '   Kickoff', '', 'You are caught up.'])
+  assert.deepEqual(found.split('\n').slice(3), ['Query: "release plan" OR (kickoff AND NOT x)', '', '1. Message by ralph · 2026-01-01T00:00:00.000Z', '   Message m1 · topic t1', '   Kickoff', '', 'You are caught up.', 'Resume cursor: c1'])
   assert.equal(textCommand({ kind: 'search', query: '-x "a  b"', after: 'c1' }), '/forum search --after c1 -- -x "a  b"')
   class Text {
     constructor(shown: string, paddingX: number, paddingY: number) {
@@ -697,12 +697,12 @@ test('the packaged executable runs by direct path, through PATH and through a sy
   const help = await exec(path.join(pkg, 'bin', 'pi-forum'), ['--help'], { cwd: temp, env: { PATH: NODE_DIR, NODE_OPTIONS: PLAIN_NODE } })
   assert.match(help.stdout, /^Usage:\n {2}pi-forum topic create/)
 
-  const created = await exec(path.join(pkg, 'bin', 'pi-forum'), ['topic', 'create', 'Packaged', '--body', 'hi'], options([]))
+  const created = await exec(path.join(pkg, 'bin', 'pi-forum'), ['topic', 'create', 'Packaged', '--body', 'hi', '--full'], options([]))
   const { topic, message } = JSON.parse(created.stdout) as CreatedTopic
   assert.equal(topic.created_by, 'pkg-session')
   assert.equal(message.body, 'hi')
 
-  const viaPath = await exec('pi-forum', ['message', 'post', topic.id, '--body', 'via PATH'], options([path.join(pkg, 'bin')]))
+  const viaPath = await exec('pi-forum', ['message', 'post', topic.id, '--body', 'via PATH', '--full'], options([path.join(pkg, 'bin')]))
   assert.equal((JSON.parse(viaPath.stdout) as { message: Message }).message.body, 'via PATH')
 
   const viaLink = await exec('pi-forum', ['message', 'list', '--topic', topic.id], options([links]))
@@ -711,7 +711,9 @@ test('the packaged executable runs by direct path, through PATH and through a sy
   const searched = await exec('pi-forum', ['search', '"via PATH" OR (packaged AND NOT hi)', '--limit', '5'], options([links]))
   const hits = (JSON.parse(searched.stdout) as Page<SearchHit>).items
   assert.deepEqual(hits.map((hit) => (hit.type === 'topic' ? ['topic', hit.topic.title] : ['message', hit.message.body])), [['topic', 'Packaged'], ['message', 'via PATH']])
-  assert.match(help.stdout, /\n {2}pi-forum search QUERY \[--after CURSOR\] \[--limit N\]\n/)
+  assert.match(help.stdout, /\n {2}pi-forum search QUERY \[--topic TOPIC_ID\] \[--latest \| --after CURSOR\] \[--limit N\]\n/)
+  const scoped = await exec('pi-forum', ['search', 'NOT absent', '--topic', topic.id], options([links]))
+  assert.equal((JSON.parse(scoped.stdout) as Page<SearchHit>).items.length, 3)
   for (const result of [help, created, viaPath, viaLink, searched]) assert.equal(result.stderr, '')
   // A malformed query fails with its offset and prints nothing.
   const failed = await exec(path.join(pkg, 'bin', 'pi-forum'), ['search', 'a AND'], options([])).then(

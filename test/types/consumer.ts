@@ -80,10 +80,17 @@ export async function useForum(signal: AbortSignal): Promise<Message> {
 export async function search(forum: Forum, signal: AbortSignal): Promise<string[]> {
   const hits: Page<SearchHit> = await forum.search('plan AND NOT "draft notes"', { limit: 20, signal, onWarning: () => {} })
   const next: Page<SearchHit> = await forum.search('plan', { after: hits.next_cursor, limit: null })
+  const recent = await forum.search('plan', { topicId: 't', latest: true, limit: 5 })
+  const more: boolean = recent.has_more
+  const omitted: number | undefined = recent.older_omitted
+  void [more, omitted]
+  // @ts-expect-error -- latest is a boolean, not a string
+  forum.listMessages({ latest: 'yes' })
   // @ts-expect-error: the query is a string
   await forum.search({ query: 'plan' })
-  // @ts-expect-error: a search takes list options, without a topic filter
   await forum.search('plan', { topicId: 't' })
+  // @ts-expect-error: topic IDs are strings
+  await forum.search('plan', { topicId: 42 })
   // @ts-expect-error: hits are not plain records
   const records: Page<Topic | Message> = next
   void records
@@ -194,13 +201,14 @@ export const textViews: TextView[] = [...views, searchView]
 export const searchCommand: string | null = textCommand(searchView)
 // @ts-expect-error: a search has a query
 textCommand({ kind: 'search' })
-// @ts-expect-error: a search has no topic
 export const topicSearch: SearchView = { kind: 'search', query: 'plan', topicId: 't' }
+// @ts-expect-error: a topic filter is a string
+textCommand({ kind: 'search', query: 'plan', topicId: 42 })
 export const target: ForumTarget = { forumDir: '/abs/forum', generated: false, status: 'on' }
 // @ts-expect-error: only a generated directory is a project pin
 export const pinned: ForumTarget = { forumDir: '/abs/forum', generated: false, project: true, status: 'on' }
-export const listing: string = formatTopicList({ target, page: { items: [topicValue], next_cursor: 'c' } })
-export const searched: string = formatSearchResults({ target, query: 'plan', page: { items: [{ type: 'topic', topic: topicValue }], next_cursor: 'c' } })
+export const listing: string = formatTopicList({ target, page: { items: [topicValue], next_cursor: 'c', has_more: false } })
+export const searched: string = formatSearchResults({ target, query: 'plan', page: { items: [{ type: 'topic', topic: topicValue }], next_cursor: 'c', has_more: false } })
 // @ts-expect-error: search results are hits, not plain records
 formatSearchResults({ target, query: 'plan', page: { items: [topicValue], next_cursor: 'c' } })
 export function browse(forum: Forum): void {

@@ -54,7 +54,8 @@ interface RunResult {
   stderr: string
 }
 
-// What each command prints on success, by its two command words, as the help documents.
+// Complete-record output (--full), used by the legacy CRUD and dispatch tests.
+// Default agent output is tested separately below.
 interface Responses {
   topic: { create: CreateTopicResult; get: { topic: Topic }; list: Page<Topic> }
   message: { post: { message: Message }; get: { message: Message }; list: Page<Message> }
@@ -94,19 +95,24 @@ async function succeeds(args: readonly string[], options?: RunOptions) {
   return result.stdout
 }
 
-// Runs a command expected to succeed and returns its single JSON result. Parsing it as the command's
+function full(args: readonly string[]) {
+  const words = args[0] === 'search' ? 1 : 2
+  return [...args.slice(0, words), '--full', ...args.slice(words)]
+}
+
+// Runs a command in full-output mode. Parsing it as the command's
 // documented response is the only unchecked step; the tests assert the fields they use.
 async function ok<G extends keyof Responses, V extends keyof Responses[G] & string>(
   args: CommandArgs<G, V>,
   options?: RunOptions,
 ): Promise<Responses[G][V]> {
-  return JSON.parse(await succeeds(args, options))
+  return JSON.parse(await succeeds(full(args), options))
 }
 
 // Runs pi-forum search with the given arguments, expecting the page of hits it documents.
 async function search(args: readonly string[], options?: RunOptions): Promise<Page<SearchHit>> {
-  const page: Page<SearchHit> = JSON.parse(await succeeds(['search', ...args], options))
-  assert.deepEqual(Object.keys(page), ['items', 'next_cursor'])
+  const page: Page<SearchHit> = JSON.parse(await succeeds(['search', '--full', ...args], options))
+  assert.deepEqual(Object.keys(page), ['items', 'next_cursor', 'has_more'])
   return page
 }
 
@@ -130,9 +136,9 @@ async function readAll<G extends keyof Responses>(args: CommandArgs<G, 'list'>, 
   const items: Responses[G]['list']['items'][number][] = []
   for (;;) {
     const page = await ok([...args, ...(cursor ? ['--after', cursor] : [])], options)
-    assert.deepEqual(Object.keys(page), ['items', 'next_cursor'])
+    assert.deepEqual(Object.keys(page), ['items', 'next_cursor', 'has_more'])
     items.push(...page.items)
-    if (page.items.length === 0) return { items, cursor: page.next_cursor }
+    if (!page.has_more) return { items, cursor: page.next_cursor }
     cursor = page.next_cursor
   }
 }
@@ -151,11 +157,11 @@ describe('help and binding', () => {
         'next_cursor',
         '--after',
         'pi-forum message get MESSAGE_ID',
-        'message get     {"message": Message}',
-        'pi-forum search QUERY [--after CURSOR] [--limit N]',
+        'message get: {"message": MessageChunk',
+        'pi-forum search QUERY [--topic TOPIC_ID] [--latest | --after CURSOR] [--limit N]',
         `pi-forum search '"flaky tests" AND (timeout OR deadlock) NOT resolved' --limit 20`,
-        'search          {"items": [Hit, ...], "next_cursor": CURSOR}',
-        '{"type": "topic", "topic": Topic} or {"type": "message", "message": Message}',
+        'lists / search: {"items": [...], "next_cursor": CURSOR, "has_more": BOOLEAN}',
+        '{"type": "topic", "topic": Topic} or {"type": "message", "message": Preview}',
         'in which \\" and \\\\ escape',
         'Put -- before a TITLE, ID or QUERY that starts with "-"',
       ]) {
@@ -263,7 +269,7 @@ describe('help and binding', () => {
       [['search', 'q', '--limit', '-h'], ambiguous],
       [['search', '--help', '--limit'], /argument missing/],
       [['search', 'a', 'b', '--help'], /unexpected argument "b" for search/],
-      [['search', 'q', '--topic', 't', '-h'], /Unknown option '--topic'/],
+      [['search', 'q', '--topic', 't', '--topic', 'u', '-h'], /--topic may be given only once/],
       [['search', 'q', '--body', 'x', '--help'], /Unknown option '--body'/],
       [['search', '-h', '-x'], /Unknown option '-x'/],
       [['search', 'q', '--help=yes'], /does not take an argument/],
@@ -374,6 +380,7 @@ describe('topic commands', () => {
 
   test('get reports unknown topics', async () => {
     const dir = await tempForum()
+    await fs.mkdir(dir)
     await fails(['topic', 'get', 'nope'], forumEnv(dir), /topic nope not found/)
     await fails(['topic', 'get', '  '], forumEnv(dir), /topicId must be a non-blank string/)
   })
@@ -562,6 +569,18 @@ describe('search command', () => {
     assert.deepEqual((await search(['  path\tc:\n'], forumEnv(dir))).items, [messageHit(quoted)])
   })
 
+  test('topic-scoped search excludes an observer topic and keeps scope while paging', async () => {
+    const dir = await tempForum()
+    const { topic, message } = await createTopic(dir, { title: 'Task4c', author: 'a', body: 'task4c current decision' })
+    await createTopic(dir, { title: 'Audit', author: 'observer', body: 'task4c historical replay' })
+    const first = await search(['task4c', '--topic', topic.id, '--limit', '1'], forumEnv(dir))
+    assert.deepEqual(first.items, [topicHit(topic)])
+    const rest = await search(['--topic=' + topic.id, '--after', first.next_cursor, 'task4c'], forumEnv(dir))
+    assert.deepEqual(rest.items, [messageHit(message!)])
+    assert.deepEqual((await search(['task4c', '--topic', 'unknown'], forumEnv(dir))).items, [])
+    assert.equal((await search(['task4c'], forumEnv(dir))).items.length, 3)
+  })
+
   test('a query starting with a dash follows --, after any options', async () => {
     const dir = await tempForum()
     const { topic } = await createTopic(dir, { title: '-dash title', author: 'a', body: '--flag in body' })
@@ -592,7 +611,7 @@ describe('search command', () => {
 
   test('an empty result is a page whose cursor finds later matches', async () => {
     const dir = await tempForum()
-    // Like the other reads, a search creates the missing forum directory.
+    await fs.mkdir(dir)
     const empty = await search(['flaky'], forumEnv(dir))
     assert.deepEqual(empty.items, [])
     assert.deepEqual(await fs.readdir(dir), [])
@@ -685,7 +704,7 @@ describe('input errors', () => {
       [['search', '"flaky', 'tests"'], /unexpected argument "tests"" for search/],
       [['search', '-flaky'], /Unknown option '-f'/],
       [['search', '--flaky'], /Unknown option '--flaky'/],
-      [['search', 'q', '--topic', topic.id], /Unknown option '--topic'/],
+      [['search', 'q', '--topic', ''], /topicId must be a non-blank string/],
       [['search', 'q', '--author', 'a'], /Unknown option '--author'/],
       [['search', 'q', '--body-stdin'], /Unknown option '--body-stdin'/],
       [['search', 'q', '--limit', '5', '--limit', '6'], /--limit may be given only once/],
@@ -711,6 +730,7 @@ describe('input errors', () => {
 
   test('limits and cursors are validated', async () => {
     const dir = await tempForum()
+    await fs.mkdir(dir)
     for (const limit of ['0', '101', '-1', '1.5', 'ten', '', ' 5', '1e2']) {
       for (const command of [['topic', 'list'], ['message', 'list'], ['search', 'q']]) {
         await fails([...command, `--limit=${limit}`], forumEnv(dir), /limit must be an integer from 1 to 100/)
@@ -719,6 +739,7 @@ describe('input errors', () => {
     await fails(['topic', 'list', '--after', 'not a cursor'], forumEnv(dir), /cursor is not valid/)
     await fails(['message', 'list', '--after', ''], forumEnv(dir), /cursor is not valid/)
     const other = await tempForum()
+    await fs.mkdir(other)
     const { next_cursor } = await ok(['topic', 'list'], forumEnv(other))
     await fails(['topic', 'list', '--after', next_cursor], forumEnv(dir), /cursor belongs to a different forum/)
     await fails(['search', 'q', '--after', next_cursor], forumEnv(dir), /cursor belongs to a different forum/)
@@ -728,6 +749,16 @@ describe('input errors', () => {
 })
 
 describe('storage conditions', () => {
+  test('reads refuse a missing directory without creating it, while writes initialize it', async () => {
+    const dir = await tempForum()
+    for (const args of [['topic', 'list'], ['message', 'list'], ['topic', 'get', 't'], ['message', 'get', 'm'], ['search', 'x']]) {
+      await fails(args, forumEnv(dir), /forum directory .* is unavailable: ENOENT/)
+      await assert.rejects(fs.stat(dir), { code: 'ENOENT' })
+    }
+    await ok(['topic', 'create', 'T'], forumEnv(dir))
+    assert.deepEqual((await ok(['topic', 'list'], forumEnv(dir))).items.map((t) => t.title), ['T'])
+  })
+
   test('warnings go to stderr while the result stays on stdout', async () => {
     const dir = await tempForum()
     await fs.mkdir(dir)
@@ -804,7 +835,7 @@ describe('dispatch through the shared API', () => {
     const out: string[] = []
     const err: string[] = []
     const stream = (chunks: string[]) => ({ write: (chunk: string) => chunks.push(chunk) > 0 })
-    const code = await main(argv, env, { createForum: factory, stdout: stream(out), stderr: stream(err) })
+    const code = await main(full(argv), env, { createForum: factory, stdout: stream(out), stderr: stream(err) })
     return { code, stdout: out.join(''), stderr: err.join('') }
   }
 
@@ -820,7 +851,7 @@ describe('dispatch through the shared API', () => {
       const result = await invoke(argv, env, recording.factory)
       assert.equal(result.stderr, '', argv.join(' '))
       assert.equal(result.code, 0)
-      assert.deepEqual(recording.configs.slice(configs), [{ forumDir: FORUM_DIR, createOnRead: true }])
+      assert.deepEqual(recording.configs.slice(configs), [{ forumDir: FORUM_DIR, createOnRead: false }])
       // Every call passes the CLI's warning reporter in its final options; the rest is compared exactly.
       const made = recording.calls.slice(calls).map(({ name, args }) => {
         // Every client method takes its options last.
@@ -898,7 +929,7 @@ describe('dispatch through the shared API', () => {
       const [given, { onWarning, ...rest }] = call!.args as [string, ReadCallOptions]
       assert.equal(given, query)
       assert.equal(typeof onWarning, 'function')
-      assert.deepEqual(rest, options)
+      assert.deepEqual(rest, { ...options, topicId: undefined })
       if (options.after === 'c') {
         assert.deepEqual(result, { code: 1, stdout: '', stderr: 'pi-forum: error: cursor is not valid\n' })
         continue
@@ -918,7 +949,7 @@ describe('dispatch through the shared API', () => {
       stderr: 'pi-forum: error: search query expects a term, phrase or group at offset 5\n',
     })
     assert.deepEqual(recording.calls.at(-1)!.args[0], 'a AND')
-    assert.deepEqual(recording.configs, Array(searches.length + 2).fill({ forumDir: FORUM_DIR, createOnRead: true }))
+    assert.deepEqual(recording.configs, Array(searches.length + 2).fill({ forumDir: FORUM_DIR, createOnRead: false }))
     await assert.rejects(fs.stat(FORUM_DIR), { code: 'ENOENT' })
   })
 
@@ -937,7 +968,7 @@ describe('dispatch through the shared API', () => {
       [['message', 'get', 'x'], { PI_FORUM_DIR: 'relative' }],
       [['search'], env],
       [['search', 'a', 'b'], env],
-      [['search', 'q', '--topic', 't'], env],
+      [['search', 'q', '--topic', 't', '--topic', 'u'], env],
       [['search', 'q', '--limit', 'ten'], env],
       [['search', 'q'], {}],
     ] as const) {
@@ -963,6 +994,7 @@ describe('dispatch through the shared API', () => {
   test('client errors keep their messages and recovery advice', async () => {
     const recording = recordingFactory()
     const env = { PI_FORUM_DIR: FORUM_DIR }
+    await recording.adapter.open({ forumDir: FORUM_DIR, create: true })
     const missing = await invoke(['message', 'get', 'nope'], env, recording.factory)
     assert.deepEqual(missing, { code: 1, stdout: '', stderr: 'pi-forum: error: message nope not found\n' })
 

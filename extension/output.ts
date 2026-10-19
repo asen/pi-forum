@@ -10,6 +10,7 @@
 // { items, omitted } when the caller kept only the first items and counted the rest. The requests
 // and views are typed in types.ts.
 
+import type { Page } from '../src/types.d.mts'
 import type {
   ForumBinding,
   ForumTarget,
@@ -92,22 +93,22 @@ export function formatTarget({ forumDir, generated, project, resolved, status, w
   return lines.map(printable).join('\n')
 }
 
-// One page of listTopics: page is its { items, next_cursor }, after the cursor it was read after.
+// One page of listTopics, including snapshot termination; after is the cursor it was read after.
 export function formatTopicList({ target, page, after, warnings = [] }: TopicListRequest): string {
-  const lines = [heading('Forum topics', after), formatTarget(target), '']
+  const lines = [heading('Forum topics', after, page.older_omitted), formatTarget(target), '']
   if (page.items.length === 0) lines.push(after ? 'No newer topics.' : 'No topics yet.')
   page.items.forEach((topic, i) => {
     lines.push(printable(`${i + 1}. ${topic.title}`))
     lines.push(printable(`   Topic ${topic.id} · by ${topic.created_by} · ${topic.created_at}`))
   })
-  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'topics' }))
+  lines.push(...damaged(warnings), '', paging(page, { kind: 'topics' }))
   return lines.join('\n')
 }
 
 // One page of listMessages; topicId is the topic it listed, or undefined for activity across the forum.
 export function formatMessageList({ target, topicId, page, after, warnings = [] }: MessageListRequest): string {
   const name = topicId === undefined ? 'Forum messages across all topics' : `Forum messages in topic ${topicId}`
-  const lines = [heading(name, after), formatTarget(target), '']
+  const lines = [heading(name, after, page.older_omitted), formatTarget(target), '']
   if (page.items.length === 0) lines.push(after ? 'No newer messages.' : 'No messages yet.')
   page.items.forEach((message, i) => {
     const reply = message.reply_to ? ` · reply to ${message.reply_to}` : ''
@@ -115,14 +116,15 @@ export function formatMessageList({ target, topicId, page, after, warnings = [] 
     lines.push(printable(`   Message ${message.id} · topic ${message.topic_id}${reply}`))
     lines.push(`   ${excerpt(message.body)}`)
   })
-  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'messages', topicId }))
+  lines.push(...damaged(warnings), '', paging(page, { kind: 'messages', topicId }))
   return lines.join('\n')
 }
 
 // One page of search hits for query, as typed: each a topic, by its title, or a message, by an
 // excerpt of its body, in the order the forum returned them.
-export function formatSearchResults({ target, query, page, after, warnings = [] }: SearchResultsRequest): string {
-  const lines = [heading('Forum search', after), formatTarget(target), printable(`Query: ${query}`), '']
+export function formatSearchResults({ target, query, topicId, page, after, warnings = [] }: SearchResultsRequest): string {
+  const name = topicId === undefined ? 'Forum search' : `Forum search in topic ${topicId}`
+  const lines = [heading(name, after, page.older_omitted), formatTarget(target), printable(`Query: ${query}`), '']
   if (page.items.length === 0) lines.push(after ? 'No newer matches.' : 'No matches.')
   page.items.forEach((hit, i) => {
     if (hit.type === 'topic') {
@@ -137,7 +139,7 @@ export function formatSearchResults({ target, query, page, after, warnings = [] 
       lines.push(`   ${excerpt(message.body)}`)
     }
   })
-  lines.push(...damaged(warnings), '', paging(page.items.length, page.next_cursor, { kind: 'search', query }))
+  lines.push(...damaged(warnings), '', paging(page, { kind: 'search', query, topicId }))
   return lines.join('\n')
 }
 
@@ -156,8 +158,8 @@ export function formatMessage({ target, message, warnings = [], visibleWidth }: 
   return lines.join('\n')
 }
 
-function heading(name: string, after: string | undefined): string {
-  return printable(`${name} · ${after ? `after cursor ${after}` : 'from the start'}`)
+function heading(name: string, after: string | undefined, olderOmitted?: number): string {
+  return printable(`${name} · ${after ? `after cursor ${after}` : olderOmitted === undefined ? 'from the start' : 'latest window'}`)
 }
 
 // Array.isArray, which does not narrow a readonly array out of a union.
@@ -170,13 +172,17 @@ function damaged(warnings: ReadWarnings): string[] {
   return [printable(`${count} damaged record(s) skipped${items.length ? `; first: ${items[0]}` : ''}`)]
 }
 
-// A full page of count items may have more after it; only its returned cursor continues. A shorter
-// page is the end.
-function paging(count: number, cursor: string, view: ListView | SearchView): string {
-  if (count < LIST_PAGE_SIZE) return 'You are caught up.'
+// has_more describes the scanned snapshot. An end cursor still resumes future appends.
+function paging(page: Page<unknown>, view: ListView | SearchView): string {
+  const { next_cursor: cursor, has_more, older_omitted } = page
+  if (!has_more) {
+    const window = older_omitted === undefined ? '' : `Latest window: ${older_omitted} older matches omitted.\n`
+    return `${window}You are caught up.${cursor ? `\nResume cursor: ${printable(cursor)}` : ''}`
+  }
+  const count = page.items.length
   const command = cursor && textCommand({ ...view, after: cursor })
-  if (command) return `${count} shown; there may be more. Next page: ${command}`
-  return printable(`${count} shown; there may be more${cursor ? ` after cursor ${cursor}` : ''}.`)
+  if (command) return `${count} shown. Next page: ${command}`
+  return printable(`${count} shown; more matches${cursor ? ` after cursor ${cursor}` : ''}.`)
 }
 
 // The /forum command that reads view ({ kind: 'topics' | 'messages' | 'read' | 'search', topicId?,
@@ -189,17 +195,19 @@ function paging(count: number, cursor: string, view: ListView | SearchView): str
 // options or it starts with "-". It may hold spaces but no other whitespace, so a query on several
 // lines, with tabs, or with characters printable() would replace, has no command.
 export function textCommand(view: TextView): string | null {
-  const { kind, topicId, messageId, after } = view
+  const { kind, topicId, messageId, after, latest } = view
   const id = kind === 'messages' ? topicId : kind === 'read' ? messageId : undefined
-  const args = [id, after].filter((arg) => arg !== undefined)
+  const args = [id, after, kind === 'search' ? topicId : undefined].filter((arg) => arg !== undefined)
   if (!args.every((arg) => arg !== '' && /^\S+$/.test(arg) && printable(arg) === arg)) return null
   const words: string[] = [kind]
-  const options = after === undefined ? [] : after.startsWith('-') ? [`--after=${after}`] : ['--after', after]
+  if (latest && after !== undefined) return null
+  const options = latest ? ['--latest'] : after === undefined ? [] : after.startsWith('-') ? [`--after=${after}`] : ['--after', after]
   if (kind === 'search') {
     const { query } = view
     if (query === '' || query.trim() !== query || /[^\S ]/.test(query) || printable(query) !== query) return null
+    if (topicId !== undefined) words.push(`--topic=${topicId}`)
     words.push(...options)
-    if (after !== undefined || query.startsWith('-')) words.push('--')
+    if (topicId !== undefined || options.length > 0 || query.startsWith('-')) words.push('--')
     words.push(query)
   } else if (id === undefined) words.push(...options)
   else if (id.startsWith('-')) words.push(...options, '--', id)

@@ -27,7 +27,7 @@ interface PiForumResult {
   stderr: string
 }
 
-// What each command prints on success, by its two command words, as the help documents.
+// Complete-record (--full) responses for this CRUD workflow.
 interface Responses {
   topic: { create: CreateTopicResult; get: { topic: Topic }; list: Page<Topic> }
   message: { post: { message: Message }; get: { message: Message }; list: Page<Message> }
@@ -69,7 +69,7 @@ test('a shared forum workflow through the bundled executable', async () => {
       env: Environment,
       input?: string,
     ): Promise<Responses[G][V]> => {
-      const result = await piForum(args, { env, cwd: work, input })
+      const result = await piForum([...args.slice(0, 2), '--full', ...args.slice(2)], { env, cwd: work, input })
       assert.equal(result.stderr, '', `stderr of ${args.join(' ')}`)
       assert.equal(result.code, 0)
       return JSON.parse(result.stdout)
@@ -77,7 +77,7 @@ test('a shared forum workflow through the bundled executable', async () => {
 
     // Runs a search command line through the shell, expecting its page of hits.
     const search = async (commandLine: string, env: Environment): Promise<Page<SearchHit>> => {
-      const result = await piForum(commandLine, { env, cwd: work })
+      const result = await piForum(commandLine.replace('pi-forum search ', 'pi-forum search --full '), { env, cwd: work })
       assert.equal(result.stderr, '', `stderr of ${commandLine}`)
       assert.equal(result.code, 0)
       return JSON.parse(result.stdout)
@@ -117,9 +117,9 @@ test('a shared forum workflow through the bundled executable', async () => {
     for (;;) {
       const page = await ok(['message', 'list', '--limit', '2', ...(cursor ? ['--after', cursor] : [])], main)
       cursor = page.next_cursor
-      if (page.items.length === 0) break
       bodies.push(...page.items.map((m) => m.body))
       pages++
+      if (!page.has_more) break
     }
     assert.equal(pages, 2)
     assert.deepEqual(bodies, ['Report findings here.', fromFile.message.body, fromStdin.message.body, 'Confirmed.'])
@@ -143,8 +143,8 @@ test('a shared forum workflow through the bundled executable', async () => {
     let after = ''
     for (;;) {
       const page = await search(`pi-forum search '"\\"pool\\""' --limit 1 ${after}`, helper)
-      if (page.items.length === 0) break
       quoted.push(...page.items)
+      if (!page.has_more) break
       after = `--after ${page.next_cursor}`
     }
     assert.deepEqual(quoted.map(text), [fromFile.message.body, fromStdin.message.body])

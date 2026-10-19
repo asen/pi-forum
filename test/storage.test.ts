@@ -318,7 +318,7 @@ describe('cursors', () => {
     const link = path.join(path.dirname(dir), 'link')
     await fs.symlink(dir, link)
     const { next_cursor } = await listTopics(dir, { limit: 1 })
-    assert.deepEqual(await listTopics(link, { after: next_cursor }), { items: [], next_cursor })
+    assert.deepEqual(await listTopics(link, { after: next_cursor }), { items: [], next_cursor, has_more: false })
   })
 
   test('from another forum are rejected', async () => {
@@ -407,12 +407,13 @@ describe('damaged logs', () => {
     // A page that ends after skipped records resumes beyond them without repeating warnings.
     const page = collectWarnings()
     const first = await listTopics(dir, { limit: 1, onWarning: page.onWarning })
-    assert.deepEqual(page.warnings, [])
-    assert.equal(decode(first.next_cursor).offset, offset)
+    assert.deepEqual(page.warnings, warnings)
+    assert.equal(first.has_more, false)
+    assert.equal(decode(first.next_cursor).offset, (await fs.stat(logPath(dir))).size)
     const rest = collectWarnings()
     const second = await listMessages(dir, { after: first.next_cursor, limit: 1, onWarning: rest.onWarning })
-    assert.deepEqual(second.items, [message])
-    assert.equal(rest.warnings.length, junk.length)
+    assert.deepEqual(second.items, [])
+    assert.equal(rest.warnings.length, 0)
     assert.deepEqual(await getTopic(dir, topic.id, { onWarning() {} }), topic)
   })
 

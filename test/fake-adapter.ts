@@ -42,11 +42,15 @@ export function fakeAdapter(): FakeAdapter {
       const forum = created
       const scan = async (start: number, visit: EventVisitor, signal?: AbortSignal) => {
         let index = start
-        while (index < forum.events.length) {
+        const end = forum.events.length
+        while (index < end) {
           await tick()
           if (signal?.aborted) throw new ForumError('ABORTED', 'fake read aborted', { cause: signal.reason })
           // In range: the loop condition was checked before the yield, and events are only appended.
-          if (visit(structuredClone(forum.events[index++]!))) break
+          const stop = visit(structuredClone(forum.events[index]!))
+          if (stop === 'stop-before') break
+          index++
+          if (stop === true) break
         }
         return index
       }
