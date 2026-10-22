@@ -111,6 +111,7 @@ const DOCS = ['README.md', 'docs/architecture.md', 'LICENSE']
 const HOST_PEERS = ['@earendil-works/pi-coding-agent', '@earendil-works/pi-tui']
 // The two entry points: the executable, which runs the CLI, and the extension Pi loads.
 const BIN = 'bin/pi-forum'
+const SHELL_SETUP = 'forum-env.sh'
 const EXTENSION_ENTRY = 'extension/forum.ts'
 // Node with its TypeScript type stripping off, for runs that must need no TypeScript at all.
 const PLAIN_NODE = '--no-experimental-strip-types'
@@ -153,7 +154,7 @@ interface CheckoutFile {
   text: string
 }
 
-const holdsCode = ({ file, mode, text }: CheckoutFile): boolean => CODE.test(file) || (mode & 0o111) !== 0 || text.startsWith('#!')
+const holdsCode = ({ file, mode, text }: CheckoutFile): boolean => file === SHELL_SETUP || CODE.test(file) || (mode & 0o111) !== 0 || text.startsWith('#!')
 
 // The comment directives that switch type checking off: @ts-nocheck for a file, @ts-ignore for the
 // next line, in TypeScript and checked JavaScript alike. Outside production, @ts-expect-error stays
@@ -218,7 +219,7 @@ function suppressions(file: string, text: string): string[] {
 
 // The files holding code that is neither the bootstrap exactly as above, TypeScript that a type check
 // reads, nor core JavaScript that it reads (checked: the files tsc reads for npm run typecheck), and
-// the comments that switch the check off, each with why.
+// the comments that switch the check off, each with why. The named shell helper is checked by Bash.
 function uncheckedCode(files: readonly CheckoutFile[], checked: ReadonlySet<string>): string[] {
   const problems: string[] = []
   for (const { file, text } of files.filter(holdsCode)) {
@@ -226,6 +227,8 @@ function uncheckedCode(files: readonly CheckoutFile[], checked: ReadonlySet<stri
     if (bootstrap) {
       const lines = text.split('\n').filter((line) => line.trim() !== '' && !line.trim().startsWith('//'))
       if (!isDeepStrictEqual(lines, bootstrap)) problems.push(`${file} does more than start the CLI`)
+    } else if (file === SHELL_SETUP) {
+      if (!text.startsWith('#!/usr/bin/env bash\n')) problems.push(`${file} must be a Bash script`)
     } else if (CORE_JAVASCRIPT.test(file)) {
       if (!checked.has(file)) problems.push(`${file} is JavaScript that no type check reads`)
     } else if (!TYPESCRIPT.test(file)) {
@@ -256,7 +259,7 @@ async function compilerFiles(project: string): Promise<string[]> {
 
 // Covers every file a commit would hold (tracked, or untracked and not ignored): production code,
 // tests, their helpers and fixtures alike. Needs the dev dependencies (npm ci).
-test('all authored code is type-checked TypeScript or core JavaScript; the only other JavaScript is the executable bootstrap', async () => {
+test('JS/TS is type-checked or the executable bootstrap; the shell helper passes Bash syntax checking', async () => {
   const checked = new Set([...(await compilerFiles('tsconfig.json')), ...(await compilerFiles('tsconfig.tooling.json'))])
   // The listing is real: it holds the production sources and declarations, tests, helpers and fixtures.
   for (const file of [...inventory.shipped, 'test/package.test.ts', 'test/checkout.ts', 'test/fixtures/npm-logger.mts', 'test/test-globals.d.ts']) {
@@ -269,10 +272,11 @@ test('all authored code is type-checked TypeScript or core JavaScript; the only 
     }),
   )
   assert.deepEqual(uncheckedCode(files, checked), [])
+  await exec('/bin/bash', ['-n', path.join(ROOT, SHELL_SETUP)])
   // Among them, the tests' deliberate type errors, each marked with @ts-expect-error, are accepted.
   assert.ok(files.some((entry) => TYPESCRIPT.test(entry.file) && /^\s*\/\/ @ts-expect-error -- \S/m.test(entry.text)), 'no @ts-expect-error was checked')
-  const javaScript = files.filter((entry) => holdsCode(entry) && !TYPESCRIPT.test(entry.file))
-  assert.deepEqual(javaScript.map((entry) => entry.file), [BIN, ...inventory.core].sort())
+  const nonTypeScript = files.filter((entry) => holdsCode(entry) && !TYPESCRIPT.test(entry.file))
+  assert.deepEqual(nonTypeScript.map((entry) => entry.file), [BIN, SHELL_SETUP, ...inventory.core].sort())
 })
 
 test('the authored-code check rejects unchecked TypeScript and JavaScript, other code and a bootstrap that does more', () => {
@@ -281,6 +285,7 @@ test('the authored-code check rejects unchecked TypeScript and JavaScript, other
   const bootstrap = (extra = ''): CheckoutFile => file(BIN, `// Starts the CLI.\n\n${BOOTSTRAPS.get(BIN)!.join('\n')}\n${extra}`, 0o755)
   const allowed = [
     bootstrap(),
+    file(SHELL_SETUP, '#!/usr/bin/env bash\ntrue\n'),
     ...[...checked].filter((name) => name !== 'test/fixtures/tool.mts').map((name) => file(name, 'export {}\n')),
     file('test/fixtures/tool.mts', '#!/usr/bin/env node\nexport {}\n', 0o755),
     file('test/types/consumer.ts', 'export {}\n'),
@@ -289,6 +294,8 @@ test('the authored-code check rejects unchecked TypeScript and JavaScript, other
   ]
   assert.deepEqual(uncheckedCode(allowed, checked), [])
   for (const [entry, problem] of [
+    [file(SHELL_SETUP, ''), 'forum-env.sh must be a Bash script'],
+    [file(SHELL_SETUP, '#!/usr/bin/env node\n'), 'forum-env.sh must be a Bash script'],
     [file('test/helper.js', 'export {}\n'), 'test/helper.js is code but neither TypeScript nor core JavaScript'],
     [file('test/helper.mjs', 'export {}\n'), 'test/helper.mjs is code but neither TypeScript nor core JavaScript'],
     [file('scripts/tool.mjs'), 'scripts/tool.mjs is code but neither TypeScript nor core JavaScript'],
@@ -415,16 +422,16 @@ test('a plain npm pack of a checkout without dependencies packs the authored sou
 })
 
 test('the tarball contains exactly the authored runtime sources, their declarations and the docs, as committed', async () => {
-  const expected = [BIN, 'package.json', ...DOCS, ...inventory.shipped].sort()
+  const expected = [BIN, SHELL_SETUP, 'package.json', ...DOCS, ...inventory.shipped].sort()
   const files = await listFiles(pkg)
   assert.deepEqual(files, expected)
   // The core JavaScript, its sidecar declarations and the extension TypeScript ship; generated
   // JavaScript or declarations, tests, tooling, compiler configurations and the lockfile do not.
   for (const file of files) {
     assert.doesNotMatch(file, /(^|\/)(\.idea|\.git|node_modules|test|scripts|dist)(\/|$)|\.tgz$|\.map$|\.tsbuildinfo$|\.(c?js|jsx|tsx|d\.c?ts)$|^(tsconfig(\.[\w-]+)?|package-lock)\.json$/)
-    assert.match(file, /^(bin\/pi-forum|package\.json|README\.md|LICENSE|docs\/architecture\.md|src\/([\w-]+\/)*[\w-]+\.(mjs|d\.mts)|extension\/[\w-]+\.ts)$/)
+    assert.match(file, /^(bin\/pi-forum|forum-env\.sh|package\.json|README\.md|LICENSE|docs\/architecture\.md|src\/([\w-]+\/)*[\w-]+\.(mjs|d\.mts)|extension\/[\w-]+\.ts)$/)
   }
-  for (const file of [...DOCS, BIN, ...inventory.shipped]) {
+  for (const file of [...DOCS, BIN, SHELL_SETUP, ...inventory.shipped]) {
     assert.deepEqual(await fs.readFile(path.join(pkg, file)), await fs.readFile(path.join(ROOT, file)), file)
   }
   assert.match(await fs.readFile(path.join(pkg, 'LICENSE'), 'utf8'), /^MIT License\n\nCopyright \(c\) \d{4} \S/)
@@ -681,6 +688,17 @@ test('the packaged executable has mode 0755 and a node shebang', async () => {
   const bin = path.join(pkg, 'bin', 'pi-forum')
   assert.equal((await fs.stat(bin)).mode & 0o777, 0o755)
   assert.ok((await fs.readFile(bin, 'utf8')).startsWith('#!/usr/bin/env node\n'))
+})
+
+test('the packaged shell helper exposes the CLI without Pi or dependencies', async () => {
+  const cwd = path.join(temp, 'standalone shell')
+  await fs.mkdir(cwd)
+  const { stdout, stderr } = await exec('/bin/bash', ['--noprofile', '--norc', '-c',
+    'set -eu; source "$SETUP" --current; pi-forum topic create Standalone',
+  ], { cwd, env: { PATH: SYSTEM_PATH, SETUP: path.join(pkg, SHELL_SETUP), NODE_OPTIONS: PLAIN_NODE } })
+  assert.equal(stderr, '')
+  assert.ok((JSON.parse(stdout) as { topic_id: string }).topic_id)
+  assert.equal((await fs.readFile(path.join(cwd, '.forum', 'events.jsonl'), 'utf8')).trim().split('\n').length, 1)
 })
 
 // Each run has Node's type stripping off: the executable and the core it loads are plain JavaScript.

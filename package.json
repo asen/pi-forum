@@ -9,6 +9,7 @@
   },
   "files": [
     "bin/pi-forum",
+    "forum-env.sh",
     "src/*.mjs",
     "src/*.d.mts",
     "src/backends/*.mjs",
